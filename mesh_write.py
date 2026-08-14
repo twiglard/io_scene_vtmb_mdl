@@ -2,9 +2,9 @@
 """MDL v2531 per-vertex writer. No bpy.
 
 Vertex records are fixed stride and index-parallel with what `Mdl.vertices` returns, so a
-field is overwritten where it already sits and nothing in the file moves: no offset is
-repointed, no section relocates, and the `.vtx` files stay valid. The count is therefore
-fixed -- this cannot add or remove geometry.
+field is overwritten where it already sits inside the model's own vertex block. Laying that
+block back into a file is `mdl_build`'s job. The count is fixed here -- the triangle lists
+live in the `.vtx`, so this cannot add or remove geometry.
 
 A filetype-0 vertex carries four bones. The fourth weight is not stored -- it is whatever
 the first three leave short of 255 -- and byte +3 is a count code whose `% 5` is how many
@@ -62,9 +62,8 @@ def quantise(v, offset, scale):
     return 0 if not scale else int(round((v - offset) / scale))
 
 
-def patch_model(data, model, verts, fields):
-    """Overwrite `fields` of one model's vertices in `data`, a bytearray. Returns the
-    number of records touched."""
+def _encode(data, model, verts, fields, base):
+    """Write `fields` of `verts` as vertex records into `data` from `base`."""
     stride = M.VERTEX_STRIDE.get(model.filetype)
     if stride is None:
         raise ValueError("unknown vertex filetype %d" % model.filetype)
@@ -77,7 +76,7 @@ def patch_model(data, model, verts, fields):
         return 0
     lim = 2 ** 16 - 1 if model.filetype == 1 else 255
     for i, v in enumerate(verts):
-        o = model.vertexbase + i * stride
+        o = base + i * stride
         if model.filetype == 0:
             if "positions" in fields:
                 struct.pack_into("<3f", data, o + 12, *v.pos)
@@ -105,13 +104,15 @@ def patch_model(data, model, verts, fields):
     return len(verts)
 
 
-def patch(m, edits, fields):
-    """`edits` maps (bodypart index, model index) to a vertex list. Returns new bytes."""
-    data = bytearray(m.d)
-    n = 0
-    for (bi, mi), verts in sorted(edits.items()):
-        n += patch_model(data, m.bodyparts[bi].models[mi], verts, fields)
-    return bytes(data), n
+def pack_model(model, verts, fields, donor):
+    """(bytes, records written) for one model's vertex block.
+
+    `donor` is that block as the file holds it: a field left unticked keeps its stored
+    value rather than being re-derived from the scene.
+    """
+    buf = bytearray(donor)
+    n = _encode(buf, model, verts, fields, 0)
+    return bytes(buf), n
 
 
 def models_of(m):

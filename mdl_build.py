@@ -13,12 +13,12 @@ re-authoring a shipped model means supplying that model's own.  The two paths di
 where the scalars come from and nowhere else, which is what lets the corpus check a writer
 whose real input is a Blender scene.
 
-`Desc.dropped` counts what a description does not carry, and `emit` refuses unless the
-caller passes `drop=True`.  Over `gamedata\\models` that is cloth and nothing else: cloth
-binds per-vertex indices into a mesh whose vertex count a description may change, and its
-table stores no length, the first object bounding it (anomalies §B10).  A procedural bone
-of a proctype nothing has measured would also drop, but all 3263 in the corpus are
-proctype 1 and are carried.
+Sections whose internal structure is unimplemented are *carried*, not dropped: cloth moves
+as one rigid region with its pointers recomputed (`_cloth_region`).  Where a description
+changes a cloth-bound mesh's vertex count the arrays cannot be resized, so that model's
+cloth is dropped and named (`_drop_stale_cloth`).  `Desc.dropped` counts everything not
+carried, and `emit` refuses unless the caller passes `drop=True`; over `gamedata\\models`
+nothing populates it, all 3263 procedural bones being proctype 1.
 """
 
 import os
@@ -29,11 +29,13 @@ try:
     from . import mdl as M
     from . import mdl_write as W
     from . import relocs as R
+    from . import sections as S
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import mdl as M
     import mdl_write as W
     import relocs as R
+    import sections as S
 
 HDR_SIZE = 424
 ALIGN = 4
@@ -169,6 +171,87 @@ class Desc(object):
             self.dropped[what] = self.dropped.get(what, 0) + n
 
 
+def _cloth_region(b, mo):
+    """One model's cloth as a single blob plus the offsets into it to re-aim at, or None.
+
+    Rigid by construction: the table stores no count, so its length is how far the first
+    object sits past it and that divided by `cols` is the row count every per-mesh array is
+    sized by, and each object's nine payload offsets are object-relative (anomalies §B10,
+    §M).  Carried whole -- holes and alignment pads included -- because nothing inside may
+    move relative to anything else.
+    """
+    m = S.Map(b)
+    tbl, rows, objs = S.cloth_objects(m, mo)
+    if not objs:
+        return None
+    # The table's own entries are model-relative, so they are the one thing inside the
+    # region that a move invalidates. Recorded per slot and recomputed at layout.
+    nslot = (min(objs) - tbl) // 4
+    slots = [(k, mo + m.i(tbl + k * 4)) for k in range(nslot) if m.i(tbl + k * 4)]
+    lo, hi = tbl, tbl + nslot * 4
+    for at in objs:
+        lo, hi = min(lo, at), max(hi, at + 0x5c)
+        h = {o: m.i(at + o) for o in range(0, 0x5c, 4)}
+        for off, cnts, w, _what in S.CLOTH_BLOCKS:
+            if h[off]:
+                lo = min(lo, at + h[off])
+                hi = max(hi, at + h[off] + sum(h[c] for c in cnts) * w)
+    binds = {}
+    mesh = mo + m.i(mo + 0x8c)
+    for k in range(m.i(mo + 0x88)):
+        s = mesh + k * 60
+        if not m.i(s + 0x30):
+            continue
+        nv = m.i(s + 8) * rows
+        spans = []
+        for f, n in ((0x30, (nv + 3) // 4 * 4), (0x34, nv * 2), (0x38, nv * 2)):
+            at = s + m.i(s + f)
+            lo, hi = min(lo, at), max(hi, at + n)
+            spans.append(at)
+        binds[k] = (spans, m.i(s + 8))
+    if lo % ALIGN:
+        raise Refused("cloth region starts at %d, not %d-aligned" % (lo, ALIGN))
+    return {"data": bytes(b[lo:hi]), "cols": m.i(mo + 0xc8), "table": tbl - lo,
+            "slots": [(k, at - lo) for k, at in slots],
+            "meshes": dict((k, ([x - lo for x in v], n)) for k, (v, n) in binds.items())}
+
+
+def _drop_stale_cloth(d):
+    """Cloth on a mesh whose vertex count moved is dropped, and the drop is reported.
+
+    `mstudiomesh_t+0x30/+0x34/+0x38` are per-vertex arrays of `rows * numvertices` entries
+    and the engine reads that many whatever the array's real length is, so a carried array
+    against a changed count is read past its end -- anomalies §M, where a mis-sized region
+    faulted in `Cloth_BuildSpringBatches_vtmb` on render rather than on load.  Growing them
+    with zero entries is the better answer and cannot be written yet: neither the element
+    order nor the meaning of a zero entry has been read out of the code, and `+0x38`'s
+    element size is a fit that already fails on one shipped mesh.
+    """
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            cl = mr.extra.get("cloth")
+            if not cl:
+                continue
+            for k, (_spans, was) in cl["meshes"].items():
+                if k < len(mr.kids) and \
+                        struct.unpack_from("<i", mr.kids[k].raw, 8)[0] == was:
+                    continue
+                mr.extra["cloth"] = None
+                mr.extra["clothcollide"] = b""
+                mr.extra["clothsphere"] = b""
+                d.drop("cloth on a mesh whose vertex count changed")
+                break
+
+
+def _sized(b, base, cnt_off, idx_off, stride):
+    """A model-relative array carried verbatim: its bytes, or b'' when the count is 0."""
+    n, at = struct.unpack_from("<i", b, base + cnt_off)[0], \
+        struct.unpack_from("<i", b, base + idx_off)[0]
+    if n <= 0 or not at:
+        return b""
+    return bytes(b[base + at:base + at + n * stride])
+
+
 def _z(raw, *offs):
     """Zero the pointer fields: a scalar template must carry no stale offset."""
     b = bytearray(raw)
@@ -240,7 +323,10 @@ def from_bytes(b):
         nf, blk = i(o + 0x0c), o + i(o + 0x30)
         r.extra["block"] = bytes(b[blk:blk + _block_len(b, blk, nb, nf)]) if nf > 0 else b""
         if i(o + 0x38):
-            d.drop("animdesc.ikruleindex")
+            # mstudioikrule_t has no measured stride, so the payload cannot be sized and
+            # carried. No shipped file reaches this: all 4464 read ikruleindex 0.
+            raise Refused("%s: animdesc %d carries %d IK rules and mstudioikrule_t has no "
+                          "measured stride" % (d.name, k, i(o + 0x34)))
         d.anims.append(r)
 
     for k in range(i(272)):
@@ -324,23 +410,20 @@ def from_bytes(b):
                     w = 8 if i(f + 0x1c) else 20
                     flexes.append(Rec(_z(b[f:f + 32], 0x18), None, None,
                                       {"payload": bytes(b[at:at + n * w])}))
-                if i(so + 0x30):
-                    d.drop("mesh cloth binding")
                 meshes.append(Rec(_z(b[so:so + 60], 0x04, 0x14, 0x30, 0x34, 0x38),
                                   None, flexes))
             eyes = []
             for k in range(i(mo + 0xc0)):
                 eo = mo + i(mo + 0xc4) + k * 140
                 eyes.append(Rec(b[eo:eo + 140]))
-            if i(mo + 0xc8) and i(mo + 0xcc):
-                d.drop("cloth")
-            d.drop("cloth collide", i(mo + 0xd0))
-            d.drop("cloth sphere", i(mo + 0xd8))
             vi, ti = mo + i(mo + 0x94), mo + i(mo + 0x98)
             r = Rec(_z(b[mo:mo + 224], 0x8c, 0x94, 0x98, 0xc4, 0xcc, 0xd4, 0xdc),
                     None, meshes,
                     {"verts": bytes(b[vi:vi + nv * (stride or 0)]),
-                     "tangents": bytes(b[ti:ti + nv * 16]), "eyes": eyes})
+                     "tangents": bytes(b[ti:ti + nv * 16]), "eyes": eyes,
+                     "cloth": _cloth_region(b, mo),
+                     "clothcollide": _sized(b, mo, 0xd0, 0xd4, 36),
+                     "clothsphere": _sized(b, mo, 0xd8, 0xdc, 20)})
             models.append(r)
         d.bodyparts.append(Rec(_z(b[p:p + 16], 0x00, 0x0c), s(p + i(p)), models))
 
@@ -387,6 +470,7 @@ def emit(d, checksum=None, drop=False):
     `drop` is the caller stating it accepts losing whatever `Desc.dropped` names.  Without
     it a description carrying cloth is refused rather than quietly emitted without it.
     """
+    _drop_stale_cloth(d)
     if d.dropped and not drop:
         raise Refused("description drops %s"
                       % ", ".join("%s x%d" % (k, v) for k, v in sorted(d.dropped.items())))
@@ -659,8 +743,8 @@ def _emit_model(o, bp, md, mk, mr):
     struct.pack_into("<i", buf, md * 224 + 0x88, len(meshes))
     nv = len(tangents) // 16
     struct.pack_into("<i", buf, md * 224 + 0x90, nv)
+    sk = "meshes%s" % tag
     if meshes:
-        sk = "meshes%s" % tag
         o.add(sk, b"".join(bytes(x.raw) for x in meshes))
         o.patch((mk, md * 224 + 0x8c), (sk, 0), base)
         for k, x in enumerate(meshes):
@@ -688,12 +772,62 @@ def _emit_model(o, bp, md, mk, mr):
         o.patch((mk, md * 224 + 0xc4), ("eyes%s" % tag, 0), base)
     for off in (0xc8, 0xcc, 0xd0, 0xd4, 0xd8, 0xdc):
         struct.pack_into("<i", buf, md * 224 + off, 0)
+    for key, cnt_off, idx_off, stride in (("clothcollide", 0xd0, 0xd4, 36),
+                                          ("clothsphere", 0xd8, 0xdc, 20)):
+        blob = mr.extra.get(key) or b""
+        if not blob:
+            continue
+        kk = "%s%s" % (key, tag)
+        o.add(kk, blob)
+        struct.pack_into("<i", buf, md * 224 + cnt_off, len(blob) // stride)
+        o.patch((mk, md * 224 + idx_off), (kk, 0), base)
+    cl = mr.extra.get("cloth")
+    if cl:
+        ck = "cloth%s" % tag
+        o.add(ck, cl["data"])
+        struct.pack_into("<i", buf, md * 224 + 0xc8, cl["cols"])
+        o.patch((mk, md * 224 + 0xcc), (ck, cl["table"]), base)
+        for slot, rel in cl["slots"]:
+            o.patch((ck, cl["table"] + slot * 4), (ck, rel), base)
+        for k, (spans, _was) in sorted(cl["meshes"].items()):
+            for f, rel in zip((0x30, 0x34, 0x38), spans):
+                o.patch((sk, k * 60 + f), (ck, rel), (sk, k * 60))
 
 
 def build(b, checksum=None, drop=False):
     """(bytes, dropped) -- read a shipped file into a description and author it again."""
     d = from_bytes(b)
     return emit(d, checksum, drop), dict(d.dropped)
+
+
+def apply_anims(d, edits, path=""):
+    """Put authored poses into `d`: {animation index: {poses, fps, flags, movements}},
+    any of the last three optional.  The poses are held, not encoded -- one scale set
+    serves the whole file, so the channel a value needs is not decided until `emit`."""
+    for i, e in sorted(edits.items()):
+        if not 0 <= i < len(d.anims):
+            raise ValueError("no animation %d in %s" % (i, path))
+        r = d.anims[i]
+        r.extra["poses"] = e["poses"]
+        r.extra["block"] = b""
+        struct.pack_into("<i", r.raw, 0x0c, len(e["poses"]))
+        if e.get("movements") is not None:
+            r.extra["movements"] = [W.movement_bytes(x) for x in e["movements"]]
+        if e.get("fps") is not None:
+            struct.pack_into("<f", r.raw, 0x04, float(e["fps"]))
+        if e.get("flags") is not None:
+            struct.pack_into("<i", r.raw, 0x08, int(e["flags"]))
+    return d
+
+
+def write_many(m, edits, checksum=None):
+    """`m` authored again with `edits` applied, as bytes.
+
+    The donor's checksum is kept by default: the `.vtx` beside the file carries it and the
+    engine draws nothing at all when the two disagree.
+    """
+    d = apply_anims(from_bytes(bytes(m.d)), edits, m.path)
+    return emit(d, checksum=m.checksum if checksum is None else checksum)
 
 
 FLT_MIN = 1.17549435e-38
@@ -825,6 +959,27 @@ class _Bones(object):
         self.bones = bones
 
 
+class _Block(object):
+    """A carried animation block addressed on its own, so `read_tracks` can decode one
+    without the file it came out of.  `base` is 0 because the block starts at byte 0."""
+
+    extract = M.Mdl.extract
+
+    def __init__(self, data, bones):
+        self.d = data
+        self.bones = bones
+
+
+class _AnimHdr(object):
+    """The `mstudioanimdesc_t` fields `read_tracks` reads, off a Rec's scalar bytes."""
+
+    def __init__(self, r):
+        self.base = 0
+        self.name = r.name
+        self.fps, self.flags, self.numframes = struct.unpack_from("<fii", r.raw, 0x04)
+        self.movements = []
+
+
 def add_animation(d, name, poses, fps=30.0, flags=0):
     """`poses[frame][bone]` is (pos, quat) in parent-local space, or None to hold the bind
     pose.  The poses are kept, not encoded: `mstudiobone_t`'s scales are file-wide, so the
@@ -869,6 +1024,7 @@ def quantise(d):
     if not pending:
         return 0
     m = _skeleton(d)
+    old = W.file_scales(m)
     filled = []
     for r in pending:
         out = []
@@ -891,6 +1047,16 @@ def quantise(d):
         t.chan = W.quantise(m, poses, scales)
         r.extra["block"] = W._anim_block(m, t)
         r.extra["poses"] = None
+    # One scale set serves the whole file, so widening it for a new pose leaves every
+    # animation already in it decoding against scales it was not encoded for.
+    if old != scales:
+        fresh = set(id(r) for r in pending)
+        for r in d.anims:
+            if id(r) in fresh or not r.extra.get("block"):
+                continue
+            t = W.read_tracks(_Block(r.extra["block"], m.bones), _AnimHdr(r))
+            W.rescale(t, old, scales)
+            r.extra["block"] = W._anim_block(m, t)
     return len(pending)
 
 

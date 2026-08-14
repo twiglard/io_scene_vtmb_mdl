@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""MDL v2531 animation writer. No bpy.
+"""MDL v2531 animation encoder. No bpy.
 
-Nothing this reader does not parse ever moves. Each animation is reached through its own
-`mstudioanimdesc_t.animindex` -- animdesc-relative and a signed int -- so a block is
-rewritten into the bytes it already occupies whenever the new one fits there, and only
-what has outgrown its own span goes past the end of the file. Evidence for the layout it
-reproduces is in todo-vtmb-mdl-animation.md section 2.22.
+Poses to int16 channels and channels to RLE bytes, plus the scale fitting the two need.
+It lays nothing out: `mdl_build` decides where a block goes and computes the offsets that
+reach it, so there is no path here that edits a file in place. `owned_spans`/`_extents`
+stay because attributing the donor's animation bytes is how `mdl_rebuild` and
+`mdl-coverage.py` tell a live span from a dead one. Evidence for the encoding is in
+todo-vtmb-mdl-animation.md section 2.22.
 """
 
 import math
@@ -325,36 +326,14 @@ def _align(buf, at=0, n=4):
         buf.append(0)
 
 
+def movement_bytes(mv):
+    """One mstudiomovement_t record."""
+    return (struct.pack("<iifff", mv.endframe, mv.motionflags, mv.v0, mv.v1, mv.angle)
+            + struct.pack("<3f", *mv.vector) + struct.pack("<3f", *mv.position))
+
+
 def _movement_bytes(t):
-    buf = bytearray()
-    for mv in t.movements:
-        buf += struct.pack("<iifff", mv.endframe, mv.motionflags, mv.v0, mv.v1, mv.angle)
-        buf += struct.pack("<3f", *mv.vector)
-        buf += struct.pack("<3f", *mv.position)
-    return bytes(buf)
-
-
-def _emit_region(m, animindex, tracks, at):
-    """The animation region as it would lie starting at file offset `at`, with the
-    animdesc fields that point into it. Nothing outside the region is touched, so the
-    caller can splice this over any span that holds only animation data."""
-    buf = bytearray()
-    patch = []
-    for a in m.anims:
-        t = tracks[a.index]
-        desc = animindex + a.index * M.ANIMDESC_STRIDE
-        patch.append((desc + 4, "<fii", (t.fps, t.flags, t.numframes)))
-        if t.numframes <= 0:
-            continue
-        _align(buf, at)
-        patch.append((desc + 0x30, "<i", (at + len(buf) - desc,)))
-        buf += _anim_block(m, t)
-        patch.append((desc + 0x10, "<i", (len(t.movements),)))
-        if t.movements:
-            _align(buf, at)
-            patch.append((desc + 0x14, "<i", (at + len(buf) - desc,)))
-            buf += _movement_bytes(t)
-    return bytes(buf), patch
+    return b"".join(movement_bytes(mv) for mv in t.movements)
 
 
 def _block_extent(m, a):
@@ -420,166 +399,3 @@ def _extents(spans):
         else:
             out.append([s, e])
     return out
-
-
-def _plan(m, tracks, spans, eof):
-    """Where each piece of animation data goes, and how long the file ends up.
-
-    Laid down one after another over the bytes the animations already hold between them,
-    with whatever does not fit going past the end of the file. Packing the run afresh
-    rather than each block into its own span is what stops a block that grew by ten bytes
-    from stranding its whole old copy, and on an unchanged rewrite it reproduces the
-    layout that was there.
-    """
-    items = []
-    for a in m.anims:
-        t = tracks[a.index]
-        if t.numframes <= 0:
-            continue
-        items.append((("block", a.index), _anim_block(m, t)))
-        if t.movements:
-            items.append((("move", a.index), _movement_bytes(t)))
-    # Studiomdl's order: every block, then every movement array. Fixed rather than read
-    # off current addresses, so placement cannot feed back into the next write's order.
-    items.sort(key=lambda kv: (kv[0][0] != "block", kv[0][1]))
-    holes = _extents(spans)
-    # The run reaching the end of the file has no section behind it to run into, and
-    # nothing below it either -- so the file ends wherever this run does, and shrinks.
-    tail = eof
-    if holes and holes[-1][1] >= eof:
-        tail, holes[-1][1] = holes[-1][0], float("inf")
-    at = {}
-    for key, buf in items:
-        at[key] = tail + -tail % 4
-        for hole in holes:
-            start = hole[0] + -hole[0] % 4
-            if start + len(buf) <= hole[1]:
-                at[key], hole[0] = start, start + len(buf)
-                break
-        tail = max(tail, at[key] + len(buf))
-    return items, at, tail
-
-
-def region_start(m):
-    """Where the whole animation region may be re-emitted in one piece, compacting it.
-
-    Only a region this writer laid down itself qualifies, and the test is byte identity:
-    re-emitting the animations exactly as they are must reproduce everything from the
-    first block to EOF. A file straight from studiomdl fails it -- its animation data is
-    followed by mesh and texture blocks this code does not parse -- and then this falls
-    back to the end of the file, where `Writer` uses it only as the last resort behind
-    packing the payload into the bytes it already holds.
-    """
-    starts = [a.base for a in m.anims if a.numframes > 0]
-    if not starts:
-        return len(m.d)
-    at = min(starts)
-    animindex = struct.unpack_from("<ii", m.d, M.HDR_NUMANIM)[1]
-    if at <= animindex + len(m.anims) * M.ANIMDESC_STRIDE:
-        return len(m.d)
-    buf, _ = _emit_region(m, animindex, [read_tracks(m, a) for a in m.anims], at)
-    return at if m.d[at:] == buf else len(m.d)
-
-
-class Writer:
-    """Rewrites every animation of one .mdl into the bytes they already hold between them.
-
-    The payload is packed end to end there and only the overflow -- more frames, more
-    channels, a longer encoding -- goes past the end of the file. Ahead of that: a region
-    this writer laid down itself is re-emitted whole at its own start. Behind it: if the
-    spans cannot be told apart at all, the whole payload is appended.
-    """
-
-    def __init__(self, m):
-        if not m.anims:
-            raise ValueError("%s has no animations to write" % m.path)
-        self.m = m
-        self.animindex = struct.unpack_from("<ii", m.d, M.HDR_NUMANIM)[1]
-        self.at = region_start(m)
-        self.spans = owned_spans(m, self.animindex) if self.at == len(m.d) else None
-
-    def build(self, tracks, scales):
-        m = self.m
-        out = bytearray(m.d) if self.spans is not None else bytearray(m.d[:self.at])
-        for b in m.bones:
-            off = struct.unpack_from("<ii", m.d, M.HDR_NUMBONES)[1] + b.index * M.BONE_STRIDE
-            struct.pack_into("<3f", out, off + M.BONE_POSSCALE, *scales[b.index][0:3])
-            struct.pack_into("<4f", out, off + M.BONE_ROTSCALE, *scales[b.index][3:7])
-
-        if self.spans is None:
-            region, patch = _emit_region(m, self.animindex, tracks, self.at)
-            for off, fmt, values in patch:
-                struct.pack_into(fmt, out, off, *values)
-            out += region
-        else:
-            self._place(out, tracks)
-        struct.pack_into("<i", out, M.HDR_LENGTH, len(out))
-        return bytes(out)
-
-    def _place(self, out, tracks):
-        m = self.m
-        items, at, tail = _plan(m, tracks, self.spans, len(out))
-        if tail > len(out):
-            out.extend(b"\0" * (tail - len(out)))
-        for key, buf in items:
-            out[at[key]:at[key] + len(buf)] = buf
-        del out[tail:]
-        for a in m.anims:
-            t = tracks[a.index]
-            desc = self.animindex + a.index * M.ANIMDESC_STRIDE
-            struct.pack_into("<fii", out, desc + 4, t.fps, t.flags, t.numframes)
-            if t.numframes <= 0:
-                continue
-            struct.pack_into("<i", out, desc + 0x30, at[("block", a.index)] - desc)
-            struct.pack_into("<i", out, desc + 0x10, len(t.movements))
-            if t.movements:
-                struct.pack_into("<i", out, desc + 0x14, at[("move", a.index)] - desc)
-
-
-def write_many(m, edits):
-    """Replace any number of animations with authored local poses and re-emit the file.
-
-    `edits` maps animation index to a dict holding `poses` and optionally `fps`, `flags`
-    and `movements`. Widening a bone's scales to fit the new poses changes how *every*
-    animation in the file decodes, since they share `mstudiobone_t`, so all of them are
-    requantised here -- and that is also why this takes them all at once. Per-animation
-    calls each append a whole fresh animation region, which on move_and_ranged.mdl's 674
-    overruns the signed int in `studiohdr_t.length` before it finishes.
-    """
-    for i in edits:
-        if not 0 <= i < len(m.anims):
-            raise ValueError("no animation %d in %s" % (i, m.path))
-    old = file_scales(m)
-    scales = fit_scales(m, [e["poses"] for e in edits.values()])
-    tracks = [read_tracks(m, a) for a in m.anims]
-    for t in tracks:
-        rescale(t, old, scales)
-    for i, e in edits.items():
-        t = tracks[i]
-        t.numframes = len(e["poses"])
-        t.chan = quantise(m, e["poses"], scales)
-        for field in ("fps", "flags"):
-            if e.get(field) is not None:
-                setattr(t, field, e[field])
-        if e.get("movements") is not None:
-            t.movements = list(e["movements"])
-    return Writer(m).build(tracks, scales)
-
-
-def write_poses(m, index, poses, fps=None, flags=None, movements=None):
-    return write_many(m, {index: {"poses": poses, "fps": fps, "flags": flags,
-                                  "movements": movements}})
-
-
-def rewrite(m, edits=None):
-    """Re-emit every animation. `edits` maps animation index to a Tracks whose channels
-    are already quantised against `scales`; anything absent is carried over unchanged.
-
-    With no edits and no scale change this reproduces the original animation region byte
-    for byte, relocated -- which is the only test that covers the packing rules.
-    """
-    tracks = [read_tracks(m, a) for a in m.anims]
-    if edits:
-        for i, t in edits.items():
-            tracks[i] = t
-    return Writer(m).build(tracks, file_scales(m))

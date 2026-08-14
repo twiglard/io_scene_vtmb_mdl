@@ -358,14 +358,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "coordinate: the file stores one UV per vertex and spells a seam by "
                     "duplicating the vertex, so a seam newly cut in Blender has nowhere "
                     "to go")
-    rebuild: bpy.props.BoolProperty(
-        name="Rebuild the file", default=True,
-        description="Write every section out again and compute every offset from where it "
-                    "landed, instead of editing the file in place. Spans nothing in the "
-                    "file points at are not carried across, so the model comes out smaller "
-                    "and holds only what the format code can account for. Nothing a reader "
-                    "can see changes, and the checksum is kept so the .vtx beside it still "
-                    "pairs")
     write_weights: bpy.props.BoolProperty(
         name="Weights", default=False,
         description="Write which bones move each vertex and how much, from the vertex "
@@ -467,18 +459,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             else:
                 _pair(box, "meshes", "left alone", icon="INFO")
 
-        box = _section(lay, "vtmb_rebuild", "Rebuild", icon="FILE_REFRESH")
-        if box is not None:
-            box.prop(self, "rebuild")
-            if self.rebuild:
-                box.label(text="offsets recomputed, unreferenced spans dropped",
-                          icon="INFO")
-
-        if self.target == NONE and not fields and not self.rebuild:
-            lay.label(text="Nothing to write: pick something above.", icon="ERROR")
-        else:
-            lay.label(text="Everything else is written as-is.",
-                      icon="LOCKED")
+        lay.label(text="Rebuilt from scratch: every offset recomputed, unreferenced "
+                       "spans dropped.", icon="FILE_REFRESH")
+        lay.label(text="Everything else is carried across unchanged.", icon="LOCKED")
 
     def execute(self, context):
         obj = context.active_object
@@ -487,11 +470,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "nothing to read from: this action was not imported "
                                    "from a .mdl, and the file being written does not "
                                    "exist yet, so there is no model to put it into")
-            return {"CANCELLED"}
-        if self.target == NONE and not _mesh_fields(self) and not self.rebuild:
-            self.report({"ERROR"}, "nothing selected to write: choose an animation under "
-                                   "Replace, tick a field under Mesh, or tick Rebuild the "
-                                   "file")
             return {"CANCELLED"}
         one = self.target not in (ALL, NONE)
         frame = context.scene.frame_current
@@ -513,7 +491,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             r = blender_export.export_actions(
                 context, obj, src, self.filepath, actions,
                 keep_travel=self.keep_travel, travel=self.travel,
-                mesh_fields=_mesh_fields(self), rebuild=self.rebuild,
+                mesh_fields=_mesh_fields(self),
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
         except Exception as exc:
@@ -534,12 +512,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if mesh["unsupported"]:
             self.report({"WARNING"}, "%s cannot be stored by every model of this file and "
                                      "was skipped there" % ", ".join(mesh["unsupported"]))
-        if r.get("rebuild"):
-            rb = r["rebuild"]
-            self.report({"INFO"}, "rebuilt: %d blocks, %d B unreferenced dropped, "
-                                  "%d of %d offsets recomputed, %d write cursors zeroed"
-                        % (rb["blocks"], rb["dropped"], rb["rewritten"], rb["pointers"],
-                           rb["cursors"]))
         what = ", ".join("%s from %r (%d frames)" % (n, a, f)
                          for _, n, a, f, _ in r["wrote"]) or "nothing"
         extra = ("; %s of %d vertices over %d meshes"

@@ -9,12 +9,13 @@ from the scene.
 
 import math
 import os
+import struct
 
 import bpy
 
 from . import mdl as mdl_mod
+from . import mdl_build as build_mod
 from . import mdl_write as write_mod
-from . import mdl_rebuild as rebuild_mod
 from . import mesh_write as mesh_mod
 
 
@@ -298,12 +299,12 @@ def describe_ignored(ignored, limit=3):
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, keep_travel=True,
-                   travel="keep", mesh_fields=(), rebuild=False):
-    """Write `actions`, an {animation index: action} map, into a copy of `source`.
+                   travel="keep", mesh_fields=()):
+    """Author `source` again with `actions`, an {animation index: action} map, applied.
 
-    An empty map is meaningful: it re-emits every animation unchanged, which is how the
-    dialog's "copy unchanged" spells itself and the only way to rebuild a file without
-    touching its content.
+    The file is always rebuilt from its own decoded records -- every count from a `len()`,
+    every offset from where its target landed -- so an empty map is meaningful and re-emits
+    the model unchanged rather than copying it.
     """
     m = mdl_mod.Mdl(source)
     ad = arm_obj.animation_data
@@ -343,35 +344,28 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if ad is not None and ad.action is not restore:
             ad.action = restore
 
+    d = build_mod.apply_anims(build_mod.from_bytes(bytes(m.d)), edits, source)
+
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0}
     if mesh_fields:
-        # Before the animation write, so it happens on the file the offsets were read
-        # from rather than on a rebuilt one.
         cells, mesh["missing"], mesh["unsupported"], mesh["normals"] = \
             read_meshes(m, source, mesh_fields)
         if not cells and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
-        if cells:
-            patched, mesh["verts"] = mesh_mod.patch(m, cells, mesh_fields)
-            mesh["models"] = len(cells)
-            m = mdl_mod.Mdl(source, data=patched)
+        for (bi, mi), verts in sorted(cells.items()):
+            rec = d.bodyparts[bi].kids[mi]
+            rec.extra["verts"], n = mesh_mod.pack_model(
+                m.bodyparts[bi].models[mi], verts, mesh_fields, rec.extra["verts"])
+            mesh["verts"] += n
+        mesh["models"] = len(cells)
 
-    # Re-emitting animations nobody replaced relocates the region and strands the old one,
-    # which on a pristine file costs ~90 KB for no change at all.
-    data = write_mod.write_many(m, edits) if edits else bytes(m.d)
-    built = None
-    if rebuild:
-        # The donor's checksum is kept: the .vtx beside this file still carries it, and the
-        # engine draws nothing at all when the two disagree.
-        before = data
-        data, built = rebuild_mod.rebuild(before)
-        bad, _n = rebuild_mod.verify(before, data)
-        if bad:
-            raise ValueError("rebuild changed what the file says: %s" % "; ".join(bad))
+    # The donor's checksum is kept: the .vtx beside this file still carries it, and the
+    # engine draws nothing at all when the two disagree.
+    data = build_mod.emit(d, checksum=d.checksum)
     with open(dest, "wb") as f:
         f.write(data)
-    return {"wrote": wrote, "bones": len(m.bones), "mesh": mesh, "rebuild": built,
+    return {"wrote": wrote, "bones": len(m.bones), "mesh": mesh,
             "bytes": len(data), "was": len(m.d), "anims": len(m.anims)}
 
 
