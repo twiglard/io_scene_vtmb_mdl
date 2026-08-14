@@ -1,0 +1,604 @@
+"""Blender addon: import Vampire: The Masquerade - Bloodlines models (MDL v2531).
+
+Run selfcheck.py under plain Python for the format check; it needs no Blender.
+"""
+
+bl_info = {
+    "name": "VTMB Model (MDL v2531)",
+    "author": "Claude Opus 5 xhigh / Twiglard",
+    "blender": (3, 0, 0),
+    "location": "File > Import > VTMB Model (.mdl), File > Export > VTMB Model (.mdl)",
+    # bl_info has no "website"; doc_url is the key that becomes a button.
+    "doc_url": "https://rpgcodex.net/",
+    "description": "Import Bloodlines skeletons, meshes, UVs, weights, textures and "
+                   "animations including the chained models. Export rewrites a .mdl in "
+                   "place: animations from Blender's poses, and optionally vertex "
+                   "positions, normals, UVs and weights. Counts never change",
+    "version": (0, 1, 99),
+    "category": "Import-Export",
+}
+
+from . import (checksum, mdl, mdl_rebuild, mdl_write, mesh_write, paths, relocs,
+               sections, tth, vpk, vtx, blender_import, blender_export)
+
+import importlib
+import os
+
+import bpy
+from bpy_extras.io_utils import ExportHelper, ImportHelper
+
+# In the operator title, because the File menu entries pass their own text and a stale
+# addon is otherwise indistinguishable from a bug.
+VERSION = ".".join(str(x) for x in bl_info["version"])
+
+ACTIVE, ALL, NONE = "~active", "~all", "~none"
+SPLIT = 0.34
+
+
+def _pair(box, key, value, icon="NONE"):
+    row = box.split(factor=SPLIT)
+    row.label(text=key)
+    row.label(text=value, icon=icon)
+
+
+def _section(lay, idname, title, icon="NONE"):
+    """A real collapsible header where Blender offers one, else a captioned box.
+
+    `UILayout.panel` is 4.1 and later and returns a None body when collapsed, so callers
+    have to skip their contents rather than draw into it.
+    """
+    try:
+        header, body = lay.panel(idname, default_closed=False)
+        header.label(text=title, icon=icon)
+        return body
+    except (AttributeError, TypeError):
+        box = lay.box()
+        box.label(text=title, icon=icon)
+        return box
+
+
+# Blender frees enum item strings it does not own, so the list a dynamic callback returns
+# has to stay referenced here or the dropdown shows garbage.
+_ANIM_ITEMS = []
+_ANIM_CACHE = {}
+_MDL_CACHE = {}
+
+
+def _cached_mdl(path):
+    """One parsed Mdl, so the panel can count meshes on every redraw."""
+    key = (path, os.path.getmtime(path))
+    if key not in _MDL_CACHE:
+        _MDL_CACHE.clear()
+        _MDL_CACHE[key] = mdl.Mdl(path)
+    return _MDL_CACHE[key]
+
+
+def _base_path(op, context):
+    """The .mdl the active action belongs to, which is the one being rewritten.
+
+    Never the save path: importing with the chain on gives actions from about 29 files at
+    once, so the file is a property of the action and not of where the result is put.
+    """
+    if getattr(op, "source", ""):
+        return bpy.path.abspath(op.source)
+    obj = context.active_object
+    ad = obj.animation_data if obj else None
+    return (ad.action.get("vtmb_source") if ad and ad.action else None) or ""
+
+
+def _base_anims(path):
+    if not path or not os.path.exists(path):
+        return []
+    key = (path, os.path.getmtime(path))
+    if key not in _ANIM_CACHE:
+        _ANIM_CACHE.clear()
+        try:
+            _ANIM_CACHE[key] = [(a.name, a.numframes) for a in mdl.Mdl(path).anims]
+        except Exception:
+            _ANIM_CACHE[key] = []
+    return _ANIM_CACHE[key]
+
+
+def _mesh_fields(op):
+    return tuple(f for f, p in (("positions", "write_positions"),
+                                ("normals", "write_normals"),
+                                ("uvs", "write_uvs"),
+                                ("weights", "write_weights"))
+                 if getattr(op, p))
+
+
+def _mesh_status(op, context, base, fields):
+    """(models the scene supplies, models the file has, fields it cannot store)."""
+    try:
+        m = _cached_mdl(base)
+    except Exception:
+        return 0, 0, []
+    no = set()
+    for _bi, _mi, _bp, mo in mesh_write.models_of(m):
+        no |= set(mesh_write.supported(mo.filetype, fields)[1])
+    return (len(blender_export.mesh_objects(m, base)),
+            len(mesh_write.models_of(m)), sorted(no))
+
+
+def _mesh_verts(base):
+    """Vertices the file's models declare. 0 for the animation libraries and null.mdl."""
+    try:
+        return sum(mo.numvertices
+                   for _bi, _mi, _bp, mo in mesh_write.models_of(_cached_mdl(base)))
+    except Exception:
+        return 0
+
+
+def _auto_name(op, context):
+    """Which animation the active-action entry lands on, through the same resolver the
+    write uses, so the dialog cannot name one slot while the write takes another."""
+    obj = context.active_object
+    ad = obj.animation_data if obj else None
+    if not (ad and ad.action):
+        return None
+    anims = _base_anims(_base_path(op, context))
+    i = blender_export.name_index([n for n, _ in anims], ad.action)
+    return None if i is None else (i, anims[i][0], anims[i][1])
+
+
+def _matches(op, context):
+    """(animation, action) pairs the every-matching-action mode would write, and how
+    many further actions aim at a slot already taken."""
+    path = _base_path(op, context)
+    anims = _base_anims(path)
+    hits, ignored = blender_export.match_indices([n for n, _ in anims], path)
+    return [(anims[i][0], a.name) for i, a in sorted(hits.items())], len(ignored)
+
+
+def _target_items(self, context):
+    """Blender takes a dynamic enum's first item as its default, and falls back to it
+    without saying so when a remembered value is gone from the rebuilt list."""
+    global _ANIM_ITEMS
+    auto = _auto_name(self, context)
+    # Kept short: the collapsed widget is about 30 characters wide and truncates in the
+    # middle, and the line under it already names the slot.
+    items = [
+        (ACTIVE, "The active action", "Replace the one animation the active action came "
+         "from%s. The usual case: import a model, edit one animation, export it back"
+         % (", %s" % auto[1] if auto else "")),
+        (ALL, "Every matching action",
+         "Replace each animation that has an action of the same name. Use this after "
+         "editing several animations of one file in the same Blender session"),
+        (NONE, "Nothing",
+         "Leave every animation alone and write only what Mesh below says, which then "
+         "is the only thing in the file that changes. Something under Mesh has to be "
+         "ticked, or the export has nothing to do and is refused"),
+    ]
+    anims = _base_anims(_base_path(self, context))
+    if anims:
+        items.append(None)
+        for i, (n, nf) in enumerate(anims):
+            cur = bool(auto) and auto[0] == i
+            items.append((n, "[%d] %s%s" % (i, n, " (*)" if cur else ""),
+                          "Replace %s, %d frames long, with the active action. %s"
+                          % (n, nf,
+                             "(*) is where the active action came from, so this writes "
+                             "back to its own slot" if cur else
+                             "Use this to put a pose authored elsewhere into a slot it "
+                             "did not come from")))
+    _ANIM_ITEMS = items
+    return _ANIM_ITEMS
+
+
+class VTMB_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    game_root: bpy.props.StringProperty(
+        name="Game root", subtype="DIR_PATH", default="",
+        description="The dir holding Vampire\\ and the mod dirs beside it")
+    mods: bpy.props.StringProperty(
+        name="Mod dirs", default="Unofficial_Patch;Vampire",
+        description="Searched in this order, as the engine's -game argument would. "
+                    "No file on disk records the order, so it has to be stated")
+    extract_root: bpy.props.StringProperty(
+        name="Extracted content", subtype="DIR_PATH", default="",
+        description="Extra tree holding models/ and materials/, searched last. Optional: "
+                    "a plain install already gives geometry, animation and textures, "
+                    "since the packs are read directly and .tth/.ttz is decoded. Point "
+                    "it at your own converted art, or at an extraction like VpkContent "
+                    "whose loose .tga then win over the packed originals")
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "game_root")
+        col.prop(self, "mods")
+        col.prop(self, "extract_root")
+
+
+def _prefs(context):
+    addon = context.preferences.addons.get(__package__)
+    p = getattr(addon, "preferences", None)
+    if p is None:
+        return "", (), ()
+    return p.game_root, paths.split_list(p.mods), paths.split_list(p.extract_root)
+
+
+class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
+    bl_idname = "import_scene.vtmb_mdl"
+    bl_label = "Import VTMB Model " + VERSION
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".mdl"
+    filter_glob: bpy.props.StringProperty(default="*.mdl", options={"HIDDEN"})
+
+    with_mesh: bpy.props.BoolProperty(
+        name="Mesh", default=True,
+        description="Read the geometry: vertices, UVs, vertex groups and materials. "
+                    "Faces come from the .vtx file beside the .mdl. Off leaves the "
+                    "armature and its animations alone")
+    with_anims: bpy.props.BoolProperty(
+        name="Animations", default=True,
+        description="Import animations as actions")
+    with_chained: bpy.props.BoolProperty(
+        name="Chained models", default=True,
+        description="Follow the include-model chain, which is where a character "
+                    "model's animations actually live. Good for browsing what a "
+                    "character can play, bad for editing one: a PC model chains to "
+                    "about 1650 animations and Blender stutters for seconds at a time. "
+                    "Turn it off, or pair it with a name filter, when authoring. Needs "
+                    "Game root set in the addon preferences unless the chain sits under "
+                    "this file's own tree")
+    root_motion: bpy.props.BoolProperty(
+        name="Root motion", default=True,
+        description="Put back the travel studiomdl took out of the animation and left in "
+                    "mstudiomovement_t, so a walk cycle crosses the scene instead of "
+                    "marching in place. Off gives the bone data exactly as stored")
+    anim_filter: bpy.props.StringProperty(
+        name="Name filter", default="",
+        description="Only import animations whose name contains this")
+    max_anims: bpy.props.IntProperty(
+        name="Max animations", default=0, min=0,
+        description="0 imports every match; the chain of a player model holds "
+                    "thousands, so pair 0 with a filter")
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        lay.use_property_decorate = False
+        lay.prop(self, "with_mesh")
+        lay.prop(self, "with_anims")
+        col = lay.column()
+        col.enabled = self.with_anims
+        for p in ("with_chained", "root_motion", "anim_filter", "max_anims"):
+            col.prop(self, p)
+        if not self.with_anims:
+            lay.label(text="Animations off: the four above only pick animations",
+                      icon="INFO")
+
+    def execute(self, context):
+        game_root, mods, extract = _prefs(context)
+        try:
+            r = blender_import.import_mdl(
+                context, self.filepath, anim_filter=self.anim_filter,
+                max_anims=self.max_anims,
+                with_mesh=self.with_mesh,
+                with_anims=self.with_anims, with_chained=self.with_chained,
+                game_root=game_root, mods=mods, extra_roots=extract,
+                root_motion=self.root_motion)
+        except Exception as exc:
+            self.report({"ERROR"}, "%s: %s" % (type(exc).__name__, exc))
+            return {"CANCELLED"}
+        if r["warning"]:
+            self.report({"WARNING"}, r["warning"])
+        self.report({"INFO"}, "vtmb mdl: %d bones, %d verts, %d faces, %d animations "
+                              "(%d chained), %d sequences, %d/%d materials textured"
+                    % (r["bones"], r["verts"], r["faces"], r["anims"],
+                       r["chained"], r["seqs"], r["textured"], r["materials"]))
+        return {"FINISHED"}
+
+
+class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
+    bl_idname = "export_scene.vtmb_mdl"
+    bl_label = "Export VTMB Model " + VERSION
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".mdl"
+    filter_glob: bpy.props.StringProperty(default="*.mdl", options={"HIDDEN"})
+
+    source: bpy.props.StringProperty(
+        name="Rewrite", subtype="FILE_PATH", default="", options={"HIDDEN"},
+        description="Scripting only: rewrite this .mdl instead of the one the active "
+                    "action was imported from. The armature must carry every bone it has")
+    # Drawn disabled purely to hang a tooltip off the filename; a label cannot have one.
+    reading: bpy.props.StringProperty(
+        name="File", default="",
+        description="The .mdl the active action was imported from. It is the template for "
+                    "the output: its skeleton, materials, sequences, hitboxes and every "
+                    "animation you are not replacing are copied across byte for byte, and "
+                    "so is its mesh unless you tick something under Mesh. Everything "
+                    "written comes from this scene's armature and meshes; nothing else "
+                    "in the scene reaches the file")
+    target: bpy.props.EnumProperty(
+        name="Replace", items=_target_items,
+        description="Which of that file's animations get poses from Blender. The rest of "
+                    "the file changes only where Mesh below says so")
+    keep_travel: bpy.props.BoolProperty(
+        name="Was applied", default=True,
+        description="Take the travel back out of the keys before writing. Tick this "
+                    "whenever the model was imported with Root motion on, or the travel "
+                    "is written a second time on top of what the file already stores and "
+                    "the animation covers twice the ground")
+    travel: bpy.props.EnumProperty(
+        name="Travel",
+        items=[("keep", "Leave the file's alone",
+                "Keep the movement blocks the file already has. Right whenever the "
+                "animation still travels the way it did"),
+               ("extract", "Rebuild from the root bone",
+                "Fit new movement blocks to the root bone's path. Use this when you "
+                "changed where the animation goes, not just how it looks"),
+               ("none", "Strip it",
+                "Write no movement blocks. The animation plays on the spot and the "
+                "engine does not move the character")],
+        default="keep")
+    use_range: bpy.props.BoolProperty(
+        name="Scene range", default=False,
+        description="Write the scene's Start and End frames rather than the action's "
+                    "own first and last keyframe. Use this to export a slice of a "
+                    "longer action")
+    write_positions: bpy.props.BoolProperty(
+        name="Positions", default=False,
+        description="Write each vertex's location. Moving vertices is allowed; adding or "
+                    "removing them is not, because the triangle lists live in the .vtx "
+                    "files and every section below the mesh would have to move")
+    write_normals: bpy.props.BoolProperty(
+        name="Normals", default=False,
+        description="Write each vertex's normal, which is what the file shades with. "
+                    "Every face meeting at a vertex must agree on it, since the format "
+                    "stores one normal per vertex and spells a hard edge by duplicating "
+                    "the vertex")
+    write_uvs: bpy.props.BoolProperty(
+        name="UVs", default=False,
+        description="Write the texture coordinates without touching the geometry they "
+                    "sit on. Every face meeting at a vertex must agree on the "
+                    "coordinate: the file stores one UV per vertex and spells a seam by "
+                    "duplicating the vertex, so a seam newly cut in Blender has nowhere "
+                    "to go")
+    rebuild: bpy.props.BoolProperty(
+        name="Rebuild the file", default=True,
+        description="Write every section out again and compute every offset from where it "
+                    "landed, instead of editing the file in place. Spans nothing in the "
+                    "file points at are not carried across, so the model comes out smaller "
+                    "and holds only what the format code can account for. Nothing a reader "
+                    "can see changes, and the checksum is kept so the .vtx beside it still "
+                    "pairs")
+    write_weights: bpy.props.BoolProperty(
+        name="Weights", default=False,
+        description="Write which bones move each vertex and how much, from the vertex "
+                    "groups named after the bones. Three bones per vertex at most, each "
+                    "weight kept to 1/255, and the largest three win when Blender has "
+                    "more")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (obj is not None and obj.type == "ARMATURE"
+                and obj.animation_data is not None
+                and obj.animation_data.action is not None)
+
+    def invoke(self, context, event):
+        # A scripted run leaves `source` set, and operator properties persist, so without
+        # this the next dialog silently rewrites whatever that script pinned.
+        self.source = ""
+        base = _base_path(self, context)
+        self.reading = os.path.basename(base) or "(none)"
+        self.filepath = base or self.filepath
+        return super().invoke(context, event)
+
+    def draw(self, context):
+        lay = self.layout
+        base = _base_path(self, context)
+        act = context.active_object.animation_data.action
+
+        box = _section(lay, "vtmb_model", "Model", icon="FILE_3D")
+        if box is not None:
+            if not base:
+                box.label(text="the active action came from no .mdl", icon="ERROR")
+            else:
+                row = box.row()
+                row.enabled = False
+                row.prop(self, "reading", text="")
+                if not self.filepath:
+                    pass
+                elif blender_export.same_file(base, self.filepath):
+                    box.label(text="overwritten in place", icon="INFO")
+                else:
+                    box.label(text="saved as %s" % os.path.basename(self.filepath),
+                              icon="INFO")
+
+        box = _section(lay, "vtmb_anims", "Animations", icon="ACTION")
+        if box is not None:
+            row = box.split(factor=SPLIT)
+            row.label(text="Replace")
+            row.prop(self, "target", text="")
+            if self.target == ALL:
+                hits, ignored = _matches(self, context)
+                _pair(box, "matched", "%d of %d" % (len(hits), len(_base_anims(base))),
+                      icon="NONE" if hits else "ERROR")
+                for name, act_name in hits[:4]:
+                    box.label(text="    " + (name if name == act_name
+                                             else "%s ← %s" % (name, act_name)))
+                if len(hits) > 4:
+                    box.label(text="    and %d more" % (len(hits) - 4))
+                if ignored:
+                    _pair(box, "ignored", "%d duplicate" % ignored, icon="INFO")
+            elif self.target != NONE:
+                auto = _auto_name(self, context)
+                if self.target == ACTIVE and not auto:
+                    box.label(text="that action came from no animation", icon="ERROR")
+                else:
+                    lo, hi = act.frame_range
+                    a, b = (context.scene.frame_start, context.scene.frame_end) \
+                        if self.use_range else (int(round(lo)), int(round(hi)))
+                    into = auto[1] if self.target == ACTIVE else self.target
+                    _pair(box, "into", into if into == act.name
+                          else "%s ← %s" % (into, act.name))
+                    _pair(box, "frames", "%d-%d (%d)" % (a, b, b - a + 1))
+                    box.prop(self, "use_range")
+
+        if self.target != NONE:
+            box = _section(lay, "vtmb_travel", "Root motion", icon="ORIENTATION_GIMBAL")
+            if box is not None:
+                box.prop(self, "keep_travel")
+                row = box.split(factor=SPLIT)
+                row.label(text="Travel")
+                row.prop(self, "travel", text="")
+
+        nverts = _mesh_verts(base)
+        fields = _mesh_fields(self)
+        box = _section(lay, "vtmb_mesh", "Mesh", icon="MESH_DATA")
+        if box is not None:
+            col = box.column(align=True)
+            col.enabled = bool(nverts)
+            for p in ("write_positions", "write_normals", "write_uvs", "write_weights"):
+                col.prop(self, p)
+            if not nverts:
+                _pair(box, "meshes", "none: the file declares no vertices", icon="INFO")
+            elif fields:
+                got, total, no = _mesh_status(self, context, base, fields)
+                _pair(box, "meshes", "%d of %d" % (got, total),
+                      icon="NONE" if got == total else "ERROR")
+                if no:
+                    _pair(box, "cannot store", ", ".join(no), icon="INFO")
+            else:
+                _pair(box, "meshes", "left alone", icon="INFO")
+
+        box = _section(lay, "vtmb_rebuild", "Rebuild", icon="FILE_REFRESH")
+        if box is not None:
+            box.prop(self, "rebuild")
+            if self.rebuild:
+                box.label(text="offsets recomputed, unreferenced spans dropped",
+                          icon="INFO")
+
+        if self.target == NONE and not fields and not self.rebuild:
+            lay.label(text="Nothing to write: pick something above.", icon="ERROR")
+        else:
+            lay.label(text="Everything else is written as-is.",
+                      icon="LOCKED")
+
+    def execute(self, context):
+        obj = context.active_object
+        src = _base_path(self, context)
+        if not src:
+            self.report({"ERROR"}, "nothing to read from: this action was not imported "
+                                   "from a .mdl, and the file being written does not "
+                                   "exist yet, so there is no model to put it into")
+            return {"CANCELLED"}
+        if self.target == NONE and not _mesh_fields(self) and not self.rebuild:
+            self.report({"ERROR"}, "nothing selected to write: choose an animation under "
+                                   "Replace, tick a field under Mesh, or tick Rebuild the "
+                                   "file")
+            return {"CANCELLED"}
+        one = self.target not in (ALL, NONE)
+        frame = context.scene.frame_current
+        try:
+            m = mdl.Mdl(src)
+            if self.target == NONE:
+                actions = {}
+            elif self.target == ALL:
+                actions, ignored = blender_export.match_actions(m, src)
+                if not actions:
+                    raise ValueError("no action shares a name with an animation of %s"
+                                     % os.path.basename(src))
+                if ignored:
+                    self.report({"WARNING"}, blender_export.describe_ignored(ignored))
+            else:
+                act = obj.animation_data.action
+                actions = {blender_export.resolve_target(
+                    m, act, "" if self.target == ACTIVE else self.target): act}
+            r = blender_export.export_actions(
+                context, obj, src, self.filepath, actions,
+                keep_travel=self.keep_travel, travel=self.travel,
+                mesh_fields=_mesh_fields(self), rebuild=self.rebuild,
+                frame_start=context.scene.frame_start if self.use_range and one else None,
+                frame_end=context.scene.frame_end if self.use_range and one else None)
+        except Exception as exc:
+            self.report({"ERROR"}, "%s: %s" % (type(exc).__name__, exc))
+            return {"CANCELLED"}
+        finally:
+            context.scene.frame_set(frame)
+        mesh = r["mesh"]
+        if mesh["missing"] and mesh["fields"]:
+            self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "
+                                     "the file's own: %s"
+                        % (len(mesh["missing"]), "" if len(mesh["missing"]) == 1 else "s",
+                           os.path.basename(src), ", ".join(mesh["missing"][:4])))
+        if mesh["normals"]:
+            self.report({"WARNING"}, "%d normals came from Blender rather than the file, "
+                                     "which costs up to 0.9 degrees each"
+                        % mesh["normals"])
+        if mesh["unsupported"]:
+            self.report({"WARNING"}, "%s cannot be stored by every model of this file and "
+                                     "was skipped there" % ", ".join(mesh["unsupported"]))
+        if r.get("rebuild"):
+            rb = r["rebuild"]
+            self.report({"INFO"}, "rebuilt: %d blocks, %d B unreferenced dropped, "
+                                  "%d of %d offsets recomputed, %d write cursors zeroed"
+                        % (rb["blocks"], rb["dropped"], rb["rewritten"], rb["pointers"],
+                           rb["cursors"]))
+        what = ", ".join("%s from %r (%d frames)" % (n, a, f)
+                         for _, n, a, f, _ in r["wrote"]) or "nothing"
+        extra = ("; %s of %d vertices over %d meshes"
+                 % ("+".join(mesh["fields"]), mesh["verts"], mesh["models"])
+                 if mesh["verts"] else "")
+        self.report({"INFO"}, "wrote %d of %d animations over %d bones, %d -> %d bytes: "
+                              "%s%s" % (len(r["wrote"]), r["anims"], r["bones"], r["was"],
+                                        r["bytes"], what, extra))
+        return {"FINISHED"}
+
+
+CLASSES = [VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl]
+
+if hasattr(bpy.types, "FileHandler"):
+    class IO_FH_vtmb_mdl(bpy.types.FileHandler):
+        bl_idname = "IO_FH_vtmb_mdl"
+        bl_label = "VTMB Model"
+        bl_import_operator = "import_scene.vtmb_mdl"
+        bl_file_extensions = ".mdl"
+
+        @classmethod
+        def poll_drop(cls, context):
+            return context.area and context.area.type == "VIEW_3D"
+
+    CLASSES.append(IO_FH_vtmb_mdl)
+
+
+def _menu(self, context):
+    self.layout.operator(IMPORT_OT_vtmb_mdl.bl_idname, text="VTMB Model (.mdl)")
+
+
+def _menu_export(self, context):
+    self.layout.operator(EXPORT_OT_vtmb_mdl.bl_idname, text="VTMB Model (.mdl)")
+
+
+def unregister():
+    for menu, fn in ((bpy.types.TOPBAR_MT_file_import, _menu),
+                     (bpy.types.TOPBAR_MT_file_export, _menu_export)):
+        try:
+            menu.remove(fn)
+        except Exception:
+            pass
+    for cls in reversed(CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+
+
+def register():
+    # addon_utils compares only __init__.py's mtime, so without this an edit to any
+    # other module survives a disable/enable cycle as stale code.
+    for m in (checksum, sections, relocs, mdl, mdl_write, mdl_rebuild, mesh_write,
+              paths, tth, vpk, vtx, blender_import, blender_export):
+        importlib.reload(m)
+    # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
+    # class of the same bl_idname otherwise makes register_class raise.
+    unregister()
+    for cls in CLASSES:
+        bpy.utils.register_class(cls)
+    bpy.types.TOPBAR_MT_file_import.append(_menu)
+    bpy.types.TOPBAR_MT_file_export.append(_menu_export)
