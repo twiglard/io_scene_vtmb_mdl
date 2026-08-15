@@ -50,10 +50,22 @@ BONEMAP_RECORD = struct.pack("<ii", 0x0000FFFF, -1) + b"\0" * 48
 
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
+# mstudiobonecontroller_t is 24 bytes here, not Valve's 56, and the engine matches a
+# controller by a field rather than by array position. client.dll's lookup at 0x1008b366:
+# numbonecontrollers@248 gates it, bonecontrollerindex@252 is file-relative,
+# `CMP [EAX+0x14],ECX` tests the requested index against +0x14, and the loop advances by
+# `ADD EAX,0x18` -- corroborated by the lookahead reading the next record's +0x14 as
+# [EAX+0x2c]. No shipped model authors one, so only a writer is affected.
+BONECONTROLLER_STRIDE = 24
+
 DEFAULTS = {
     "hdr.unk144": (0.5, 0.5, 0.5),      # on 4416 of 4423 models
-    "hdr.unk232": 0.0,
-    "hdr.unk236": 0.0,
+    # The phoneme filter: the bounds a phoneme's own duration is clamped into before it
+    # becomes the lipsync blend width. client.dll 0x100c3be0 falls back to this pair when
+    # the phonemefilter_min/max ConVars are unset, taking +0xec (236) as the upper bound
+    # and +0xe8 (232) as the lower. Zero is not a neutral default -- it clamps the window
+    # shut. This is the modal pair over the 202 installed models that carry a face.
+    "hdr.phonemefilter": (0.065, 0.100),
     "hdr.unhz": (0, 0, 1),              # on every model
     "seqgroup": ("default", ""),        # on every model
 }
@@ -215,7 +227,8 @@ def from_bytes(b):
         d.bones.append(r)
 
     for k in range(i(248)):
-        d.bonecontrollers.append(Rec(b[i(252) + k * 56:i(252) + (k + 1) * 56]))
+        s = i(252) + k * BONECONTROLLER_STRIDE
+        d.bonecontrollers.append(Rec(b[s:s + BONECONTROLLER_STRIDE]))
 
     for k in range(i(256)):
         o = i(260) + k * 12
@@ -423,7 +436,8 @@ def emit(d, checksum=None, drop=False):
     count(240, nb)
     hdrptr(244, "bones", nb)
 
-    _simple(o, hdr, d.bonecontrollers, "bonecontrollers", 56, 248, 252)
+    _simple(o, hdr, d.bonecontrollers, "bonecontrollers",
+            BONECONTROLLER_STRIDE, 248, 252)
 
     if d.hitboxsets:
         raw = bytearray()
@@ -704,7 +718,10 @@ def new(name, surfaceprop="flesh"):
     """An empty description: header scalars, one sequence group, no records.
 
     The unnamed scalars take their corpus value rather than zero -- `unk144` is
-    (0.5, 0.5, 0.5) on 4416 of 4423 models and `unhz` is (0, 0, 1) on every one.
+    (0.5, 0.5, 0.5) on 4416 of 4423 models and `unhz` is (0, 0, 1) on every one. The
+    phoneme filter is written for the same reason and a stronger one: it is a clamp, so
+    leaving it zero does not mean "unset", it means every lipsync blend collapses to zero
+    width.
     """
     d = Desc()
     d.name = name
@@ -712,6 +729,7 @@ def new(name, surfaceprop="flesh"):
     struct.pack_into("<i", h, 0, 0x54534449)
     struct.pack_into("<i", h, 4, M.VERSION)
     struct.pack_into("<3f", h, 144, *DEFAULTS["hdr.unk144"])
+    struct.pack_into("<2f", h, 232, *DEFAULTS["hdr.phonemefilter"])
     struct.pack_into("<3f", h, 180, -16.0, -16.0, 0.0)
     struct.pack_into("<3f", h, 192, 16.0, 16.0, 72.0)
     struct.pack_into("<3i", h, 412, *DEFAULTS["hdr.unhz"])
