@@ -143,10 +143,34 @@ def check_vertices(m, verbose=True):
                 print("  !!! %s" % exc)
                 return False, n, None
             if model.filetype != 0:
-                if verbose:
-                    print("  model %r filetype=%d: positions and UVs are decoded, "
-                          "normals and weights are not in the file" %
-                          (model.name, model.filetype))
+                # A packed format carries no normal and no weight, but its positions are
+                # still checkable against the model's own quantisation: the scalar cannot
+                # exceed its type's maximum, so no decoded coordinate may leave
+                # [offset, offset + max*norm*scale]. Skipping the packed formats outright
+                # is what let a decode that multiplied the byte raw -- 255x past that
+                # bound on every filetype-2 model -- pass the whole corpus.
+                lim = (mdl_mod.QUANT_MAX[model.filetype]
+                       * mdl_mod.QUANT_NORM[model.filetype])
+                out = 0
+                for v in vs:
+                    for c in range(3):
+                        lo = model.quant_offset[c]
+                        hi = lo + lim * model.quant_scale[c]
+                        if lo > hi:
+                            lo, hi = hi, lo
+                        slack = 1e-3 * max(1.0, hi - lo)
+                        if not (lo - slack <= v.pos[c] <= hi + slack):
+                            out += 1
+                n += len(vs)
+                if out:
+                    print("  !!! %d of %d packed coordinates leave the model's own "
+                          "quantisation range (filetype %d, %r)"
+                          % (out, 3 * len(vs), model.filetype, model.name))
+                    ok = False
+                elif verbose:
+                    print("  %d verts %r filetype=%d: positions in range, UVs decoded, "
+                          "normals and weights are not in the file"
+                          % (len(vs), model.name, model.filetype))
                 continue
             lens = [math.sqrt(sum(x * x for x in v.normal)) for v in vs]
             # A handful of degenerate verts carry a null normal; only a normal that is

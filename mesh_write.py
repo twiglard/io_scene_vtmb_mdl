@@ -58,8 +58,15 @@ def count_code(old, numbones):
     return (old - old % 5) + (numbones % 5)
 
 
-def quantise(v, offset, scale):
-    return 0 if not scale else int(round((v - offset) / scale))
+def quantise(v, offset, scale, norm=1.0):
+    """The inverse of `Mdl.vertices`' packed-position decode.
+
+    `norm` is that format's scalar normalisation -- 1.0 for filetype 1's raw u16, 1/255
+    for filetype 2's byte -- so this has to divide it back out. Encoding without it is
+    self-consistent with a decode that also omits it, which is why a Blender round trip
+    reproduces the file byte for byte while both halves disagree with the engine.
+    """
+    return 0 if not scale else int(round((v - offset) / (scale * norm)))
 
 
 def patch_model(data, model, verts, fields):
@@ -75,7 +82,8 @@ def patch_model(data, model, verts, fields):
     fields, _ = supported(model.filetype, fields)
     if not fields:
         return 0
-    lim = 2 ** 16 - 1 if model.filetype == 1 else 255
+    lim = M.QUANT_MAX.get(model.filetype, 255)
+    norm = M.QUANT_NORM.get(model.filetype, 1.0)
     for i, v in enumerate(verts):
         o = model.vertexbase + i * stride
         if model.filetype == 0:
@@ -96,7 +104,8 @@ def patch_model(data, model, verts, fields):
         else:
             if "positions" in fields:
                 q = [max(0, min(lim, quantise(v.pos[c], model.quant_offset[c],
-                                              model.quant_scale[c]))) for c in range(3)]
+                                              model.quant_scale[c], norm)))
+                     for c in range(3)]
                 struct.pack_into("<3H" if model.filetype == 1 else "<3B", data, o, *q)
             if "uvs" in fields and v.uv is not None:
                 uv = [max(0, min(65535, int(round(x * 65535.0)))) for x in v.uv]
