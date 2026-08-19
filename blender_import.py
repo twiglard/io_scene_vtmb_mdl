@@ -113,10 +113,13 @@ def _scaled(m, s):
 def _display_lengths(m, rest, scale):
     """Draw each bone out to its first child, and a childless one to half its parent.
 
-    Length is cosmetic -- it moves the tail along the bone's own Y and leaves head, roll
-    and matrix_local alone -- but nothing here may be a constant: every length has to
-    carry `scale`, or a non-1.0 import leaves the leaf bones dwarfing the real ones.
-    Parents precede children, so one pass suffices.
+    Nothing here may be a constant: every length has to carry `scale`, or a non-1.0 import
+    leaves the leaf bones dwarfing the real ones.  Parents precede children, so one pass
+    suffices.
+
+    The `1e-4` floor costs accuracy rather than only looks: matrix_local is derived from
+    `tail - head` in float32, so a bone at the floor with its head 27 units out comes back
+    1.4e-3 per quaternion entry away from what was assigned, against 1.3e-5 at length 1.
     """
     first = {}
     for b in m.bones:
@@ -161,13 +164,23 @@ def build_armature(context, m, name, scale):
             eb.parent = edit_bones[b.parent]
     bpy.ops.object.mode_set(mode="OBJECT")
 
+    dbs = arm_obj.data.bones
     for b in m.bones:
         pb = arm_obj.pose.bones[b.name]
         pb.rotation_mode = "QUATERNION"
         # rotscale bounds what can ever be written back to this bone.
+        # Bit 1 is BONE_ROTATION_FROM_ROOT, which decides what a pose's local rotation even
+        # means, so a scene-authored rewrite has to know it before it samples a frame.
+        pb["vtmb_bone_flags"] = b.flags
         pb["vtmb_rotscale"] = list(b.rotscale)
         pb["vtmb_posscale"] = list(b.posscale)
         pb["vtmb_rot_limit"] = [32767.0 * s for s in b.rotscale]
+        # The export path's did-this-move baseline. The file's own record cannot serve:
+        # head/tail/roll storage loses up to 1.4e-3 per quaternion entry on a short bone.
+        local = dbs[b.name].matrix_local
+        if b.parent >= 0:
+            local = dbs[m.bones[b.parent].name].matrix_local.inverted() @ local
+        pb["vtmb_rest_local"] = [f for row in local for f in row]
 
     arm_obj["vtmb_scale"] = scale
     arm_obj["vtmb_checksum"] = m.checksum
@@ -392,7 +405,13 @@ def build_meshes(context, m, arm_obj, name, scale, content):
                        [list(f[0]) for f in faces])
         me.update()
 
+        # Seeded from the meshes rather than the faces so a mesh whose triangles all sit
+        # in a lower LOD still gets a slot, which is what lets the exporter place it.
         slots = {}
+        for mesh in model.meshes:
+            if mesh.material not in slots:
+                slots[mesh.material] = len(slots)
+                me.materials.append(_material(m, mesh.material, content))
         for _tri, matidx in faces:
             if matidx not in slots:
                 slots[matidx] = len(slots)
@@ -404,6 +423,15 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         for loop in me.loops:
             u, w = verts[loop.vertex_index].uv
             uv.data[loop.index].uv = (u, 1.0 - w)
+
+        # A vertex added later copies this rather than getting a sentinel, so a tag stops
+        # being unique; obj["vtmb_orig_co"] below is what breaks the tie.
+        att = me.attributes.new("vtmb_orig", "INT", "POINT")
+        att.data.foreach_set("value", list(range(len(verts))))
+        # A loose vertex has no loop, so the UV layer cannot give it one back.
+        att = me.attributes.new("vtmb_uv", "FLOAT2", "POINT")
+        att.data.foreach_set("vector",
+                             [c for v_ in verts for c in (v_.uv[0], 1.0 - v_.uv[1])])
 
         if model.filetype == 0:
             me.normals_split_custom_set_from_vertices(
@@ -427,6 +455,12 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         obj["vtmb_bodypart"] = bp.name
         obj["vtmb_model"] = model.name
         obj["vtmb_filetype"] = model.filetype
+        # The mesh partition of the vertex array, which Blender's per-face material slot
+        # cannot express: two meshes may share a material, and a loose vertex has no face.
+        obj["vtmb_meshes"] = [[slots[x.material], x.numvertices] for x in model.meshes]
+        # Keyed by file vertex, not by Blender vertex: an edit rewrites the second and
+        # interpolates any float attribute, so only an object property survives one.
+        obj["vtmb_orig_co"] = [c * scale for v_ in verts for c in v_.pos]
         # Names are not unique: move_and_ranged has four bodyparts whose model is called
         # sharedbones.smd, so only the position in the file tells them apart.
         obj["vtmb_index"] = gi
