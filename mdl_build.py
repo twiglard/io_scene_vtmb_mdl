@@ -900,13 +900,8 @@ def add_material(d, name, cdtexture="models/"):
     return len(d.textures) - 1
 
 
-def add_mesh(d, verts, faces, material=0, bodypart="studio", model="model"):
-    """One bodypart holding one model holding one mesh.
-
-    `verts` is [(pos, normal, uv, [(bone, weight), ...]), ...], `faces` triples of indices
-    into it.  Only filetype 0 is emitted: 1 and 2 quantise through the model's
-    quant_offset/quant_scale and filetype 2's scale reading is unconfirmed.
-    """
+def _pack_verts(verts):
+    """`mstudiovertex0_t[]` and its tangent array for one run of vertices."""
     vb, tb = bytearray(), bytearray()
     for pos, nrm, uv, binding in verts:
         b = sorted(binding, key=lambda x: -x[1])[:4]
@@ -924,25 +919,53 @@ def add_mesh(d, verts, faces, material=0, bodypart="studio", model="model"):
         vb += struct.pack("<2f", *uv)
         t = _perp(nrm)
         tb += struct.pack("<4f", t[0], t[1], t[2], 1.0)
+    return vb, tb
 
-    mraw = bytearray(60)
-    struct.pack_into("<i", mraw, 0x00, material)
-    struct.pack_into("<i", mraw, 0x08, len(verts))
-    cx = [sum(v[0][k] for v in verts) / max(1, len(verts)) for k in range(3)]
-    struct.pack_into("<3f", mraw, 0x24, *cx)
+
+def add_model(d, meshes, bodypart="studio", model="model"):
+    """One bodypart holding one model whose meshes share a vertex array.
+
+    `meshes` is [(material, verts, faces), ...]; `verts` is
+    [(pos, normal, uv, [(bone, weight), ...]), ...] and `faces` triples of indices into
+    that mesh's own `verts`.  A mesh owns a contiguous run of the model's array, which is
+    what `mstudiomesh_t.vertexoffset` addresses, so the runs concatenate in order.
+
+    Only filetype 0 is emitted: 1 and 2 quantise through the model's
+    quant_offset/quant_scale and filetype 2's scale reading is unconfirmed.
+    """
+    vb, tb, recs, face_lists, offset, radius = \
+        bytearray(), bytearray(), [], [], 0, 0.0
+    for material, verts, faces in meshes:
+        pvb, ptb = _pack_verts(verts)
+        vb += pvb
+        tb += ptb
+        mraw = bytearray(60)
+        struct.pack_into("<i", mraw, 0x00, material)
+        struct.pack_into("<i", mraw, 0x08, len(verts))
+        struct.pack_into("<i", mraw, 0x0c, offset)
+        cx = [sum(v[0][k] for v in verts) / max(1, len(verts)) for k in range(3)]
+        struct.pack_into("<3f", mraw, 0x24, *cx)
+        recs.append(Rec(mraw))
+        face_lists.append(list(faces))
+        offset += len(verts)
+        radius = max([radius] + [sum(x * x for x in v[0]) ** 0.5 for v in verts])
 
     moraw = bytearray(224)
     moraw[0:128] = model.encode("latin1")[:127].ljust(128, b"\0")
-    struct.pack_into("<f", moraw, 0x84,
-                     max((sum(x * x for x in v[0]) ** 0.5 for v in verts), default=0.0))
+    struct.pack_into("<f", moraw, 0x84, radius)
 
-    mo = Rec(moraw, None, [Rec(mraw)],
+    mo = Rec(moraw, None, recs,
              {"verts": bytes(vb), "tangents": bytes(tb), "eyes": []})
     bp = Rec(bytearray(16), bodypart, [mo])
     struct.pack_into("<i", bp.raw, 0x08, 1)
     d.bodyparts.append(bp)
-    d.faces.append(list(faces))
+    d.faces.append([face_lists])
     return len(d.bodyparts) - 1
+
+
+def add_mesh(d, verts, faces, material=0, bodypart="studio", model="model"):
+    """One bodypart holding one model holding one mesh."""
+    return add_model(d, [(material, verts, faces)], bodypart, model)
 
 
 def _perp(n):
