@@ -12,9 +12,11 @@ import os
 import struct
 
 import bpy
+import mathutils
 
 from . import mdl as mdl_mod
 from . import mdl_build as build_mod
+from . import mdl_rebuild as rebuild_mod
 from . import mdl_write as write_mod
 from . import mesh_write as mesh_mod
 
@@ -24,6 +26,14 @@ UV_TOL = 1e-6
 # disagree by up to 9.2e-03; under this a normal is taken as unedited.
 NORMAL_EPS = 1.5e-2
 NORMAL_ATTR = "vtmb_normal"
+# Against the import stash an untouched bone compares exactly; this only absorbs a
+# recomposition of the same float32s.
+REST_EPS = 1e-6
+# Without a stash the file's record is the baseline, and Blender loses 3.2e-05 of a bone's
+# offset to chain composition and 1.4e-03 per quaternion entry to head/tail/roll storage.
+REST_POS_EPS = 1e-3
+REST_POS_REL = 1e-4
+REST_QUAT_EPS = 2e-3
 SKIN_ATTR = "vtmb_skin"
 WEIGHT_ATTR = "vtmb_weight"
 COUNT_ATTR = "vtmb_numbones"
@@ -56,6 +66,87 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion=False)
             world = [mdl_mod.mat_mul(off, w) for w in world]
         out.append(write_mod.local_from_world(m, world))
     return write_mod.unwind_signs(out)
+
+
+def to_file(local, scale):
+    """(pos, quat) in the file's convention out of a parent-relative Blender matrix.
+
+    The importer scales translation only, so the rotation comes back untouched and only the
+    offset divides out. Blender orders a quaternion w first and the file x first.
+    """
+    t, q = local.to_translation(), local.to_quaternion()
+    return (t.x / scale, t.y / scale, t.z / scale), (q.x, q.y, q.z, q.w)
+
+
+def bone_flags(arm_obj, name):
+    """`vtmb_bone_flags` as the importer stashed it, or None to keep the file's own.
+
+    Verbatim, with none of `blender_scratch`'s zero-used-by-mask guard: there is a file
+    value here and it is already what the engine accepts -- manbat's Dummy01 ships 0x0 --
+    so forcing a bit in would edit a bone nobody asked to edit.
+    """
+    pb = arm_obj.pose.bones.get(name)
+    f = pb.get("vtmb_bone_flags") if pb is not None else None
+    return None if f is None else int(f)
+
+
+def rest_baseline(arm_obj, name):
+    """`vtmb_rest_local` as a Matrix, or None where the importer stashed none."""
+    pb = arm_obj.pose.bones.get(name)
+    v = pb.get("vtmb_rest_local") if pb is not None else None
+    if v is None or len(v) != 16:
+        return None
+    return mathutils.Matrix([tuple(v[i * 4:i * 4 + 4]) for i in range(4)])
+
+
+def moved_from_file(m, b, pos, quat):
+    """Did this bone leave the file's own record, allowing for what Blender cannot hold.
+
+    Only for a bone the importer stashed no baseline for. The bounds are far coarser than
+    an edit, so the answer is one-sided: a real edit under them is missed, silently.
+    """
+    tol = REST_POS_EPS + REST_POS_REL * max(abs(x) for x in b.pos)
+    return not (all(abs(x - y) <= tol for x, y in zip(pos, b.pos))
+                and all(abs(x - y) <= REST_QUAT_EPS for x, y in zip(quat, b.quat)))
+
+
+def read_bones(m, arm_obj, scale):
+    """{index: (pos, quat, flags)} for the bones of `m` the armature actually moved.
+
+    A bone still sitting on its imported pose is left out, so an unedited export does not
+    touch the bone array and comes back byte for byte -- the same reason the mesh puts an
+    unmoved vertex back with its file bytes rather than Blender's.
+
+    The file's parent chain is what the local matrix is taken against, not Blender's. The
+    two agree on an imported armature, and where they disagree it is the file the output
+    has to stay consistent with.
+    """
+    dbs = arm_obj.data.bones
+    missing = [b.name for b in m.bones if b.name not in dbs]
+    if missing:
+        raise ValueError("armature has no bone %s (and %d more)"
+                         % (missing[0], len(missing) - 1))
+    out = {}
+    for k, b in enumerate(m.bones):
+        local = dbs[b.name].matrix_local
+        if b.parent >= 0:
+            local = dbs[m.bones[b.parent].name].matrix_local.inverted() @ local
+        pos, quat = to_file(local, scale)
+        flags = bone_flags(arm_obj, b.name)
+        # A quaternion and its negation are one rotation, so the nearer sign wins or a bone
+        # the importer flipped reads as moved.
+        if sum(x * y for x, y in zip(quat, b.quat)) < 0:
+            quat = tuple(-x for x in quat)
+        base = rest_baseline(arm_obj, b.name)
+        if base is None:
+            moved = moved_from_file(m, b, pos, quat)
+        else:
+            moved = any(abs(local[i][j] - base[i][j]) > REST_EPS
+                        for i in range(4) for j in range(4))
+        if not moved and (flags is None or flags == b.flags):
+            continue
+        out[k] = (pos, quat, flags)
+    return out
 
 
 def mesh_objects(m, source):
@@ -297,16 +388,111 @@ def describe_ignored(ignored, limit=3):
         len(ignored), "" if len(ignored) == 1 else "s", head, more)
 
 
+def read_materials(m, source):
+    """{file texture index: name} from the scene's material slots.
+
+    `obj["vtmb_meshes"]` records which slot each file mesh landed in, and it is the only
+    thing that maps a material back: two meshes may share one, and Blender's per-face slot
+    cannot speak for a mesh whose triangles all sit in a lower LOD.
+    """
+    out = {}
+    for (bi, mi), obj in sorted(mesh_objects(m, source).items()):
+        stash = obj.get("vtmb_meshes")
+        if not stash:
+            continue
+        mats = obj.data.materials
+        for j, mesh in enumerate(m.bodyparts[bi].models[mi].meshes):
+            if j >= len(stash):
+                break
+            slot = int(stash[j][0])
+            if not 0 <= slot < len(mats) or mats[slot] is None:
+                continue
+            ref = mesh.material
+            if m.skins and 0 <= ref < len(m.skins[0]):
+                ref = m.skins[0][ref]
+            name = mats[slot].name
+            if out.get(ref, name) != name:
+                raise ValueError("texture %d is named both %r and %r by the scene's "
+                                 "materials" % (ref, out[ref], name))
+            out[ref] = name
+    return out
+
+
+def apply_sequences(d, arm_obj, anim_names):
+    """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
+
+    Matched by position: the stash is written in file order and this path cannot change how
+    many sequences there are. Blends are stored as animation names because an index means
+    nothing once the file is re-emitted, so they resolve back through `anim_names`.
+    """
+    stash = arm_obj.get("vtmb_sequences")
+    if not stash:
+        return 0
+    if len(stash) != len(d.seqs):
+        raise ValueError("the armature carries %d sequences and the file has %d"
+                         % (len(stash), len(d.seqs)))
+    index = {n: k for k, n in enumerate(anim_names)}
+    n = 0
+    for rec, s in zip(d.seqs, stash):
+        label, activity = s.get("label"), s.get("activity")
+        if label and rec.name != label:
+            rec.name, n = label, n + 1
+        if activity and rec.extra.get("activity") != activity:
+            rec.extra["activity"], n = activity, n + 1
+        blends = [list(col) for col in s.get("blends") or []]
+        gx, gy = len(blends), max((len(c) for c in blends), default=0)
+        # The grid sits inside the 764-byte record at a 0x20 stride, so one that would run
+        # past it is left alone rather than written over the fields behind it.
+        if not gx or mdl_mod.SEQ_ANIM + (gx - 1) * 0x20 + gy * 2 > len(rec.raw):
+            continue
+        was = struct.unpack_from("<ii", rec.raw, mdl_mod.SEQ_GROUPSIZE)
+        struct.pack_into("<ii", rec.raw, mdl_mod.SEQ_GROUPSIZE, gx, gy)
+        if was != (gx, gy):
+            n += 1
+        for x, col in enumerate(blends):
+            for y, name in enumerate(col):
+                at = mdl_mod.SEQ_ANIM + x * 0x20 + y * 2
+                a = index.get(name, -1)
+                if a < 0:
+                    raise ValueError("sequence %r blends animation %r, which the file does "
+                                     "not have" % (rec.name, name))
+                if struct.unpack_from("<h", rec.raw, at)[0] != a:
+                    n += 1
+                struct.pack_into("<h", rec.raw, at, a)
+    return n
+
+
+def verify_writer(src):
+    """The writer must reproduce this donor before anything from the scene is fed in.
+
+    Grades the relayout alone, which is what makes the differences that follow attributable
+    to the scene: an edit is an intended difference and would drown the check, so the
+    comparison is `emit(from_bytes(x))` against `x` and never against the edited output.
+    """
+    plain = build_mod.emit(build_mod.from_bytes(src))
+    bad, _n = rebuild_mod.verify(src, plain)
+    return bad
+
+
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, keep_travel=True,
-                   travel="keep", mesh_fields=()):
+                   travel="keep", mesh_fields=(), verify=True):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     The file is always rebuilt from its own decoded records -- every count from a `len()`,
     every offset from where its target landed -- so an empty map is meaningful and re-emits
     the model unchanged rather than copying it.
+
+    The skeleton, the material names and the sequence table come from the scene too, and
+    unconditionally: each is compared against what the file already says and written only
+    where it differs, so an unedited model still comes back byte for byte.
     """
     m = mdl_mod.Mdl(source)
+    if verify:
+        bad = verify_writer(bytes(m.d))
+        if bad:
+            raise ValueError("the writer does not reproduce %s, so nothing was written: %s"
+                             % (os.path.basename(source), "; ".join(bad)))
     ad = arm_obj.animation_data
     if actions and ad is None:
         raise ValueError("%s has no animation data" % arm_obj.name)
@@ -346,6 +532,20 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     d = build_mod.apply_anims(build_mod.from_bytes(bytes(m.d)), edits, source)
 
+    scene = {"bones": 0, "materials": 0, "sequences": 0, "stale": 0}
+    poses = read_bones(m, arm_obj, scale)
+    if poses:
+        build_mod.set_bone_poses(d, poses)
+        scene["bones"] = len(poses)
+        # A rotation channel is `int16 * rotscale` with no bind base, so an animation left
+        # un-re-encoded keeps a pose the moved bind disagrees with -- 1.0e-01 against 5.4e-04.
+        scene["stale"] = len(d.anims) - len(edits)
+    for ref, name in sorted(read_materials(m, source).items()):
+        if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
+            d.textures[ref].name = name
+            scene["materials"] += 1
+    scene["sequences"] = apply_sequences(d, arm_obj, [r.name for r in d.anims])
+
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0}
     if mesh_fields:
@@ -365,7 +565,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     data = build_mod.emit(d, checksum=d.checksum)
     with open(dest, "wb") as f:
         f.write(data)
-    return {"wrote": wrote, "bones": len(m.bones), "mesh": mesh,
+    return {"wrote": wrote, "bones": len(m.bones), "mesh": mesh, "scene": scene,
             "bytes": len(data), "was": len(m.d), "anims": len(m.anims)}
 
 

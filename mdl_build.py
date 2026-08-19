@@ -892,6 +892,24 @@ def _stamp_posetobone(d):
         struct.pack_into("<12f", r.raw, 0x58, *[x for row in inv for x in row])
 
 
+def set_bone_poses(d, poses):
+    """Overwrite the bind pose of bones already in `d`.  `poses` is
+    {index: (pos, quat, flags)} and `flags` may be None to keep the record's own.
+
+    The rest of each record stays: parent, the quantisation scales an existing animation is
+    already encoded against, surfaceprop, and the procedural helper.  `poseToBone` is
+    restamped for every bone, not only the named ones, because a moved parent changes its
+    children's world matrices too.
+    """
+    for k, (pos, quat, flags) in poses.items():
+        raw = d.bones[k].raw
+        struct.pack_into("<3f", raw, 0x20, *pos)
+        struct.pack_into("<4f", raw, 0x2c, *quat)
+        if flags is not None:
+            struct.pack_into("<i", raw, 0x88, flags)
+    _stamp_posetobone(d)
+
+
 def add_material(d, name, cdtexture="models/"):
     if not d.cdtextures:
         d.cdtextures = [cdtexture]

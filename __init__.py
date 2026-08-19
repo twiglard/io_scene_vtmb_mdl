@@ -18,8 +18,9 @@ bl_info = {
     "category": "Import-Export",
 }
 
-from . import (checksum, mdl, mdl_rebuild, mdl_write, mesh_write, paths, relocs,
-               sections, tth, vpk, vtx, blender_import, blender_export)
+from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write, paths,
+               relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write,
+               blender_import, blender_export)
 
 import importlib
 import os
@@ -308,11 +309,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     reading: bpy.props.StringProperty(
         name="File", default="",
         description="The .mdl the active action was imported from. It is the template for "
-                    "the output: its skeleton, materials, sequences, hitboxes and every "
-                    "animation you are not replacing are copied across byte for byte, and "
-                    "so is its mesh unless you tick something under Mesh. Everything "
-                    "written comes from this scene's armature and meshes; nothing else "
-                    "in the scene reaches the file")
+                    "the output: its hitboxes, attachments, cloth, flex, spring bones and "
+                    "every animation you are not replacing are copied across byte for "
+                    "byte, and so are its mesh, skeleton, materials and sequences unless "
+                    "you tick them below. Everything written comes from this scene's "
+                    "armature and meshes; nothing else in the scene reaches the file")
     target: bpy.props.EnumProperty(
         name="Replace", items=_target_items,
         description="Which of that file's animations get poses from Blender. The rest of "
@@ -461,6 +462,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 
         lay.label(text="Rebuilt from scratch: every offset recomputed, unreferenced "
                        "spans dropped.", icon="FILE_REFRESH")
+        lay.label(text="Skeleton, materials and sequences follow the scene where it "
+                       "differs from the file.", icon="OUTLINER")
         lay.label(text="Everything else is carried across unchanged.", icon="LOCKED")
 
     def execute(self, context):
@@ -512,11 +515,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if mesh["unsupported"]:
             self.report({"WARNING"}, "%s cannot be stored by every model of this file and "
                                      "was skipped there" % ", ".join(mesh["unsupported"]))
+        if r["scene"]["bones"] and r["scene"]["stale"]:
+            self.report({"WARNING"}, "%d bone%s moved; the %d animation%s you did not export "
+                                     "still key the old skeleton and may not follow it. "
+                                     "Export them together to re-encode."
+                        % (r["scene"]["bones"], "" if r["scene"]["bones"] == 1 else "s",
+                           r["scene"]["stale"], "" if r["scene"]["stale"] == 1 else "s"))
         what = ", ".join("%s from %r (%d frames)" % (n, a, f)
                          for _, n, a, f, _ in r["wrote"]) or "nothing"
         extra = ("; %s of %d vertices over %d meshes"
                  % ("+".join(mesh["fields"]), mesh["verts"], mesh["models"])
                  if mesh["verts"] else "")
+        scene = r["scene"]
+        if any(scene.values()):
+            extra += ("; the scene moved %d bones, renamed %d materials and changed %d "
+                      "sequence fields"
+                      % (scene["bones"], scene["materials"], scene["sequences"]))
         self.report({"INFO"}, "wrote %d of %d animations over %d bones, %d -> %d bytes: "
                               "%s%s" % (len(r["wrote"]), r["anims"], r["bones"], r["was"],
                                         r["bytes"], what, extra))
@@ -564,8 +578,11 @@ def unregister():
 def register():
     # addon_utils compares only __init__.py's mtime, so without this an edit to any
     # other module survives a disable/enable cycle as stale code.
-    for m in (checksum, sections, relocs, mdl, mdl_write, mdl_rebuild, mesh_write,
-              paths, tth, vpk, vtx, blender_import, blender_export):
+    # Dependency order: a module has to be reloaded before anything that imports it, or the
+    # importer keeps the old object and the reload buys nothing.
+    for m in (checksum, sections, relocs, mdl, mdl_write, mdl_build, mdl_rebuild,
+              mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild,
+              blender_import, blender_export):
         importlib.reload(m)
     # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
     # class of the same bl_idname otherwise makes register_class raise.
