@@ -52,6 +52,11 @@ MODEL_STRIDE = 224
 MESH_STRIDE = 60
 
 VERTEX_STRIDE = {0: 44, 1: 12, 2: 8}
+# 3 weight bytes, the bone-count byte, 4 bone shorts, then pos/normal/uv as 8 floats.
+_VERT0 = struct.Struct("<4B4h8f")
+# Tabulated rather than divided, and kept as the same expressions so the bits do not move.
+_W255 = [i / 255.0 for i in range(256)]
+_W4TH = [(255 - s) / 255.0 for s in range(766)]
 
 
 def anim_position(a, frame):
@@ -357,6 +362,22 @@ class Mdl:
         stride = VERTEX_STRIDE.get(model.filetype)
         if stride is None:
             raise ValueError("unknown vertex filetype %d" % model.filetype)
+        need = model.numvertices * stride
+        # One iter_unpack over the span rather than six unpack_from per vertex; the
+        # per-vertex loop below still runs on a short file so its error stays the same one.
+        if model.filetype == 0 and model.vertexbase + need <= len(d):
+            for t in _VERT0.iter_unpack(
+                    memoryview(d)[model.vertexbase:model.vertexbase + need]):
+                v = Vertex()
+                v.numbones = t[3] % 5
+                v.weights = [_W255[t[0]], _W255[t[1]], _W255[t[2]],
+                             _W4TH[t[0] + t[1] + t[2]]]
+                v.bones = list(t[4:8])
+                v.pos = t[8:11]
+                v.normal = t[11:14]
+                v.uv = t[14:16]
+                out.append(v)
+            return out
         for i in range(model.numvertices):
             o = model.vertexbase + i * stride
             v = Vertex()
