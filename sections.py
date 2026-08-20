@@ -142,6 +142,7 @@ def build(b, want_anims, want_seqs):
         # value carries a struct this does not know and must stay unsized.
         if m.i(s + 0x8c) == 1:
             m.add("  bone%d mstudioaxisinterpbone_t" % k, s + m.i(s + 0x90), 1, 176)
+    # 24, not Valve's 56 -- the engine's lookup strides by 0x18 (client.dll 0x1008b366).
     m.add("mstudiobonecontroller_t[]", h["bonecontrollerindex"],
           h["numbonecontrollers"], 24)
     m.add("mstudiohitboxset_t[]", h["hitboxsetindex"], h["numhitboxsets"], 12)

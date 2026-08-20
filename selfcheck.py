@@ -146,15 +146,15 @@ def check_vertices(m, verbose=True):
                 # A packed coordinate cannot leave the model's own quantisation range, so
                 # one outside it means the normalisation is wrong. Sorted: quant_scale may
                 # be negative.
-                span = mdl_mod.QUANT_MAX[model.filetype] / mdl_mod.QUANT_NORM[model.filetype]
+                span = mdl_mod.QUANT_MAX[model.filetype] * mdl_mod.QUANT_NORM[model.filetype]
                 rng = [sorted((model.quant_offset[c],
                                model.quant_offset[c] + span * model.quant_scale[c]))
                        for c in range(3)]
-                slack = [max(1e-3, (hi - lo) * 1e-4) for lo, hi in rng]
+                slack = [1e-3 * max(1.0, hi - lo) for lo, hi in rng]
                 out = [v for v in vs
                        if any(not rng[c][0] - slack[c] <= v.pos[c] <= rng[c][1] + slack[c]
                               for c in range(3))]
-                n += len(vs) * 3
+                n += len(vs)
                 if verbose:
                     print("  %d verts %r filetype=%d: %d outside the quantisation range "
                           "%s; normals and weights are not in the file"

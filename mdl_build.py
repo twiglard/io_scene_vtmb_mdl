@@ -50,6 +50,11 @@ BONE_USED = 0x10
 # __strcmpi operands wild.  Anomalies §L.
 BONEMAP_RECORD = struct.pack("<ii", 0x0000FFFF, -1) + b"\0" * 48
 
+# 24, not Valve's 56: client.dll's lookup at 0x1008b366 tests the caller's input against
+# +0x14 of each record and advances by 0x18.  No shipped model authors one, so only a
+# writer is affected.
+BONECONTROLLER_STRIDE = 24
+
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
 DEFAULTS = {
@@ -298,7 +303,8 @@ def from_bytes(b):
         d.bones.append(r)
 
     for k in range(i(248)):
-        d.bonecontrollers.append(Rec(b[i(252) + k * 24:i(252) + (k + 1) * 24]))
+        bc = i(252) + k * BONECONTROLLER_STRIDE
+        d.bonecontrollers.append(Rec(b[bc:bc + BONECONTROLLER_STRIDE]))
 
     for k in range(i(256)):
         o = i(260) + k * 12
@@ -507,7 +513,8 @@ def emit(d, checksum=None, drop=False):
     count(240, nb)
     hdrptr(244, "bones", nb)
 
-    _simple(o, hdr, d.bonecontrollers, "bonecontrollers", 24, 248, 252)
+    _simple(o, hdr, d.bonecontrollers, "bonecontrollers",
+            BONECONTROLLER_STRIDE, 248, 252)
 
     if d.hitboxsets:
         raw = bytearray()

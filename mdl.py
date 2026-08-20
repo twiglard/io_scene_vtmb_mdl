@@ -52,10 +52,10 @@ MODEL_STRIDE = 224
 MESH_STRIDE = 60
 
 VERTEX_STRIDE = {0: 44, 1: 12, 2: 8}
-# filetype 2's byte is normalised through g_byteToFloatTable (i/255) before the multiply at
-# StudioRender.dll 0x2c013be7; filetype 1's ushort is FILDed raw at 0x2c013ac8. So filetype
-# 2's quant_scale is the model's whole extent, not one quantisation step.
-QUANT_NORM = {0: 1.0, 1: 1.0, 2: 255.0}
+# What a packed position scalar is multiplied by before the model's own quant_scale.
+# filetype 2's byte goes through g_byteToFloatTable (i/255) at StudioRender.dll 0x2c013be7,
+# filetype 1's ushort is FILDed raw at 0x2c013ac8, so only filetype 2's scale is an extent.
+QUANT_NORM = {1: 1.0, 2: 1.0 / 255.0}
 QUANT_MAX = {1: 65535, 2: 255}
 # 3 weight bytes, the bone-count byte, 4 bone shorts, then pos/normal/uv as 8 floats.
 _VERT0 = struct.Struct("<4B4h8f")
@@ -400,7 +400,7 @@ class Mdl:
                 q = struct.unpack_from("<3H", d, o) if model.filetype == 1 \
                     else struct.unpack_from("<3B", d, o)
                 nrm = QUANT_NORM[model.filetype]
-                v.pos = tuple(model.quant_offset[c] + q[c] / nrm * model.quant_scale[c]
+                v.pos = tuple(model.quant_offset[c] + q[c] * nrm * model.quant_scale[c]
                               for c in range(3))
                 v.normal = (0.0, 0.0, 1.0)
                 uv = struct.unpack_from("<2H", d, o + 8) if model.filetype == 1 \
