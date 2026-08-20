@@ -50,17 +50,20 @@ BONE_USED = 0x10
 # __strcmpi operands wild.  Anomalies §L.
 BONEMAP_RECORD = struct.pack("<ii", 0x0000FFFF, -1) + b"\0" * 48
 
-# 24, not Valve's 56: client.dll's lookup at 0x1008b366 tests the caller's input against
-# +0x14 of each record and advances by 0x18.  No shipped model authors one, so only a
-# writer is affected.
+# 24, not Valve's 56: client.dll's lookup at 0x1008b366 gates on numbonecontrollers@248,
+# tests the caller's input against +0x14 of each record and advances by 0x18.  Zero of the
+# 4464 corpus models carry one, so only a writer is affected.
 BONECONTROLLER_STRIDE = 24
 
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
 DEFAULTS = {
     "hdr.unk144": (0.5, 0.5, 0.5),      # on 4416 of 4423 models
-    "hdr.unk232": 0.0,
-    "hdr.unk236": 0.0,
+    # Lipsync blend-width clamp, named for the phonemefilter_min/max ConVars.  PR #2 reads
+    # client.dll 0x100c3be0 as the fallback when those are unset; NOT re-derived here.  The
+    # corpus takes four values -- (0,0) x3787, this x525, (0.08,0.10) x150, (0.08,0.105) x2 --
+    # so zero clamps the window shut rather than meaning unset.
+    "hdr.phonemefilter": (0.065, 0.100),
     "hdr.unhz": (0, 0, 1),              # on every model
     "seqgroup": ("default", ""),        # on every model
 }
@@ -845,7 +848,10 @@ def new(name, surfaceprop="flesh"):
     """An empty description: header scalars, one sequence group, no records.
 
     The unnamed scalars take their corpus value rather than zero -- `unk144` is
-    (0.5, 0.5, 0.5) on 4416 of 4423 models and `unhz` is (0, 0, 1) on every one.
+    (0.5, 0.5, 0.5) on 4416 of 4423 models and `unhz` is (0, 0, 1) on every one. The
+    phoneme filter is written for the same reason and a stronger one: it is a clamp, so
+    leaving it zero does not mean "unset", it means every lipsync blend collapses to zero
+    width.
     """
     d = Desc()
     d.name = name
@@ -853,6 +859,7 @@ def new(name, surfaceprop="flesh"):
     struct.pack_into("<i", h, 0, 0x54534449)
     struct.pack_into("<i", h, 4, M.VERSION)
     struct.pack_into("<3f", h, 144, *DEFAULTS["hdr.unk144"])
+    struct.pack_into("<2f", h, 232, *DEFAULTS["hdr.phonemefilter"])
     struct.pack_into("<3f", h, 180, -16.0, -16.0, 0.0)
     struct.pack_into("<3f", h, 192, 16.0, 16.0, 72.0)
     struct.pack_into("<3i", h, 412, *DEFAULTS["hdr.unhz"])
