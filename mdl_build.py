@@ -50,19 +50,20 @@ BONE_USED = 0x10
 # __strcmpi operands wild.  Anomalies §L.
 BONEMAP_RECORD = struct.pack("<ii", 0x0000FFFF, -1) + b"\0" * 48
 
-# 24, not Valve's 56: client.dll's lookup at 0x1008b366 gates on numbonecontrollers@248,
-# tests the caller's input against +0x14 of each record and advances by 0x18.  Zero of the
-# 4464 corpus models carry one, so only a writer is affected.
+# 24, not Valve's 56: Studio_FindBoneControllerByInput (client.dll:0x1008b360) matches on
+# +0x14 and advances by 0x18, and its unrolled lookahead reads [EAX+0x2c] == 0x18 + 0x14,
+# which closes at no other stride.  Zero of the 4464 corpus models carry a record, so only a
+# writer is affected.
 BONECONTROLLER_STRIDE = 24
 
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
 DEFAULTS = {
     "hdr.unk144": (0.5, 0.5, 0.5),      # on 4416 of 4423 models
-    # Lipsync blend-width clamp, named for the phonemefilter_min/max ConVars.  PR #2 reads
-    # client.dll 0x100c3be0 as the fallback when those are unset; NOT re-derived here.  The
-    # corpus takes four values -- (0,0) x3787, this x525, (0.08,0.10) x150, (0.08,0.105) x2 --
-    # so zero clamps the window shut rather than meaning unset.
+    # Lipsync blend-width clamp in seconds, @232 min and @236 max.  client.dll 0x100c3be0
+    # clamps a phoneme's own duration into this pair whenever either phonemefilter ConVar
+    # reads 0.0, so zero here shuts the window rather than meaning unset.  Four values over
+    # the corpus -- (0,0) x3787, this x525, (0.08,0.10) x150, (0.08,0.105) x2.
     "hdr.phonemefilter": (0.065, 0.100),
     "hdr.unhz": (0, 0, 1),              # on every model
     "seqgroup": ("default", ""),        # on every model
