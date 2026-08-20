@@ -264,14 +264,6 @@ def _tth_image(content, rel, name):
         return None
     source = content.find(rel + ".tth")[0]
     try:
-        img = _packed_image(name, tth_mod.to_dds(w, h, t.format, mip), ".dds", source)
-    except ValueError:
-        img = None
-    if img is not None:
-        return img
-    # A Blender built without DDS lands here too, not just the formats DDS cannot
-    # carry, so the slow Python decoder is the fallback for both.
-    try:
         rgba = tth_mod.decode(w, h, t.format, mip)
     except ValueError:
         return None
