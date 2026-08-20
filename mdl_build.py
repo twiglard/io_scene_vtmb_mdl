@@ -949,7 +949,7 @@ def add_model(d, meshes, bodypart="studio", model="model"):
     what `mstudiomesh_t.vertexoffset` addresses, so the runs concatenate in order.
 
     Only filetype 0 is emitted: 1 and 2 quantise through the model's
-    quant_offset/quant_scale and filetype 2's scale reading is unconfirmed.
+    quant_offset/quant_scale, which a from-scratch caller would have to fit.
     """
     vb, tb, recs, face_lists, offset, radius = \
         bytearray(), bytearray(), [], [], 0, 0.0

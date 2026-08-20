@@ -58,8 +58,8 @@ def count_code(old, numbones):
     return (old - old % 5) + (numbones % 5)
 
 
-def quantise(v, offset, scale):
-    return 0 if not scale else int(round((v - offset) / scale))
+def quantise(v, offset, scale, norm=1.0):
+    return 0 if not scale else int(round((v - offset) / scale * norm))
 
 
 def _encode(data, model, verts, fields, base):
@@ -74,7 +74,6 @@ def _encode(data, model, verts, fields, base):
     fields, _ = supported(model.filetype, fields)
     if not fields:
         return 0
-    lim = 2 ** 16 - 1 if model.filetype == 1 else 255
     for i, v in enumerate(verts):
         o = base + i * stride
         if model.filetype == 0:
@@ -94,8 +93,10 @@ def _encode(data, model, verts, fields, base):
                                  *([int(b) for b in list(v.bones)[:4]] + [0, 0, 0, 0])[:4])
         else:
             if "positions" in fields:
+                lim, nrm = M.QUANT_MAX[model.filetype], M.QUANT_NORM[model.filetype]
                 q = [max(0, min(lim, quantise(v.pos[c], model.quant_offset[c],
-                                              model.quant_scale[c]))) for c in range(3)]
+                                              model.quant_scale[c], nrm)))
+                     for c in range(3)]
                 struct.pack_into("<3H" if model.filetype == 1 else "<3B", data, o, *q)
             if "uvs" in fields and v.uv is not None:
                 uv = [max(0, min(65535, int(round(x * 65535.0)))) for x in v.uv]
