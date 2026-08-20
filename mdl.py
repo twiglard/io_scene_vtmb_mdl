@@ -53,6 +53,12 @@ MESH_STRIDE = 60
 
 VERTEX_STRIDE = {0: 44, 1: 12, 2: 8}
 
+# What a packed position scalar is multiplied by before the model's own quant_scale.
+# filetype 1 uses its u16 raw; filetype 2 normalises its byte to 0..1 first. Read off
+# StudioRender.dll's vertex accessor, not inferred -- see Mdl.vertices.
+QUANT_NORM = {1: 1.0, 2: 1.0 / 255.0}
+QUANT_MAX = {1: 65535, 2: 255}
+
 
 def anim_position(a, frame):
     """(translation, yaw degrees) that studiomdl extracted out of the animation and left
@@ -373,7 +379,17 @@ class Mdl:
             else:
                 q = struct.unpack_from("<3H", d, o) if model.filetype == 1 \
                     else struct.unpack_from("<3B", d, o)
-                v.pos = tuple(model.quant_offset[c] + q[c] * model.quant_scale[c]
+                # The two packed formats do not share a rule. filetype 1 multiplies the
+                # raw u16 by the scale; filetype 2 normalises its byte to 0..1 first,
+                # through the same table the skin weights use, so its scale spans the
+                # whole extent rather than one step. StudioRender's vertex accessor at
+                # 0x2c013a70: the u16 branch is FILD/FMUL [model+0xac..0xb4]/FADD, the
+                # byte branch is FLD [byte*4 + 0x2c06c530]/FMUL/FADD, and 0x2c06c530 is
+                # 256 floats holding i/255 exactly. Multiplying the byte raw put every
+                # filetype-2 model 255x oversized -- fencepost.mdl decoded 37,760 units
+                # tall against the 148 its own .phy hull measures.
+                v.pos = tuple(model.quant_offset[c] + q[c] * QUANT_NORM[model.filetype]
+                              * model.quant_scale[c]
                               for c in range(3))
                 v.normal = (0.0, 0.0, 1.0)
                 uv = struct.unpack_from("<2H", d, o + 8) if model.filetype == 1 \
