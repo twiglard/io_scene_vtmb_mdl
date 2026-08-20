@@ -22,6 +22,7 @@ import bpy  # noqa: F401
 from . import blender_export as export_mod
 from . import mdl as mdl_mod
 from . import mdl_build as build_mod
+from . import mdl_write as write_mod
 from . import vtx_rebuild as vtxr_mod
 
 # A bone needs at least one bit of the 0xFFFC used-by mask or it gets no bone matrix and
@@ -320,6 +321,73 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0, cdtexture="models/"):
     return list(d.faces), total_unskinned, total_kept
 
 
+_ARM = ("upperarm", "forearm", "hand", "finger", "thumb")
+_LEG = ("thigh", "calf", "foot", "toe")
+
+
+def _hitgroup_of(name):
+    """The hit group a bone falls in: 1 head, 2 chest, 3 stomach, 4/5 arms, 6/7 legs, 0
+    generic. Not derivable from a file, so this is the corpus convention over 14333
+    shipped boxes -- pelvis 0 on 372 of 372, bare Spine 3 on 512 of 514, Spine1 2 on 501
+    of 508, neck and head 1, the limbs 4/5 and 6/7 on 98.9%. A `vtmb_hitgroup` on the
+    Blender bone wins over it."""
+    n = " %s " % name.lower().replace("_", " ")
+    if "pelvis" in n:
+        return 0
+    if "head" in n or "neck" in n or "jaw" in n:
+        return 1
+    right = " r " in n or "right" in n
+    if any(k in n for k in _ARM):
+        return 5 if right else 4
+    if any(k in n for k in _LEG):
+        return 7 if right else 6
+    if "spine" in n:
+        return 2 if n.rstrip()[-1].isdigit() else 3
+    if "clavicle" in n:
+        return 2
+    return 0
+
+
+def fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale=1.0, floor=0.05,
+                 name="default"):
+    """One box per bone that owns geometry, in that bone's own space. Returns the count.
+
+    A vertex counts for every bone binding it at `floor` or more, so a joint's box covers
+    the flesh on both sides of it. At 0.50 only 3 of `security_guard`'s 20 shipped boxes
+    come out enclosed and at 0.05 it is 18, the two others being a degenerate pair Troika
+    shipped on `Bip01 Spine2` (item 41). The bindings are the ones being written, not the
+    raw vertex groups, so the box cannot enclose flesh the file does not give that bone.
+    """
+    inv = [[list(f[0:4]), list(f[4:8]), list(f[8:12])]
+           for f in (struct.unpack_from("<12f", r.raw, 0x58) for r in d.bones)]
+    lo, hi = {}, {}
+    for obj in mesh_objs:
+        for v in obj.data.vertices:
+            p = (v.co[0] / scale, v.co[1] / scale, v.co[2] / scale)
+            for bi, w in _skin(v, obj.vertex_groups, bone_index):
+                if w < floor:
+                    continue
+                m = inv[bi]
+                q = [m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3]
+                     for r in range(3)]
+                if bi not in lo:
+                    lo[bi], hi[bi] = list(q), list(q)
+                    continue
+                for c in range(3):
+                    lo[bi][c] = min(lo[bi][c], q[c])
+                    hi[bi][c] = max(hi[bi][c], q[c])
+    boxes = []
+    for bi in sorted(lo):
+        bname = d.bones[bi].name or ""
+        db = arm_obj.data.bones.get(bname)
+        g = db.get("vtmb_hitgroup") if db else None
+        boxes.append((bi, int(_hitgroup_of(bname) if g is None else g),
+                      tuple(lo[bi]), tuple(hi[bi])))
+    if boxes:
+        build_mod.add_hitbox(d, boxes, name)
+    return len(boxes)
+
+
 def sample_action(context, arm_obj, action, d, scale=1.0, use_range=False):
     """`poses[frame][bone]` of local (pos, quat), in the bone order already authored.
 
@@ -356,20 +424,32 @@ def _ordered(actions):
 
 
 def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
-                activity="ACT_IDLE"):
+                activity="ACT_IDLE", travel="extract"):
+    """`travel` is what becomes of the root bone's path. "extract" takes its net ground
+    travel into one `mstudiomovement_t` and leaves the rest -- the cycle's own sway and
+    rise -- in the keys, which is how a walk cycle is stored: the engine carries the
+    entity, the skeleton stays put and still bobs. "none" leaves the whole path in the
+    poses, which is right only for an animation that really does translate in model
+    space."""
+    moved = 0
     for act in _ordered(actions):
         poses = sample_action(context, arm_obj, act, d, scale, use_range)
         if not poses:
             raise Refused("action %r has no frames" % act.name)
+        movements = ()
+        if travel == "extract":
+            movements, poses = write_mod.extract_travel(build_mod._skeleton(d), poses)
+            moved += bool(movements)
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
-        a = build_mod.add_animation(d, act.name, poses, fps, flags)
+        a = build_mod.add_animation(d, act.name, poses, fps, flags, movements)
         build_mod.add_sequence(d, act.name, a, act.get("vtmb_activity", activity))
-    return len(actions)
+    return len(actions), moved
 
 
 def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="flesh",
-          cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE"):
+          cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE",
+          hitboxes=False, travel="extract"):
     """(Desc, faces) for the scene. `hull` is (min, max) and stays the caller's:
     @180/@192 are the movement hull the .qc's $hbox sets, not the mesh's bounds."""
     d = build_mod.new(name, surfaceprop)
@@ -380,16 +460,40 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     if not bone_index:
         raise Refused("the armature has no bones")
     faces, unskinned, kept = add_meshes(d, mesh_objs, bone_index, scale, cdtexture)
-    add_actions(context, arm_obj, d, actions, scale, use_range, activity)
-    return d, faces, unskinned, kept
+    if hitboxes:
+        fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
+    _n, moved = add_actions(context, arm_obj, d, actions, scale, use_range, activity,
+                            travel)
+    return d, faces, unskinned, kept, moved
 
 
 def _set_hull(d, lo, hi):
     struct.pack_into("<3f", d.hdr, 180, *lo)
     struct.pack_into("<3f", d.hdr, 192, *hi)
-    # studiomdl's default when $illumposition is absent: the centre of the hull, on 3845
-    # of 4423 shipped models.
+    # Only reached by a model with no sequence at all: mdl_build.stamp_sequence_boxes
+    # rewrites @168 as the centre of sequence 0's box, which is studiomdl's own rule.
     struct.pack_into("<3f", d.hdr, 168, *[(a + b) * 0.5 for a, b in zip(lo, hi)])
+
+
+def fit_hull(mesh_objs, scale=1.0):
+    """(min, max) over every vertex handed in, in file units, or None when there are none.
+
+    A starting point and not a truth: @180/@192 is the movement hull the .qc's `$hbox`
+    sets, which is why `build` takes it from the caller rather than deriving it. Without
+    one `mdl_build.new` leaves (-16,-16,0)..(16,16,72), so a bat claims a humanoid volume.
+    Mesh-local like `split_mesh`, so an object transform is ignored by both alike.
+    """
+    lo = hi = None
+    for obj in mesh_objs:
+        for v in obj.data.vertices:
+            p = [v.co[c] / scale for c in range(3)]
+            if lo is None:
+                lo, hi = list(p), list(p)
+                continue
+            for c in range(3):
+                lo[c] = min(lo[c], p[c])
+                hi[c] = max(hi[c], p[c])
+    return None if lo is None else (tuple(lo), tuple(hi))
 
 
 def embedded_name(path):
@@ -415,12 +519,14 @@ def write(d, faces, path, checksum):
 
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
-    d, faces, unskinned, kept = build(context, arm_obj, mesh_objs, actions,
-                                      embedded_name(path), **kw)
+    d, faces, unskinned, kept, moved = build(context, arm_obj, mesh_objs, actions,
+                                             embedded_name(path), **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
+            "travelling": moved,
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),
             "anims": len(d.anims), "seqs": len(d.seqs),
+            "hitboxes": sum(len(r.kids) for r in d.hitboxsets),
             "faces": st["tris_out"], "verts": st["verts_out"],
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16
                                for bp in d.bodyparts for x in bp.kids),

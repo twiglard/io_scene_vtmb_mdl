@@ -7,20 +7,23 @@ bl_info = {
     "name": "VTMB Model (MDL v2531)",
     "author": "Claude Opus 5 xhigh / Twiglard",
     "blender": (3, 0, 0),
-    "location": "File > Import > VTMB Model (.mdl), File > Export > VTMB Model (.mdl)",
+    "location": "File > Import > VTMB Model (.mdl), File > Export > VTMB Model (.mdl), "
+                "File > Export > VTMB Model, no donor (.mdl)",
     # bl_info has no "website"; doc_url is the key that becomes a button.
     "doc_url": "https://rpgcodex.net/",
     "description": "Import Bloodlines skeletons, meshes, UVs, weights, textures and "
-                   "animations including the chained models. Export rewrites a .mdl in "
-                   "place: animations from Blender's poses, and optionally vertex "
-                   "positions, normals, UVs and weights. Counts never change",
+                   "animations including the chained models. Export rebuilds a .mdl "
+                   "from its own decoded records: animations from Blender's poses, "
+                   "and optionally vertex positions, normals, UVs and weights. A "
+                   "second exporter authors a .mdl and .dx80.vtx from the scene with "
+                   "no donor file at all",
     "version": (0, 1, 99),
     "category": "Import-Export",
 }
 
 from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write, paths,
                relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write,
-               blender_import, blender_export)
+               blender_import, blender_export, blender_scratch)
 
 import importlib
 import os
@@ -166,9 +169,9 @@ def _target_items(self, context):
          "Replace each animation that has an action of the same name. Use this after "
          "editing several animations of one file in the same Blender session"),
         (NONE, "Nothing",
-         "Leave every animation alone and write only what Mesh below says, which then "
-         "is the only thing in the file that changes. Something under Mesh has to be "
-         "ticked, or the export has nothing to do and is refused"),
+         "Leave every animation alone. The skeleton, the material names and the "
+         "sequence table still go from the scene into the file, as they do on every "
+         "export, and Mesh below adds the vertex fields it names"),
     ]
     anims = _base_anims(_base_path(self, context))
     if anims:
@@ -362,9 +365,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     write_weights: bpy.props.BoolProperty(
         name="Weights", default=False,
         description="Write which bones move each vertex and how much, from the vertex "
-                    "groups named after the bones. Three bones per vertex at most, each "
-                    "weight kept to 1/255, and the largest three win when Blender has "
-                    "more")
+                    "groups named after the bones. Four bones per vertex at most and the "
+                    "largest four win when Blender has more; three weights are stored to "
+                    "1/255 and the fourth is whatever they leave over")
 
     @classmethod
     def poll(cls, context):
@@ -537,7 +540,222 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         return {"FINISHED"}
 
 
-CLASSES = [VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl]
+# `build` emits each of these with a count of zero, which nobody reads out of a header.
+# The chain is the worst on a character: its animations live in the included files.
+SCRATCH_DROPS = (
+    "the include chain, so only this scene's animations exist",
+    "collision and ragdoll -- both live in the sibling .phy, not written",
+    "cloth, flex descs, controllers, rules and every vertanim",
+    "eyeballs, mouths and pose parameters",
+    "spring bones, procedural bones, IK chains and bone controllers",
+    "attachments, sequence events and autolayers",
+)
+
+
+def _scratch_meshes(context, arm_obj):
+    """The meshes the armature owns, else every mesh in the scene.
+
+    Not filtered on `vtmb_model`: that marker comes from the importer, and a hand-built
+    scene -- the case this operator exists for -- is exactly the one with none.
+    """
+    own = [o for o in context.scene.objects if o.type == "MESH"
+           and (o.parent is arm_obj
+                or any(getattr(mo, "object", None) is arm_obj for mo in o.modifiers))]
+    return own or [o for o in context.scene.objects if o.type == "MESH"]
+
+
+def _scratch_actions(arm_obj=None):
+    """Every action keying a bone this armature has, so nothing needs marking up first.
+
+    Matched on the bone names rather than on `pose.bones` alone: a second rig's actions
+    live in the same `bpy.data.actions`, and `sample_action` would assign one to this
+    armature and read a pose of nothing moving. `blender_scratch._ordered` then sorts by
+    `vtmb_anim_index` where the importer left one and keeps collection order otherwise.
+    """
+    have = None if arm_obj is None else {b.name for b in arm_obj.data.bones}
+    out = []
+    for a in bpy.data.actions:
+        for fc in blender_import.action_fcurves(a):
+            path = fc.data_path
+            if not path.startswith('pose.bones["'):
+                continue
+            end = path.find('"]', 12)
+            # A malformed path counts as a match: dropping the action would be a silent
+            # narrowing, and exporting one too many is visible in the count.
+            if have is None or end < 0 or path[12:end] in have:
+                out.append(a)
+                break
+    return out
+
+
+class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
+    bl_idname = "export_scene.vtmb_mdl_scratch"
+    bl_label = "Export VTMB Model, no donor " + VERSION
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".mdl"
+    filter_glob: bpy.props.StringProperty(default="*.mdl", options={"HIDDEN"})
+
+    scale: bpy.props.FloatProperty(
+        name="Scale", default=1.0, min=1e-4, soft_max=100.0,
+        description="Blender units per file unit; every bone and vertex position is "
+                    "divided by it on the way out. An import stamps what it used on the "
+                    "armature and this starts from that")
+    surfaceprop: bpy.props.StringProperty(
+        name="Surface", default="flesh",
+        description="What the model sounds like and behaves like when hit: flesh, metal, "
+                    "wood, concrete. Free text -- the engine looks it up in "
+                    "scripts/surfaceproperties.txt and falls back without a word when "
+                    "the name is not there")
+    cdtexture: bpy.props.StringProperty(
+        name="Material dir", default="models/",
+        description="Where the engine looks for the .vmt files, under materials/. Each "
+                    "Blender material slot becomes a name in this directory, so a slot "
+                    "named tor_femamor0head resolves as "
+                    "materials/<this>/tor_femamor0head.vmt")
+    activity: bpy.props.StringProperty(
+        name="Activity", default="ACT_IDLE",
+        description="The activity every sequence claims. An action carrying its own "
+                    "vtmb_activity overrides this one")
+    use_range: bpy.props.BoolProperty(
+        name="Scene range", default=False,
+        description="Sample the scene's Start and End frames rather than each action's "
+                    "own first and last keyframe")
+    travel: bpy.props.EnumProperty(
+        name="Travel",
+        items=[("extract", "Move the character",
+                "Put the ground distance the root covers into a movement block, so the "
+                "engine carries the character while the animation plays on the spot. "
+                "The bob and sway stay in the keys. This is what a walk cycle wants, "
+                "and what an import with Root motion on needs putting back"),
+               ("none", "Leave it in the keys",
+                "Write no movement blocks. The skeleton itself travels and snaps back "
+                "when the sequence loops, which is right only for something that really "
+                "does move in place")],
+        default="extract")
+    fit_hull: bpy.props.BoolProperty(
+        name="Fit hull to the mesh", default=True,
+        description="Set the movement hull to the bounding box of the geometry. Off "
+                    "leaves the humanoid default of (-16,-16,0)..(16,16,72), which is "
+                    "wrong for anything that is not a person. Neither is the truth: this "
+                    "field is the hull the .qc's $hbox sets, not the mesh's extent")
+    fit_hitboxes: bpy.props.BoolProperty(
+        name="Fit hitboxes to the skin", default=True,
+        description="Give every bone that owns geometry a hitbox enclosing it, so the "
+                    "model can be shot. Off writes no hitbox set at all and the engine "
+                    "falls back to the movement hull, which is one box for the whole "
+                    "body. The hit group each box reports is a guess off the bone name "
+                    "unless the bone carries a vtmb_hitgroup")
+    checksum: bpy.props.IntProperty(
+        name="Checksum", default=0x5A534E31, subtype="UNSIGNED",
+        description="Scripting only. Written into both files; any value is legal as long "
+                    "as the two agree, which they do by construction. The engine draws "
+                    "nothing at all when they disagree")
+
+    @classmethod
+    def poll(cls, context):
+        # Not the donor operator's four conditions: those want an assigned action, and
+        # allsequences.mdl ships 59 bones with no animations and no sequences.
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE" and bool(obj.data.bones)
+
+    def invoke(self, context, event):
+        self.scale = float(context.active_object.get("vtmb_scale", 1.0) or 1.0)
+        return super().invoke(context, event)
+
+    def draw(self, context):
+        lay = self.layout
+        obj = context.active_object
+        meshes = _scratch_meshes(context, obj)
+        actions = _scratch_actions(obj)
+
+        box = _section(lay, "vtmb_s_model", "Model", icon="FILE_3D")
+        if box is not None:
+            _pair(box, "name in the file", blender_scratch.embedded_name(self.filepath))
+            box.prop(self, "scale")
+            box.prop(self, "surfaceprop")
+            box.prop(self, "cdtexture")
+
+        box = _section(lay, "vtmb_s_geom", "Geometry", icon="MESH_DATA")
+        if box is not None:
+            _pair(box, "bones", str(len(obj.data.bones)))
+            _pair(box, "meshes", "%d object%s" % (len(meshes),
+                                                  "" if len(meshes) == 1 else "s"),
+                  icon="NONE" if meshes else "ERROR")
+            if not meshes:
+                box.label(text="a skeleton with no mesh is written and draws nothing",
+                          icon="INFO")
+            no_uv = [o.name for o in meshes if not o.data.uv_layers.active]
+            if no_uv:
+                _pair(box, "no UV layer", ", ".join(no_uv[:3]), icon="ERROR")
+
+        box = _section(lay, "vtmb_s_anims", "Animations", icon="ACTION")
+        if box is not None:
+            _pair(box, "actions", str(len(actions)),
+                  icon="NONE" if actions else "INFO")
+            for a in actions[:4]:
+                box.label(text="    " + a.name)
+            if len(actions) > 4:
+                box.label(text="    and %d more" % (len(actions) - 4))
+            box.prop(self, "use_range")
+            box.prop(self, "activity")
+            row = box.row()
+            row.label(text="Travel")
+            row.prop(self, "travel", text="")
+
+        box = _section(lay, "vtmb_s_fit", "Fit", icon="SHADING_BBOX")
+        if box is not None:
+            box.prop(self, "fit_hull")
+            box.prop(self, "fit_hitboxes")
+            hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
+            if hull is not None:
+                _pair(box, "hull", "%.0f %.0f %.0f .. %.0f %.0f %.0f"
+                      % (hull[0] + hull[1]))
+            elif self.fit_hull:
+                _pair(box, "hull", "no vertices, so the default is kept", icon="INFO")
+
+        box = _section(lay, "vtmb_s_drops", "Not written", icon="LOCKED")
+        if box is not None:
+            for line in SCRATCH_DROPS:
+                box.label(text=line)
+
+    def execute(self, context):
+        obj = context.active_object
+        meshes = _scratch_meshes(context, obj)
+        hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
+        try:
+            r = blender_scratch.export_scene(
+                context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
+                scale=self.scale, surfaceprop=self.surfaceprop,
+                cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
+                activity=self.activity, hitboxes=self.fit_hitboxes, travel=self.travel)
+        except blender_scratch.Refused as exc:
+            self.report({"ERROR"}, "refused: %s" % exc)
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, "%s: %s" % (type(exc).__name__, exc))
+            return {"CANCELLED"}
+        if r["unskinned"]:
+            self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
+                                     "bone 0, which drags them wherever it goes"
+                        % r["unskinned"])
+        if r["dropped"]:
+            self.report({"WARNING"}, "dropped %s"
+                        % ", ".join("%s x%d" % (k, v)
+                                    for k, v in sorted(r["dropped"].items())))
+        self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
+                              "%d materials, %d animations (%d travelling), "
+                              "%d sequences, %d hitboxes, %d faces, %d verts, "
+                              "%d + %d bytes"
+                    % (os.path.basename(self.filepath), r["bones"], r["bodyparts"],
+                       r["materials"], r["anims"], r["travelling"], r["seqs"],
+                       r["hitboxes"], r["faces"], r["verts"], r["bytes"],
+                       r["vtx_bytes"]))
+        return {"FINISHED"}
+
+
+CLASSES = [VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
+           EXPORT_OT_vtmb_mdl_scratch]
 
 if hasattr(bpy.types, "FileHandler"):
     class IO_FH_vtmb_mdl(bpy.types.FileHandler):
@@ -561,9 +779,15 @@ def _menu_export(self, context):
     self.layout.operator(EXPORT_OT_vtmb_mdl.bl_idname, text="VTMB Model (.mdl)")
 
 
+def _menu_export_scratch(self, context):
+    self.layout.operator(EXPORT_OT_vtmb_mdl_scratch.bl_idname,
+                         text="VTMB Model, no donor (.mdl)")
+
+
 def unregister():
     for menu, fn in ((bpy.types.TOPBAR_MT_file_import, _menu),
-                     (bpy.types.TOPBAR_MT_file_export, _menu_export)):
+                     (bpy.types.TOPBAR_MT_file_export, _menu_export),
+                     (bpy.types.TOPBAR_MT_file_export, _menu_export_scratch)):
         try:
             menu.remove(fn)
         except Exception:
@@ -582,7 +806,7 @@ def register():
     # importer keeps the old object and the reload buys nothing.
     for m in (checksum, sections, relocs, mdl, mdl_write, mdl_build, mdl_rebuild,
               mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild,
-              blender_import, blender_export):
+              blender_import, blender_export, blender_scratch):
         importlib.reload(m)
     # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
     # class of the same bl_idname otherwise makes register_class raise.
@@ -591,3 +815,4 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(_menu)
     bpy.types.TOPBAR_MT_file_export.append(_menu_export)
+    bpy.types.TOPBAR_MT_file_export.append(_menu_export_scratch)

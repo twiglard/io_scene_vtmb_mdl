@@ -509,6 +509,15 @@ def _curve_factory(action, arm_obj):
     return lambda path, i, group: fcurves.new(path, index=i, group_name=group)
 
 
+def action_fcurves(action):
+    """Every curve of an action, over both APIs. `action.fcurves` is gone rather than
+    empty since 4.4, so this is the read side of `_curve_factory`."""
+    if not hasattr(action, "layers"):
+        return list(action.fcurves)
+    return [fc for layer in action.layers for strip in layer.strips
+            for bag in getattr(strip, "channelbags", ()) for fc in bag.fcurves]
+
+
 def _rest_local_inv(m, arm_obj):
     """The parent-relative rest matrix Blender composes the basis against, inverted.
 
