@@ -484,6 +484,7 @@ def emit(d, checksum=None, drop=False):
     if d.dropped and not drop:
         raise Refused("description drops %s"
                       % ", ".join("%s x%d" % (k, v) for k, v in sorted(d.dropped.items())))
+    stamp_sequence_boxes(d)
     quantise(d)
     o = Out()
     nb = len(d.bones)
@@ -925,6 +926,30 @@ def set_bone_poses(d, poses):
     _stamp_posetobone(d)
 
 
+def add_hitbox(d, boxes, name="default", at=None):
+    """Append or extend a hitbox set from [(bone, group, bbmin, bbmax), ...].
+
+    `at` extends an existing set rather than adding another; `emit` takes the count from
+    `len(kids)`, so nothing here writes +0x04 or either pointer.
+    """
+    if at is None:
+        d.hitboxsets.append(Rec(bytearray(12), name))
+        at = len(d.hitboxsets) - 1
+    rec = d.hitboxsets[at]
+    for bone, group, lo, hi in boxes:
+        if not 0 <= bone < len(d.bones):
+            raise Refused("hitbox cites bone %d of %d" % (bone, len(d.bones)))
+        if any(a > c for a, c in zip(lo, hi)):
+            raise Refused("hitbox on bone %d has bbmin past bbmax: %s past %s"
+                          % (bone, tuple(lo), tuple(hi)))
+        raw = bytearray(32)
+        struct.pack_into("<ii", raw, 0, bone, group)
+        struct.pack_into("<3f", raw, 8, *lo)
+        struct.pack_into("<3f", raw, 20, *hi)
+        rec.kids.append(Rec(raw))
+    return at
+
+
 def add_material(d, name, cdtexture="models/"):
     if not d.cdtextures:
         d.cdtextures = [cdtexture]
@@ -1036,16 +1061,23 @@ class _AnimHdr(object):
         self.movements = []
 
 
-def add_animation(d, name, poses, fps=30.0, flags=0):
+def add_animation(d, name, poses, fps=30.0, flags=0, movements=()):
     """`poses[frame][bone]` is (pos, quat) in parent-local space, or None to hold the bind
     pose.  The poses are kept, not encoded: `mstudiobone_t`'s scales are file-wide, so the
-    channel a value needs cannot be chosen until every animation in the file is known."""
+    channel a value needs cannot be chosen until every animation in the file is known.
+
+    `movements` is `mstudiomovement_t` records, which the engine applies to the entity
+    rather than to the skeleton.  Empty means the animation plays where it stands: leave
+    travel in the poses instead and the skeleton itself walks away from the origin, and
+    snaps back when the sequence loops.
+    """
     raw = bytearray(72)
     struct.pack_into("<f", raw, 0x04, fps)
     struct.pack_into("<i", raw, 0x08, flags)
     struct.pack_into("<i", raw, 0x0c, len(poses))
-    d.anims.append(Rec(raw, name, None, {"movements": [], "block": b"",
-                                         "poses": [list(f) for f in poses]}))
+    d.anims.append(Rec(raw, name, None,
+                       {"movements": [W.movement_bytes(x) for x in movements],
+                        "block": b"", "poses": [list(f) for f in poses]}))
     return len(d.anims) - 1
 
 
@@ -1114,6 +1146,130 @@ def quantise(d):
             W.rescale(t, old, scales)
             r.extra["block"] = W._anim_block(m, t)
     return len(pending)
+
+
+def _bone_vertex_boxes(d):
+    """Per bone, the box of the vertices it carries, in that bone's own space.
+
+    `posetobone` puts a bind-pose vertex where its bone can carry it, so the box is rigid:
+    a frame moves it without changing its extents, and the sweep costs one 3x4 per bone per
+    frame instead of one per vertex. It contains the skinned point set rather than equalling
+    it -- a blended vertex is a convex combination of its bones' placements, so it stays
+    inside their union. Measured against the per-vertex sweep on 108 frames of the andrei
+    scratch model: conservative on every axis, widest by 3.15 units.
+    """
+    lo, hi = {}, {}
+    stride = M.VERTEX_STRIDE[0]
+    p2b = [struct.unpack_from("<12f", r.raw, 0x58) for r in d.bones]
+    for bp in d.bodyparts:
+        for mo in bp.kids:
+            if struct.unpack_from("<i", mo.raw, 156)[0] != 0:
+                continue
+            vb = mo.extra.get("verts") or b""
+            for o in range(0, len(vb) - stride + 1, stride):
+                w = vb[o:o + 3]
+                weights = (w[0], w[1], w[2], 255 - w[0] - w[1] - w[2])
+                bones = struct.unpack_from("<4h", vb, o + 4)
+                x, y, z = struct.unpack_from("<3f", vb, o + 12)
+                # An unskinned vertex writes numbones 0 and rides bone 0 at full weight.
+                for k in range(vb[o + 3] % 5 or 1):
+                    if weights[k] <= 0 or not 0 <= bones[k] < len(p2b):
+                        continue
+                    t = p2b[bones[k]]
+                    q = (t[0] * x + t[1] * y + t[2] * z + t[3],
+                         t[4] * x + t[5] * y + t[6] * z + t[7],
+                         t[8] * x + t[9] * y + t[10] * z + t[11])
+                    b = bones[k]
+                    if b not in lo:
+                        lo[b], hi[b] = list(q), list(q)
+                        continue
+                    for c in range(3):
+                        if q[c] < lo[b][c]:
+                            lo[b][c] = q[c]
+                        if q[c] > hi[b][c]:
+                            hi[b][c] = q[c]
+    return [(b, [(lo[b][c] + hi[b][c]) * 0.5 for c in range(3)],
+             [(hi[b][c] - lo[b][c]) * 0.5 for c in range(3)]) for b in sorted(lo)]
+
+
+def _anim_boxes(d, carried):
+    """{animation index: (min, max)} over every frame, for the animations still holding
+    their poses. Root motion is not applied: `movements` carries the model away from the
+    origin and the engine offsets the whole entity, so a sequence box that already included
+    the travel would be counted twice."""
+    m = _skeleton(d)
+    out = {}
+    for i, r in enumerate(d.anims):
+        poses = r.extra.get("poses")
+        if not poses:
+            continue
+        lo, hi = [float("inf")] * 3, [float("-inf")] * 3
+        for f in poses:
+            local = [f[b.index] if f[b.index] is not None else (b.pos, b.quat)
+                     for b in m.bones]
+            world = M.Mdl.world_matrices(m, local)
+            for b, ctr, half in carried:
+                t = world[b]
+                for c in range(3):
+                    row = t[c]
+                    mid = (row[0] * ctr[0] + row[1] * ctr[1] + row[2] * ctr[2] + row[3])
+                    ext = (abs(row[0]) * half[0] + abs(row[1]) * half[1]
+                           + abs(row[2]) * half[2])
+                    if mid - ext < lo[c]:
+                        lo[c] = mid - ext
+                    if mid + ext > hi[c]:
+                        hi[c] = mid + ext
+        if lo[0] <= hi[0]:
+            out[i] = (lo, hi)
+    return out
+
+
+def _seq_anims(raw):
+    """The blend table: `groupsize[0]*groupsize[1]` animation indices from +0x38, rows of
+    0x20 bytes. A sequence built here is 1x1, a donor's can be a blend grid."""
+    gx, gy = struct.unpack_from("<2i", raw, 0x23c)
+    return [struct.unpack_from("<h", raw, 0x38 + x * 0x20 + y * 2)[0]
+            for x in range(max(1, gx)) for y in range(max(1, gy))]
+
+
+def stamp_sequence_boxes(d):
+    """`mstudioseqdesc_t.bbmin`/`bbmax` @+0x1c/+0x28 -- the volume the engine culls the
+    model against, and zero there means it draws and then vanishes as soon as the camera
+    turns. The union over the sequence's blend animations of the skinned vertex sweep over
+    every frame (`utils/studiomdl/simplify.cpp:5276` and `:5349`).
+
+    Only a sequence whose box is still zero and whose every cited animation still holds its
+    poses: one read out of a file keeps the box that file shipped, and one whose animation
+    is already encoded cannot be swept. Returns how many were stamped.
+    """
+    if not d.seqs or not any(r.extra.get("poses") for r in d.anims):
+        return 0
+    boxes = _anim_boxes(d, _bone_vertex_boxes(d))
+    if not boxes:
+        return 0
+    n, first = 0, False
+    for k, r in enumerate(d.seqs):
+        if any(struct.unpack_from("<6f", r.raw, 0x1c)):
+            continue
+        want = _seq_anims(r.raw)
+        cited = [boxes[i] for i in want if i in boxes]
+        if len(cited) != len(want):
+            continue
+        struct.pack_into("<3f", r.raw, 0x1c,
+                         *[min(b[0][c] for b in cited) for c in range(3)])
+        struct.pack_into("<3f", r.raw, 0x28,
+                         *[max(b[1][c] for b in cited) for c in range(3)])
+        n += 1
+        first = first or k == 0
+    if first:
+        # studiomdl's default when the .qc has no $illumposition: the centre of sequence 0's
+        # box, "Only use the 0th sequence; that should be the idle sequence"
+        # (simplify.cpp:5379). It is the centre of hull_min/hull_max on 3845 of 4423 shipped
+        # models only because the hull defaults to that same box.
+        lo = struct.unpack_from("<3f", d.seqs[0].raw, 0x1c)
+        hi = struct.unpack_from("<3f", d.seqs[0].raw, 0x28)
+        struct.pack_into("<3f", d.hdr, 168, *[(a + b) * 0.5 for a, b in zip(lo, hi)])
+    return n
 
 
 def add_sequence(d, label, anim, activity=None):

@@ -19,11 +19,15 @@ HDR_NUMTEXTURES = 292
 HDR_NUMCDTEXTURES = 300
 HDR_NUMSKINREF = 308
 HDR_NUMBODYPARTS = 320
+HDR_NUMHITBOXSETS = 256
 HDR_NUMINCLUDEMODELS = 404
 
 # Measured, not from Valve: the record is 116 bytes with the name offset at +0, and no
 # other stride parses the corpus. The 24 trailing -1s are the pose-parameter remap.
 INCLUDE_STRIDE = 116
+
+HITBOXSET_STRIDE = 12
+BBOX_STRIDE = 32
 
 BONE_STRIDE = 160
 BONE_POS = 0x20
@@ -38,6 +42,7 @@ BONE_ROTATION_FROM_ROOT = 0x2
 
 ANIMDESC_STRIDE = 72
 SEQDESC_STRIDE = 764
+SEQ_BBMIN = 0x1c
 SEQ_ANIM = 0x38
 SEQ_GROUPSIZE = 0x23C
 
@@ -194,7 +199,7 @@ class Movement:
 
 
 class Seq:
-    __slots__ = ("index", "label", "activity", "groupsize", "blends")
+    __slots__ = ("index", "label", "activity", "groupsize", "blends", "bbmin", "bbmax")
 
 
 class Mesh:
@@ -209,6 +214,14 @@ class Model:
 
 class BodyPart:
     __slots__ = ("index", "name", "base", "models")
+
+
+class HitboxSet:
+    __slots__ = ("index", "name", "boxes")
+
+
+class Hitbox:
+    __slots__ = ("index", "bone", "group", "bbmin", "bbmax")
 
 
 class Vertex:
@@ -249,6 +262,7 @@ class Mdl:
                      for i in range(numseq)]
         self._read_materials()
         self._read_bodyparts()
+        self._read_hitboxsets()
         self._read_includes()
 
     def _cstr(self, off):
@@ -293,6 +307,11 @@ class Mdl:
         s.index = i
         s.label = self._cstr(off + struct.unpack_from("<i", d, off)[0])
         s.activity = self._cstr(off + struct.unpack_from("<i", d, off + 4)[0])
+        # The cull volume, and the one field a from-scratch writer cannot leave zero:
+        # zero here and the engine draws the model, then drops it the moment the camera
+        # turns. See plans/todo-vtmb-mdl-roadmap.md item 31.
+        s.bbmin = struct.unpack_from("<3f", d, off + SEQ_BBMIN)
+        s.bbmax = struct.unpack_from("<3f", d, off + SEQ_BBMIN + 12)
         gx, gy = struct.unpack_from("<ii", d, off + SEQ_GROUPSIZE)
         s.groupsize = (gx, gy)
         s.blends = [[struct.unpack_from("<h", d, off + SEQ_ANIM + x * 0x20 + y * 2)[0]
@@ -351,6 +370,27 @@ class Mdl:
             e.materialtype, e.materialparam = struct.unpack_from("<2i", d, eo + 24)
             m.meshes.append(e)
         return m
+
+    def _read_hitboxsets(self):
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMHITBOXSETS)
+        self.hitboxsets = []
+        for i in range(n):
+            off = idx + i * HITBOXSET_STRIDE
+            s = HitboxSet()
+            s.index = i
+            nb, bi = struct.unpack_from("<ii", d, off + 4)
+            s.name = self._cstr(off + struct.unpack_from("<i", d, off)[0])
+            s.boxes = []
+            for k in range(nb):
+                bo = off + bi + k * BBOX_STRIDE
+                x = Hitbox()
+                x.index = k
+                x.bone, x.group = struct.unpack_from("<ii", d, bo)
+                x.bbmin = struct.unpack_from("<3f", d, bo + 8)
+                x.bbmax = struct.unpack_from("<3f", d, bo + 20)
+                s.boxes.append(x)
+            self.hitboxsets.append(s)
 
     def _read_includes(self):
         d = self.d
