@@ -1,0 +1,85 @@
+{
+  "id": "wing-pair",
+  "label": "Wing pair",
+  "description": "Four spar bones per side off the upper spine. Merges onto human-core or onto quadruped alike, which is what attaching by name buys. Note animalism_bat spells its own L_wingArm1..4 and will not chain to these names without a rename.",
+  "kind": "skeleton",
+  "requires": "an armature carrying Bip01 Spine2",
+  "attach": [
+    "Bip01 Spine2"
+  ],
+  "proportions": {
+    "generator": "strand",
+    "params": {
+      "height": 72.0,
+      "length": 0.55,
+      "direction": [
+        -0.2,
+        0.96,
+        0.2
+      ],
+      "taper": 0.82
+    }
+  },
+  "bones": [
+    {
+      "name": "Bip01 L Wing1",
+      "parent": "Bip01 Spine2",
+      "role": "strand",
+      "side": "L",
+      "index": 0
+    },
+    {
+      "name": "Bip01 L Wing2",
+      "parent": "Bip01 L Wing1",
+      "role": "strand",
+      "side": "L",
+      "index": 1
+    },
+    {
+      "name": "Bip01 L Wing3",
+      "parent": "Bip01 L Wing2",
+      "role": "strand",
+      "side": "L",
+      "index": 2
+    },
+    {
+      "name": "Bip01 L Wing4",
+      "parent": "Bip01 L Wing3",
+      "role": "strand",
+      "side": "L",
+      "index": 3
+    },
+    {
+      "name": "Bip01 R Wing1",
+      "parent": "Bip01 Spine2",
+      "role": "strand",
+      "side": "R",
+      "index": 0
+    },
+    {
+      "name": "Bip01 R Wing2",
+      "parent": "Bip01 R Wing1",
+      "role": "strand",
+      "side": "R",
+      "index": 1
+    },
+    {
+      "name": "Bip01 R Wing3",
+      "parent": "Bip01 R Wing2",
+      "role": "strand",
+      "side": "R",
+      "index": 2
+    },
+    {
+      "name": "Bip01 R Wing4",
+      "parent": "Bip01 R Wing3",
+      "role": "strand",
+      "side": "R",
+      "index": 3
+    }
+  ],
+  "provenance": {
+    "bones": "convention",
+    "proportions": "generated"
+  }
+}

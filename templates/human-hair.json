@@ -1,0 +1,53 @@
+{
+  "id": "human-hair",
+  "label": "Hair, one ponytail",
+  "description": "A four-link strand off the head, tapering. Where a spring bone would go: nothing simulates it yet, so it moves only if something keys it or a chained model animates bones of the same name.",
+  "kind": "skeleton",
+  "requires": "an armature carrying Bip01 Head",
+  "attach": [
+    "Bip01 Head"
+  ],
+  "proportions": {
+    "generator": "strand",
+    "params": {
+      "height": 72.0,
+      "length": 0.18,
+      "direction": [
+        -0.55,
+        0.0,
+        -0.84
+      ],
+      "taper": 0.85
+    }
+  },
+  "bones": [
+    {
+      "name": "Bip01 Ponytail1",
+      "parent": "Bip01 Head",
+      "role": "strand",
+      "index": 0
+    },
+    {
+      "name": "Bip01 Ponytail2",
+      "parent": "Bip01 Ponytail1",
+      "role": "strand",
+      "index": 1
+    },
+    {
+      "name": "Bip01 Ponytail3",
+      "parent": "Bip01 Ponytail2",
+      "role": "strand",
+      "index": 2
+    },
+    {
+      "name": "Bip01 Ponytail4",
+      "parent": "Bip01 Ponytail3",
+      "role": "strand",
+      "index": 3
+    }
+  ],
+  "provenance": {
+    "bones": "convention",
+    "proportions": "generated"
+  }
+}

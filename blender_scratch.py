@@ -447,15 +447,32 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
     return len(actions), moved
 
 
+def scene_includes(arm_obj):
+    """The chain an import stamped, or a template wrote, as a list of engine paths.
+
+    An import stores it verbatim; a bone-set template writes the same key, which is where
+    a generated skeleton gets its animations from. Duplicates are dropped in first-seen
+    order -- the engine walks the array and a repeat costs a whole second bone map.
+    """
+    out = []
+    for p in (arm_obj.get("vtmb_includes") or ()):
+        p = str(p).replace("\\", "/").strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
 def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="flesh",
           cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE",
-          hitboxes=False, travel="extract"):
+          hitboxes=False, travel="extract", includes=()):
     """(Desc, faces) for the scene. `hull` is (min, max) and stays the caller's:
     @180/@192 are the movement hull the .qc's $hbox sets, not the mesh's bounds."""
     d = build_mod.new(name, surfaceprop)
     if hull is not None:
         lo, hi = hull
         _set_hull(d, lo, hi)
+    for p in includes:
+        build_mod.add_include(d, p)
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
@@ -526,6 +543,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "travelling": moved,
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),
             "anims": len(d.anims), "seqs": len(d.seqs),
+            "includes": len(d.includes),
             "hitboxes": sum(len(r.kids) for r in d.hitboxsets),
             "faces": st["tris_out"], "verts": st["verts_out"],
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16

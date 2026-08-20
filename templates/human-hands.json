@@ -1,0 +1,264 @@
+{
+  "id": "human-hands",
+  "label": "Human hands",
+  "description": "Five fingers of three joints per hand, in the Max biped spelling Finger0 / Finger01 / Finger02. Placed in each hand bone's own frame, so this lands correctly on any armature providing the two hands.",
+  "kind": "skeleton",
+  "requires": "an armature carrying Bip01 L Hand and Bip01 R Hand",
+  "attach": [
+    "Bip01 L Hand",
+    "Bip01 R Hand"
+  ],
+  "proportions": {
+    "generator": "digits",
+    "params": {
+      "height": 72.0,
+      "spread": 1.0
+    }
+  },
+  "bones": [
+    {
+      "name": "Bip01 L Finger0",
+      "parent": "Bip01 L Hand",
+      "role": "finger",
+      "side": "L",
+      "finger": 0,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 L Finger01",
+      "parent": "Bip01 L Finger0",
+      "role": "finger",
+      "side": "L",
+      "finger": 0,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 L Finger02",
+      "parent": "Bip01 L Finger01",
+      "role": "finger",
+      "side": "L",
+      "finger": 0,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 L Finger1",
+      "parent": "Bip01 L Hand",
+      "role": "finger",
+      "side": "L",
+      "finger": 1,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 L Finger11",
+      "parent": "Bip01 L Finger1",
+      "role": "finger",
+      "side": "L",
+      "finger": 1,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 L Finger12",
+      "parent": "Bip01 L Finger11",
+      "role": "finger",
+      "side": "L",
+      "finger": 1,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 L Finger2",
+      "parent": "Bip01 L Hand",
+      "role": "finger",
+      "side": "L",
+      "finger": 2,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 L Finger21",
+      "parent": "Bip01 L Finger2",
+      "role": "finger",
+      "side": "L",
+      "finger": 2,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 L Finger22",
+      "parent": "Bip01 L Finger21",
+      "role": "finger",
+      "side": "L",
+      "finger": 2,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 L Finger3",
+      "parent": "Bip01 L Hand",
+      "role": "finger",
+      "side": "L",
+      "finger": 3,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 L Finger31",
+      "parent": "Bip01 L Finger3",
+      "role": "finger",
+      "side": "L",
+      "finger": 3,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 L Finger32",
+      "parent": "Bip01 L Finger31",
+      "role": "finger",
+      "side": "L",
+      "finger": 3,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 L Finger4",
+      "parent": "Bip01 L Hand",
+      "role": "finger",
+      "side": "L",
+      "finger": 4,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 L Finger41",
+      "parent": "Bip01 L Finger4",
+      "role": "finger",
+      "side": "L",
+      "finger": 4,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 L Finger42",
+      "parent": "Bip01 L Finger41",
+      "role": "finger",
+      "side": "L",
+      "finger": 4,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 R Finger0",
+      "parent": "Bip01 R Hand",
+      "role": "finger",
+      "side": "R",
+      "finger": 0,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 R Finger01",
+      "parent": "Bip01 R Finger0",
+      "role": "finger",
+      "side": "R",
+      "finger": 0,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 R Finger02",
+      "parent": "Bip01 R Finger01",
+      "role": "finger",
+      "side": "R",
+      "finger": 0,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 R Finger1",
+      "parent": "Bip01 R Hand",
+      "role": "finger",
+      "side": "R",
+      "finger": 1,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 R Finger11",
+      "parent": "Bip01 R Finger1",
+      "role": "finger",
+      "side": "R",
+      "finger": 1,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 R Finger12",
+      "parent": "Bip01 R Finger11",
+      "role": "finger",
+      "side": "R",
+      "finger": 1,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 R Finger2",
+      "parent": "Bip01 R Hand",
+      "role": "finger",
+      "side": "R",
+      "finger": 2,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 R Finger21",
+      "parent": "Bip01 R Finger2",
+      "role": "finger",
+      "side": "R",
+      "finger": 2,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 R Finger22",
+      "parent": "Bip01 R Finger21",
+      "role": "finger",
+      "side": "R",
+      "finger": 2,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 R Finger3",
+      "parent": "Bip01 R Hand",
+      "role": "finger",
+      "side": "R",
+      "finger": 3,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 R Finger31",
+      "parent": "Bip01 R Finger3",
+      "role": "finger",
+      "side": "R",
+      "finger": 3,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 R Finger32",
+      "parent": "Bip01 R Finger31",
+      "role": "finger",
+      "side": "R",
+      "finger": 3,
+      "joint": 2
+    },
+    {
+      "name": "Bip01 R Finger4",
+      "parent": "Bip01 R Hand",
+      "role": "finger",
+      "side": "R",
+      "finger": 4,
+      "joint": 0
+    },
+    {
+      "name": "Bip01 R Finger41",
+      "parent": "Bip01 R Finger4",
+      "role": "finger",
+      "side": "R",
+      "finger": 4,
+      "joint": 1
+    },
+    {
+      "name": "Bip01 R Finger42",
+      "parent": "Bip01 R Finger41",
+      "role": "finger",
+      "side": "R",
+      "finger": 4,
+      "joint": 2
+    }
+  ],
+  "provenance": {
+    "bones": "convention",
+    "proportions": "generated"
+  }
+}

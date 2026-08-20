@@ -8,7 +8,7 @@ bl_info = {
     "author": "Claude Opus 5 xhigh / Twiglard",
     "blender": (3, 0, 0),
     "location": "File > Import > VTMB Model (.mdl), File > Export > VTMB Model (.mdl), "
-                "File > Export > VTMB Model, no donor (.mdl)",
+                "File > Export > VTMB Model, no donor (.mdl), Add > VTMB > Bone set",
     # bl_info has no "website"; doc_url is the key that becomes a button.
     "doc_url": "https://rpgcodex.net/",
     "description": "Import Bloodlines skeletons, meshes, UVs, weights, textures and "
@@ -22,8 +22,8 @@ bl_info = {
 }
 
 from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write, paths,
-               relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write,
-               blender_import, blender_export, blender_scratch)
+               relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write, bone_templates,
+               blender_import, blender_export, blender_scratch, blender_templates)
 
 import importlib
 import os
@@ -543,7 +543,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 # `build` emits each of these with a count of zero, which nobody reads out of a header.
 # The chain is the worst on a character: its animations live in the included files.
 SCRATCH_DROPS = (
-    "the include chain, so only this scene's animations exist",
     "collision and ragdoll -- both live in the sibling .phy, not written",
     "cloth, flex descs, controllers, rules and every vertanim",
     "eyeballs, mouths and pose parameters",
@@ -633,6 +632,14 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 "when the sequence loops, which is right only for something that really "
                 "does move in place")],
         default="extract")
+    chain: bpy.props.BoolProperty(
+        name="Keep the animation chain", default=True,
+        description="Write the included models the armature carries, so the engine reads "
+                    "their animations as if they were this file's. This is where a "
+                    "character's walk cycles actually live -- a bone-set template puts "
+                    "the chain there, and an import stamps whatever the donor had. The "
+                    "join is by bone name and is case-insensitive, so a renamed bone "
+                    "silently loses every animation that moved it")
     fit_hull: bpy.props.BoolProperty(
         name="Fit hull to the mesh", default=True,
         description="Set the movement hull to the bounding box of the geometry. Off "
@@ -702,6 +709,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             row = box.row()
             row.label(text="Travel")
             row.prop(self, "travel", text="")
+            box.prop(self, "chain")
+            chain = blender_scratch.scene_includes(obj)
+            if not chain:
+                _pair(box, "chained models", "none on this armature", icon="INFO")
+            elif self.chain:
+                for p in chain[:3]:
+                    box.label(text="    " + p)
+                if len(chain) > 3:
+                    box.label(text="    and %d more" % (len(chain) - 3))
+            else:
+                _pair(box, "chained models", "%d dropped" % len(chain), icon="ERROR")
 
         box = _section(lay, "vtmb_s_fit", "Fit", icon="SHADING_BBOX")
         if box is not None:
@@ -728,7 +746,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
                 scale=self.scale, surfaceprop=self.surfaceprop,
                 cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
-                activity=self.activity, hitboxes=self.fit_hitboxes, travel=self.travel)
+                activity=self.activity, hitboxes=self.fit_hitboxes, travel=self.travel,
+                includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
         except blender_scratch.Refused as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -745,17 +764,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                     for k, v in sorted(r["dropped"].items())))
         self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
                               "%d materials, %d animations (%d travelling), "
-                              "%d sequences, %d hitboxes, %d faces, %d verts, "
-                              "%d + %d bytes"
+                              "%d sequences, %d chained, %d hitboxes, %d faces, "
+                              "%d verts, %d + %d bytes"
                     % (os.path.basename(self.filepath), r["bones"], r["bodyparts"],
                        r["materials"], r["anims"], r["travelling"], r["seqs"],
-                       r["hitboxes"], r["faces"], r["verts"], r["bytes"],
+                       r["includes"], r["hitboxes"], r["faces"], r["verts"], r["bytes"],
                        r["vtx_bytes"]))
         return {"FINISHED"}
 
 
 CLASSES = [VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
-           EXPORT_OT_vtmb_mdl_scratch]
+           EXPORT_OT_vtmb_mdl_scratch] + list(blender_templates.CLASSES)
 
 if hasattr(bpy.types, "FileHandler"):
     class IO_FH_vtmb_mdl(bpy.types.FileHandler):
@@ -787,7 +806,8 @@ def _menu_export_scratch(self, context):
 def unregister():
     for menu, fn in ((bpy.types.TOPBAR_MT_file_import, _menu),
                      (bpy.types.TOPBAR_MT_file_export, _menu_export),
-                     (bpy.types.TOPBAR_MT_file_export, _menu_export_scratch)):
+                     (bpy.types.TOPBAR_MT_file_export, _menu_export_scratch),
+                     (bpy.types.VIEW3D_MT_add, blender_templates.menu)):
         try:
             menu.remove(fn)
         except Exception:
@@ -805,8 +825,8 @@ def register():
     # Dependency order: a module has to be reloaded before anything that imports it, or the
     # importer keeps the old object and the reload buys nothing.
     for m in (checksum, sections, relocs, mdl, mdl_write, mdl_build, mdl_rebuild,
-              mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild,
-              blender_import, blender_export, blender_scratch):
+              mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild, bone_templates,
+              blender_import, blender_export, blender_scratch, blender_templates):
         importlib.reload(m)
     # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
     # class of the same bl_idname otherwise makes register_class raise.
@@ -816,3 +836,4 @@ def register():
     bpy.types.TOPBAR_MT_file_import.append(_menu)
     bpy.types.TOPBAR_MT_file_export.append(_menu_export)
     bpy.types.TOPBAR_MT_file_export.append(_menu_export_scratch)
+    bpy.types.VIEW3D_MT_add.append(blender_templates.menu)

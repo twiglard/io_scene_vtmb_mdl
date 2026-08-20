@@ -1,0 +1,155 @@
+{
+  "id": "quadruped",
+  "label": "Quadruped",
+  "description": "The same topology as human-core over a horizontal spine, keeping the Bip01 names the game's own quadrupeds use (wolf_form, dog_feral, cat) so chaining stays available. height is withers height, not stature.",
+  "kind": "skeleton",
+  "requires": null,
+  "attach": [],
+  "surfaceprop": "flesh",
+  "proportions": {
+    "generator": "quadruped",
+    "params": {
+      "height": 40.0,
+      "width": 1.0,
+      "depth": 1.0
+    }
+  },
+  "bones": [
+    {
+      "name": "Bip01",
+      "parent": null,
+      "role": "root"
+    },
+    {
+      "name": "Bip01 Pelvis",
+      "parent": "Bip01",
+      "role": "pelvis"
+    },
+    {
+      "name": "Bip01 Spine",
+      "parent": "Bip01 Pelvis",
+      "role": "spine"
+    },
+    {
+      "name": "Bip01 Spine1",
+      "parent": "Bip01 Spine",
+      "role": "spine1"
+    },
+    {
+      "name": "Bip01 Spine2",
+      "parent": "Bip01 Spine1",
+      "role": "spine2"
+    },
+    {
+      "name": "Bip01 Neck",
+      "parent": "Bip01 Spine2",
+      "role": "neck"
+    },
+    {
+      "name": "Bip01 Head",
+      "parent": "Bip01 Neck",
+      "role": "head"
+    },
+    {
+      "name": "Bip01 L Clavicle",
+      "parent": "Bip01 Spine2",
+      "role": "clavicle",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 L UpperArm",
+      "parent": "Bip01 L Clavicle",
+      "role": "upperarm",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 L Forearm",
+      "parent": "Bip01 L UpperArm",
+      "role": "forearm",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 L Hand",
+      "parent": "Bip01 L Forearm",
+      "role": "hand",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 R Clavicle",
+      "parent": "Bip01 Spine2",
+      "role": "clavicle",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 R UpperArm",
+      "parent": "Bip01 R Clavicle",
+      "role": "upperarm",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 R Forearm",
+      "parent": "Bip01 R UpperArm",
+      "role": "forearm",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 R Hand",
+      "parent": "Bip01 R Forearm",
+      "role": "hand",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 L Thigh",
+      "parent": "Bip01 Pelvis",
+      "role": "thigh",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 L Calf",
+      "parent": "Bip01 L Thigh",
+      "role": "calf",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 L Foot",
+      "parent": "Bip01 L Calf",
+      "role": "foot",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 L Toe0",
+      "parent": "Bip01 L Foot",
+      "role": "toe",
+      "side": "L"
+    },
+    {
+      "name": "Bip01 R Thigh",
+      "parent": "Bip01 Pelvis",
+      "role": "thigh",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 R Calf",
+      "parent": "Bip01 R Thigh",
+      "role": "calf",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 R Foot",
+      "parent": "Bip01 R Calf",
+      "role": "foot",
+      "side": "R"
+    },
+    {
+      "name": "Bip01 R Toe0",
+      "parent": "Bip01 R Foot",
+      "role": "toe",
+      "side": "R"
+    }
+  ],
+  "provenance": {
+    "bones": "convention",
+    "proportions": "generated",
+    "surfaceprop": "convention"
+  }
+}

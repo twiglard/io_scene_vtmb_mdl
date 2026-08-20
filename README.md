@@ -24,6 +24,22 @@ the Unofficial Patch works with no extraction step.
 
 Both paths have been confirmed in game.
 
+**Bone sets** — *Add > VTMB > Bone set...* drops a skeleton into the scene, or merges one
+onto the armature already there. Each template is a small `.json` under `templates/`
+holding bone **names and hierarchy** plus a named proportion generator; nothing in it is a
+coordinate copied out of a shipped model. Merging is by bone name and applying twice adds
+nothing, so `human-core` + `human-hands` + `human-hair` compose, and `wing-pair` lands on
+either `human-core` or `quadruped`.
+
+The two `anims-human-*` templates carry no bones at all — only the chain of included models
+a character reads its animations through. That chain is what turns a bare armature into
+something that walks, and the engine joins it **by bone name, case-insensitively**, so a
+generated skeleton of the right names plays the game's own animations at its own limb
+lengths. Rename a bone and it silently stops animating.
+
+Adding a template is dropping a file in `templates/`. `plans/template-check.py` validates
+every one of them, and packing refuses any field tagged as measured off a shipped file.
+
 ## Requirements
 
 Blender, and a Bloodlines installation to read content from. Development and testing has
@@ -67,7 +83,6 @@ Stated up front, because hitting one should not be how it gets discovered.
 
 **What the no-donor path leaves out**, listed verbatim in its own export dialog:
 
-- the include chain, so only this scene's animations exist
 - collision and ragdoll — both live in the sibling `.phy`, not written
 - cloth, flex descs, controllers, rules and every vertanim
 - eyeballs, mouths and pose parameters

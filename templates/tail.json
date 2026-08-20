@@ -1,0 +1,59 @@
+{
+  "id": "tail",
+  "label": "Tail",
+  "description": "A five-link tail off the pelvis. The corpus spells this two ways, rat_crowd4 as Bip01 Tail1.. and cat reusing Bip01 Ponytail1.., and this file picks Tail. Rename the bones to chain against a model using the other spelling; the join is by name.",
+  "kind": "skeleton",
+  "requires": "an armature carrying Bip01 Pelvis",
+  "attach": [
+    "Bip01 Pelvis"
+  ],
+  "proportions": {
+    "generator": "strand",
+    "params": {
+      "height": 72.0,
+      "length": 0.42,
+      "direction": [
+        -0.94,
+        0.0,
+        0.34
+      ],
+      "taper": 0.88
+    }
+  },
+  "bones": [
+    {
+      "name": "Bip01 Tail1",
+      "parent": "Bip01 Pelvis",
+      "role": "strand",
+      "index": 0
+    },
+    {
+      "name": "Bip01 Tail2",
+      "parent": "Bip01 Tail1",
+      "role": "strand",
+      "index": 1
+    },
+    {
+      "name": "Bip01 Tail3",
+      "parent": "Bip01 Tail2",
+      "role": "strand",
+      "index": 2
+    },
+    {
+      "name": "Bip01 Tail4",
+      "parent": "Bip01 Tail3",
+      "role": "strand",
+      "index": 3
+    },
+    {
+      "name": "Bip01 Tail5",
+      "parent": "Bip01 Tail4",
+      "role": "strand",
+      "index": 4
+    }
+  ],
+  "provenance": {
+    "bones": "convention",
+    "proportions": "generated"
+  }
+}

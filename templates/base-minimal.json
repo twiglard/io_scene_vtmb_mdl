@@ -1,0 +1,28 @@
+{
+  "id": "base-minimal",
+  "label": "Base, one bone",
+  "description": "A single root bone and nothing else: the least that makes a valid spawnable model, with no assumption about what it is. 246 shipped models carry no Bip01 at all, and Root is the name that family uses.",
+  "kind": "skeleton",
+  "requires": null,
+  "attach": [],
+  "surfaceprop": "flesh",
+  "proportions": {
+    "generator": "single",
+    "params": {
+      "height": 72.0,
+      "length": 0.1
+    }
+  },
+  "bones": [
+    {
+      "name": "Root",
+      "parent": null,
+      "role": "root"
+    }
+  ],
+  "provenance": {
+    "bones": "convention",
+    "proportions": "generated",
+    "surfaceprop": "convention"
+  }
+}

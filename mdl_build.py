@@ -950,6 +950,19 @@ def add_hitbox(d, boxes, name="default", at=None):
     return at
 
 
+def add_include(d, name):
+    """Append one chained model, return its index.  `name` is the path the engine resolves,
+    'models/character/pc/male/pcidles_allsequences.mdl'.
+
+    All 116 bytes go out zero. `emit` patches the only two the file supplies -- the name at
+    +0x00 and the bone map at +0x10 -- and every other field is runtime scratch that
+    engine.dll `Studio_BuildChainedModelBoneMaps` @2000ce40 initialises before it reads any
+    of them, so the zeros are correct by construction rather than merely tolerated.
+    """
+    d.includes.append(Rec(bytearray(116), name))
+    return len(d.includes) - 1
+
+
 def add_material(d, name, cdtexture="models/"):
     if not d.cdtextures:
         d.cdtextures = [cdtexture]

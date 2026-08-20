@@ -1,0 +1,14 @@
+{
+  "id": "anims-human-male",
+  "label": "Human animations, male",
+  "description": "The chain a male character reads its animations through. Carries no bones, so merge it onto human-core or onto an armature of your own. The join is case-insensitive and by bone name, so a subset rig chains and a renamed bone silently stops animating.",
+  "kind": "animations",
+  "requires": "the game files these paths resolve against",
+  "attach": [],
+  "includes": [
+    "models/character/shared/male/pcidles_allsequences.mdl"
+  ],
+  "provenance": {
+    "includes": "convention"
+  }
+}
