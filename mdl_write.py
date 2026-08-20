@@ -245,60 +245,91 @@ def fit_scales(m, authored):
 
 
 LINEAR_AXIS = (0x40, 0x80, 0x100)
-# Undefined in ref/2531/studio.h and never read at runtime, but set on 10717 of 11013
+# Undefined in ref/2531/studio.h and never read at runtime, but set on 23442 of 23861
 # shipped blocks; motionflags as a whole reaches no engine code.
 MOTION_EXTRA = 0x1000
 
 
 def fit_movements(path, eps=1e-4):
-    """mstudiomovement_t blocks reproducing a per-frame model-space path.
+    """The straight ground-plane ramp behind one `mstudiomovement_t`, and the per-frame
+    displacement it accounts for.
 
-    v0/v1 are distance per block span, not per second: (v0+v1)/2 equals the block's own
-    step in all 11013 shipped blocks. One block per frame is exact at every integer frame,
-    which is the only place the engine is asked for; merging would only save bytes.
-    `angle` stays 0, as it is in every shipped block -- a turn lives in `vector`.
+    studiomdl extracts the *net* travel, never the path: one block along the frame-0 to
+    last-frame displacement, its speed ramping as `d(t) = v0 t + (v1 - v0) t^2 / 2` over
+    normalised time, which is exactly what `anim_position` integrates back
+    (`utils/studiomdl/simplify.cpp:315`, `extractLinearMotion`). `v0` and `v1` come from
+    the midframe -- distance `d1` there and `d2` at the end give `v0 = 4 d1 - d2` and
+    `v1 = 3 d2 - 4 d1`, each clamped to non-negative, and collapsed to a constant `d2`
+    when they agree within 10%. andrei's `run_0` carries `v0` 113.687 over 93.519, which
+    that fit reproduces.
+
+    Z is never extracted: `position.z` is nonzero in 68 of the corpus's 23 861 blocks, over
+    8 files. A run's rise and its fore-aft sway belong in the keys, where a viewer that
+    ignores movement blocks -- which is every one not driving an NPC -- can still see them.
+    `angle` stays 0: the 21 shipped blocks that carry one are pure yaw with no translation
+    at all, which is a different record and not something a linear fit produces.
+
+    One block per animation, so a path that curves keeps its curve in the keys and only
+    the chord becomes entity motion. Troika splits a turning walk into a block per span,
+    which this does not.
+
+    Returns `([], [])` when the ground-plane travel is under `eps`.
     """
-    rel = [[p[i] - path[0][i] for i in range(3)] for p in path]
-    if all(max(abs(c) for c in p) <= eps for p in rel):
-        return []
-    used = 0
-    for p in rel:
-        for i in range(3):
-            if abs(p[i]) > eps:
-                used |= LINEAR_AXIS[i]
-    out, prev, vec = [], rel[0], [1.0, 0.0, 0.0]
-    for f in range(1, len(rel)):
-        d = [rel[f][i] - prev[i] for i in range(3)]
-        step = math.sqrt(sum(c * c for c in d))
-        if step > eps:
-            vec = [c / step for c in d]
-        mv = M.Movement()
-        mv.endframe = f
-        mv.motionflags = MOTION_EXTRA | used
-        mv.v0 = mv.v1 = step
-        mv.angle = 0.0
-        mv.vector = tuple(vec)
-        mv.position = tuple(rel[f])
-        out.append(mv)
-        prev = rel[f]
-    return out
+    n = len(path) - 1
+    if n < 1:
+        return [], []
+    p2 = [path[n][i] - path[0][i] for i in range(2)]
+    d2 = math.sqrt(p2[0] * p2[0] + p2[1] * p2[1])
+    if d2 <= eps:
+        return [], []
+    mid = n // 2
+    s = n / 2.0 - mid
+    p1 = [path[mid][i] * (1 - s) + path[mid + 1][i] * s - path[0][i] for i in range(2)]
+    d1 = math.sqrt(p1[0] * p1[0] + p1[1] * p1[1])
+    v0, v1 = 4 * d1 - d2, 3 * d2 - 4 * d1
+    if v0 < 0.0:
+        v0, v1 = 0.0, d2 * 2.0
+    elif v1 < 0.0:
+        v0, v1 = d2 * 2.0, 0.0
+    elif v0 + v1 > 0.01 and abs(v0 - v1) / (v0 + v1) < 0.2:
+        v0 = v1 = d2
+    vec = (p2[0] / d2, p2[1] / d2, 0.0)
+    ramp = []
+    for f in range(n + 1):
+        t = f / n
+        ramp.append([c * (v0 * t + 0.5 * (v1 - v0) * t * t) for c in vec])
+    mv = M.Movement()
+    mv.endframe = n
+    mv.motionflags = MOTION_EXTRA | LINEAR_AXIS[0] | LINEAR_AXIS[1]
+    mv.v0 = v0
+    mv.v1 = v1
+    mv.angle = 0.0
+    mv.vector = vec
+    mv.position = tuple(ramp[n])
+    return [mv], ramp
 
 
 def extract_travel(m, poses):
-    """Move the root bone's path out of the poses and into movement blocks.
+    """Move the root bone's net ground-plane travel out of the poses and into one movement
+    block, subtracting only the ramp `fit_movements` fitted.
 
-    Equivalent only because `angle` is 0 in every shipped block: the engine applies
-    anim_position as a pure translation of every world matrix, and translating the root
-    of a hierarchy translates all of it, so no other bone's pose changes.
+    Whatever the ramp does not account for stays in the keys: andrei's `run_0` keeps its
+    21 units of rise and 6.7 of fore-aft sway on the root while the block carries the 93.5
+    forward, so the bound is still in the animation. Pinning the root instead takes the
+    bound out with the travel and the character runs flat.
+
+    Sound only because `angle` is 0: the engine applies anim_position as a pure translation
+    of every world matrix, and translating the root of a hierarchy translates all of it, so
+    no other bone's pose changes.
     """
     path = [list(p[0][0]) for p in poses]
-    mvs = fit_movements(path)
+    mvs, ramp = fit_movements(path)
     if not mvs:
         return [], poses
     out = []
-    for p in poses:
+    for f, p in enumerate(poses):
         q = [(list(pp), list(qq)) for pp, qq in p]
-        q[0] = (list(path[0]), q[0][1])
+        q[0] = ([path[f][i] - ramp[f][i] for i in range(3)], q[0][1])
         out.append(q)
     return mvs, out
 
