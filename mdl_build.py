@@ -298,7 +298,7 @@ def from_bytes(b):
         d.bones.append(r)
 
     for k in range(i(248)):
-        d.bonecontrollers.append(Rec(b[i(252) + k * 56:i(252) + (k + 1) * 56]))
+        d.bonecontrollers.append(Rec(b[i(252) + k * 24:i(252) + (k + 1) * 24]))
 
     for k in range(i(256)):
         o = i(260) + k * 12
@@ -507,7 +507,7 @@ def emit(d, checksum=None, drop=False):
     count(240, nb)
     hdrptr(244, "bones", nb)
 
-    _simple(o, hdr, d.bonecontrollers, "bonecontrollers", 56, 248, 252)
+    _simple(o, hdr, d.bonecontrollers, "bonecontrollers", 24, 248, 252)
 
     if d.hitboxsets:
         raw = bytearray()

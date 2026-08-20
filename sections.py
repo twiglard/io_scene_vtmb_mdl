@@ -143,7 +143,7 @@ def build(b, want_anims, want_seqs):
         if m.i(s + 0x8c) == 1:
             m.add("  bone%d mstudioaxisinterpbone_t" % k, s + m.i(s + 0x90), 1, 176)
     m.add("mstudiobonecontroller_t[]", h["bonecontrollerindex"],
-          h["numbonecontrollers"], 56)
+          h["numbonecontrollers"], 24)
     m.add("mstudiohitboxset_t[]", h["hitboxsetindex"], h["numhitboxsets"], 12)
     for k in range(h["numhitboxsets"]):
         s = h["hitboxsetindex"] + k * 12
