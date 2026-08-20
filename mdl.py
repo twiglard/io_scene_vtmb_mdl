@@ -249,6 +249,8 @@ class Mdl:
             raise ValueError("header length %d exceeds file size %d"
                              % (self.length, len(d)))
         self.trailer = d[self.length:]
+        # One animation's expanded RLE channels, dropped when the block moves.
+        self._chan, self._chan_base, self._chan_table = {}, None, []
 
         numbones, boneindex = struct.unpack_from("<ii", d, HDR_NUMBONES)
         numanim, animindex = struct.unpack_from("<ii", d, HDR_NUMANIM)
@@ -460,16 +462,60 @@ class Mdl:
         valid = d[off]
         return struct.unpack_from("<h", d, off + (k + 1 if valid > k else valid) * 2)[0]
 
+    def channel(self, off, numframes):
+        """One RLE channel as numframes int16s, decoded once and kept.
+
+        extract() restarts at the first run for every frame, so reading a whole animation
+        costs O(frames**2 / run length) per channel and unpacks one int16 at a time. Same
+        values, same held-tail rule -- a run stores `valid` of its `total` frames and the
+        rest repeat the last one -- but each run is unpacked once and each byte walked
+        once. Degenerate runs are reproduced rather than rejected: valid == 0 reads the
+        header word as extract's arithmetic does, total == 0 contributes nothing and the
+        walk moves on.
+        """
+        out = self._chan.get(off)
+        if out is not None:
+            return out
+        d, out, o = self.d, [], off
+        while len(out) < numframes:
+            valid, total = d[o], d[o + 1]
+            if valid:
+                vals = struct.unpack_from("<%dh" % valid, d, o + 2)
+                hold = vals[valid - 1]
+            else:
+                vals, hold = (), struct.unpack_from("<h", d, o)[0]
+            for k in range(min(total, numframes - len(out))):
+                out.append(vals[k] if k < valid else hold)
+            o += (valid + 1) * 2
+        self._chan[off] = out
+        return out
+
+    def anim_channels(self, anim):
+        """Per bone, its seven channels as lists of numframes int16s, None where absent.
+
+        Built once per animation and kept until the next one asks, which is the access
+        order every caller has: animation outer, frame inner. It is what takes the
+        per-frame path down to an index -- the header unpack, the offset arithmetic and
+        the channel decode all happen here instead of once per bone per frame.
+        """
+        if anim.base != self._chan_base:
+            self._chan, self._chan_base = {}, anim.base
+            d, nf, tab = self.d, max(1, anim.numframes), []
+            for b in self.bones:
+                o = anim.base + b.index * ANIM_STRIDE
+                offs = struct.unpack_from("<7i", d, o + 4)
+                tab.append([self.channel(o + x, nf) if x else None for x in offs])
+            self._chan_table = tab
+        return self._chan_table
+
     def local_pose(self, anim, frame):
         """Parent-relative (pos, quat) per bone. Rotation is a bare product, no base."""
-        d, out = self.d, []
-        for b in self.bones:
-            o = anim.base + b.index * ANIM_STRIDE
-            offs = struct.unpack_from("<7i", d, o + 4)
-            pos = [b.pos[c] + self.extract(o + offs[c], frame) * b.posscale[c]
-                   if offs[c] else b.pos[c] for c in range(3)]
-            quat = [self.extract(o + offs[3 + c], frame) * b.rotscale[c]
-                    if offs[3 + c] else b.quat[c] for c in range(4)]
+        out = []
+        for b, ch in zip(self.bones, self.anim_channels(anim)):
+            pos = [b.pos[c] + ch[c][frame] * b.posscale[c] if ch[c] else b.pos[c]
+                   for c in range(3)]
+            quat = [ch[3 + c][frame] * b.rotscale[c] if ch[3 + c] else b.quat[c]
+                    for c in range(4)]
             out.append((pos, quat))
         return out
 
