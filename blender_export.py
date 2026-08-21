@@ -312,19 +312,31 @@ def read_meshes(m, source, fields):
     return edits, missing, sorted(unsupported), renormals
 
 
+def named_index(anim_names, action):
+    """The slot whose animation bears this action's exact name, or None."""
+    for i, n in enumerate(anim_names):
+        if n == action.name:
+            return i
+    return None
+
+
+def stamped_index(anim_names, action):
+    """The slot `vtmb_anim_index` points at, or None when it is absent or out of range."""
+    i = action.get("vtmb_anim_index")
+    return int(i) if i is not None and 0 <= int(i) < len(anim_names) else None
+
+
 def name_index(anim_names, action):
-    """The slot an action lands on when no slot was named, or None.
+    """The slot one named action lands on, or None.
 
     Its own name first, `vtmb_anim_index` second: duplicating an action copies the
     property, so it can point at a slot the action is no longer called after. The dialog
     and the write must both come through here, or one displays a slot and the other
-    writes a different one.
+    writes a different one. Only for the paths that carry a single action -- with several
+    in play the stamp is not enough on its own, which is what `match_indices` decides.
     """
-    for i, n in enumerate(anim_names):
-        if n == action.name:
-            return i
-    i = action.get("vtmb_anim_index")
-    return int(i) if i is not None and 0 <= int(i) < len(anim_names) else None
+    i = named_index(anim_names, action)
+    return stamped_index(anim_names, action) if i is None else i
 
 
 def resolve_target(m, action, name):
@@ -350,42 +362,84 @@ def same_file(a, b):
             os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
-def match_indices(anim_names, source):
-    """Every action in the blend that names one of `anim_names`, as ({index: action}, ignored).
+def armature_actions(arm_obj):
+    """Every action the armature currently plays -- its own, and its NLA strips'."""
+    ad = getattr(arm_obj, "animation_data", None)
+    if ad is None:
+        return []
+    out = [ad.action] if ad.action else []
+    for tr in ad.nla_tracks:
+        out += [s.action for s in tr.strips if s.action]
+    return out
 
-    The name decides, and `vtmb_anim_index` is only a fallback for an action whose name
-    matches nothing. Duplicating an action copies its custom properties, so several
-    actions routinely carry one index while showing three different names; letting the
-    invisible property outvote the visible name made that an error the user could not
-    see the cause of. Takes names rather than an Mdl so the dialog can call it every
-    redraw off its cached list.
+
+def match_indices(anim_names, source, arm_obj=None):
+    """Which action replaces which animation, as ({index: action}, unwritten).
+
+    The name decides; `vtmb_anim_index` answers only for an action nobody else contests.
+    `action.copy()` carries custom properties over, so `run_0.001`, `run_0.002` and
+    `run_0.003` all read index 0 and all claim animation 0 -- picking one is picking by
+    `bpy.data.actions` order, which the author cannot see, so none is written and the tie
+    is reported. `unwritten` is (animation, action, kept) for every candidate left out,
+    `kept` being the action that took the slot or None when the animation is left alone.
+
+    Takes names rather than an Mdl so the dialog can call it every redraw off its cached
+    list.
     """
-    by_name = set(anim_names)
-    claims = {}
+    named, stamped, loose = {}, {}, []
     for act in bpy.data.actions:
-        if act.name not in by_name and not same_file(act.get("vtmb_source"), source):
+        i = named_index(anim_names, act)
+        if i is not None:
+            named[i] = act
             continue
-        i = name_index(anim_names, act)
-        if i is None:
+        if not same_file(act.get("vtmb_source"), source):
             continue
-        claims.setdefault(i, []).append(act)
-    found, ignored = {}, []
-    for i, acts in sorted(claims.items()):
-        best = next((a for a in acts if a.name == anim_names[i]), acts[0])
-        found[i] = best
-        ignored += [(anim_names[i], a.name) for a in acts if a is not best]
-    return found, ignored
+        j = stamped_index(anim_names, act)
+        if j is None:
+            loose.append(act)
+        else:
+            stamped.setdefault(j, []).append(act)
+
+    found, unwritten = dict(named), []
+    for j, acts in sorted(stamped.items()):
+        if j in found:
+            unwritten += [(anim_names[j], a.name, found[j].name) for a in acts]
+        elif len(acts) == 1:
+            found[j] = acts[0]
+        else:
+            unwritten += [(anim_names[j], a.name, None) for a in acts]
+    # Came from this file and now points at no animation of it -- a rename, or a stamp
+    # that outlived the animation it named.
+    unwritten += [(None, a.name, None) for a in loose]
+    # Keying into a fresh action leaves neither a name nor a stamp, so it never became a
+    # candidate above and would otherwise be dropped without appearing anywhere at all.
+    seen = set(found.values()) | {a for a in loose}
+    named_out = {u[1] for u in unwritten}
+    for act in armature_actions(arm_obj):
+        if act not in seen and act.name not in named_out:
+            unwritten.append((None, act.name, None))
+            named_out.add(act.name)
+    return found, unwritten
 
 
-def match_actions(m, source):
-    return match_indices([a.name for a in m.anims], source)
+def match_actions(m, source, arm_obj=None):
+    return match_indices([a.name for a in m.anims], source, arm_obj)
 
 
-def describe_ignored(ignored, limit=3):
-    head = "; ".join("%s kept over %s" % (n, a) for n, a in ignored[:limit])
-    more = "" if len(ignored) <= limit else " and %d more" % (len(ignored) - limit)
-    return "%d action%s ignored, same target: %s%s" % (
-        len(ignored), "" if len(ignored) == 1 else "s", head, more)
+def unwritten_line(anim, act, kept):
+    """One row of `match_indices`' second return, in the dialog's own arrow idiom."""
+    if kept is not None:
+        return "%s ← %s (not %s)" % (anim, kept, act)
+    if anim is None:
+        return "%s → nothing" % act
+    return "%s ← nothing (%s and others claim it)" % (anim, act)
+
+
+def describe_unwritten(unwritten, limit=3):
+    head = "; ".join(unwritten_line(*u) for u in unwritten[:limit])
+    more = "" if len(unwritten) <= limit else " and %d more" % (len(unwritten) - limit)
+    return "%d action%s not written: %s%s" % (
+        len(unwritten), "" if len(unwritten) == 1 else "s", head, more)
 
 
 def read_materials(m, source):

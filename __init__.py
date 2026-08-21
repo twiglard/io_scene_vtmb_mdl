@@ -147,12 +147,13 @@ def _auto_name(op, context):
 
 
 def _matches(op, context):
-    """(animation, action) pairs the every-matching-action mode would write, and how
-    many further actions aim at a slot already taken."""
+    """(animation, action) pairs the every-matching-action mode would write, and the
+    (animation, action, kept) triples it would leave out."""
     path = _base_path(op, context)
     anims = _base_anims(path)
-    hits, ignored = blender_export.match_indices([n for n, _ in anims], path)
-    return [(anims[i][0], a.name) for i, a in sorted(hits.items())], len(ignored)
+    hits, unwritten = blender_export.match_indices([n for n, _ in anims], path,
+                                                   context.active_object)
+    return [(anims[i][0], a.name) for i, a in sorted(hits.items())], unwritten
 
 
 def _target_items(self, context):
@@ -413,7 +414,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             row.label(text="Replace")
             row.prop(self, "target", text="")
             if self.target == ALL:
-                hits, ignored = _matches(self, context)
+                hits, unwritten = _matches(self, context)
                 _pair(box, "matched", "%d of %d" % (len(hits), len(_base_anims(base))),
                       icon="NONE" if hits else "ERROR")
                 for name, act_name in hits[:4]:
@@ -421,8 +422,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                              else "%s ← %s" % (name, act_name)))
                 if len(hits) > 4:
                     box.label(text="    and %d more" % (len(hits) - 4))
-                if ignored:
-                    _pair(box, "ignored", "%d duplicate" % ignored, icon="INFO")
+                if unwritten:
+                    _pair(box, "not written", "%d action%s" % (
+                        len(unwritten), "" if len(unwritten) == 1 else "s"), icon="ERROR")
+                    for u in unwritten[:3]:
+                        box.label(text="    " + blender_export.unwritten_line(*u))
+                    if len(unwritten) > 3:
+                        box.label(text="    and %d more" % (len(unwritten) - 3))
             elif self.target != NONE:
                 auto = _auto_name(self, context)
                 if self.target == ACTIVE and not auto:
@@ -485,12 +491,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             if self.target == NONE:
                 actions = {}
             elif self.target == ALL:
-                actions, ignored = blender_export.match_actions(m, src)
+                actions, unwritten = blender_export.match_actions(m, src, obj)
                 if not actions:
                     raise ValueError("no action shares a name with an animation of %s"
                                      % os.path.basename(src))
-                if ignored:
-                    self.report({"WARNING"}, blender_export.describe_ignored(ignored))
+                if unwritten:
+                    self.report({"WARNING"},
+                                blender_export.describe_unwritten(unwritten))
             else:
                 act = obj.animation_data.action
                 actions = {blender_export.resolve_target(
