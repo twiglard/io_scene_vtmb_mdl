@@ -186,6 +186,8 @@ def build_armature(context, m, name, scale):
     arm_obj["vtmb_checksum"] = m.checksum
     arm_obj["vtmb_source"] = m.path
     arm_obj["vtmb_includes"] = list(m.includes)
+    # Per-model and not per-material, so nothing else in the scene can carry it back out.
+    arm_obj["vtmb_cdtexture"] = list(m.material_paths)
     arm_obj["vtmb_sequences"] = [
         {"label": s.label, "activity": s.activity,
          "groupsize": list(s.groupsize),
@@ -193,6 +195,22 @@ def build_armature(context, m, name, scale):
                      for i in col] for col in s.blends]}
         for s in m.seqs]
     return arm_obj
+
+
+def missing_paths(content, includes=(), cdtextures=(), material_names=()):
+    """{"includes": [...], "materials": [...]} -- what a write would point at nothing.
+
+    A material is missing only when no cdtexture directory has it, which is the same
+    cross product the engine walks, so one prefix serving nothing is not itself an error:
+    `toreador_female_armor_0` carries 11 for 10 materials.
+    """
+    gone = [p for p in includes if content.find(p)[0] is None]
+    bad = []
+    for name in material_names:
+        stems = paths_mod.material_stems(name, cdtextures)
+        if all(content.find(s + ".vmt")[0] is None for s in stems):
+            bad.append(name)
+    return {"includes": gone, "materials": bad}
 
 
 def _vmt_basetexture(path, blob=None):

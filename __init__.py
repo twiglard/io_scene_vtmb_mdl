@@ -23,7 +23,8 @@ bl_info = {
 
 from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write, paths,
                relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write, bone_templates,
-               blender_import, blender_export, blender_scratch, blender_templates)
+               blender_import, blender_export, blender_scratch, blender_templates,
+               blender_panel)
 
 import importlib
 import os
@@ -563,6 +564,33 @@ def _scratch_meshes(context, arm_obj):
     return own or [o for o in context.scene.objects if o.type == "MESH"]
 
 
+def _scratch_cdtexture(arm_obj):
+    """What the dialog starts the Material dirs field at.
+
+    Reachable without a window on purpose: `invoke` cannot be driven headless, so the seed
+    would otherwise be the one part of the dialog no check can see.
+    """
+    return ";".join(blender_scratch.scene_cdtextures(arm_obj)) or "models/"
+
+
+def _unresolved(context, arm_obj, filepath, includes, cdtextures):
+    """{kind: [name, ...]} a write would point at nothing, or {} with no content root.
+
+    Anchored on the model the armature came from rather than on where it is being saved:
+    an export usually goes somewhere outside the install, and rooting on that would find
+    no content and then have nothing to say. Silence with no root at all would read as
+    "everything resolves", so only a lookup that really ran is reported.
+    """
+    game_root, mods, extract = _prefs(context)
+    roots = paths.roots(arm_obj.get("vtmb_source") or filepath, game_root, mods, extract)
+    if not roots:
+        return {}
+    bad = blender_import.missing_paths(
+        blender_import.Content(roots), includes, cdtextures,
+        blender_panel.scene_material_names(context, arm_obj))
+    return {k: v for k, v in bad.items() if v}
+
+
 def _scratch_actions(arm_obj=None):
     """Every action keying a bone this armature has, so nothing needs marking up first.
 
@@ -607,11 +635,14 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     "scripts/surfaceproperties.txt and falls back without a word when "
                     "the name is not there")
     cdtexture: bpy.props.StringProperty(
-        name="Material dir", default="models/",
+        name="Material dirs", default="models/",
         description="Where the engine looks for the .vmt files, under materials/. Each "
-                    "Blender material slot becomes a name in this directory, so a slot "
-                    "named tor_femamor0head resolves as "
-                    "materials/<this>/tor_femamor0head.vmt")
+                    "Blender material slot becomes a name tried in each of these in turn, "
+                    "so a slot named tor_femamor0head resolves as "
+                    "materials/<first that has it>/tor_femamor0head.vmt. Several are "
+                    "separated by ;, because nothing binds a directory to a particular "
+                    "material and 615 of the 4445 shipped models need more than one. An "
+                    "import fills this in from the file it read")
     activity: bpy.props.StringProperty(
         name="Activity", default="ACT_IDLE",
         description="The activity every sequence claims. An action carrying its own "
@@ -667,7 +698,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         return obj is not None and obj.type == "ARMATURE" and bool(obj.data.bones)
 
     def invoke(self, context, event):
-        self.scale = float(context.active_object.get("vtmb_scale", 1.0) or 1.0)
+        obj = context.active_object
+        self.scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
+        self.cdtexture = _scratch_cdtexture(obj)
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -682,6 +715,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             box.prop(self, "scale")
             box.prop(self, "surfaceprop")
             box.prop(self, "cdtexture")
+            dirs = paths.cdtexture_list(self.cdtexture)
+            stamped = blender_scratch.scene_cdtextures(obj)
+            if len(dirs) > 1:
+                for p in dirs[:4]:
+                    box.label(text="    materials/" + p)
+                if len(dirs) > 4:
+                    box.label(text="    and %d more" % (len(dirs) - 4))
+            if stamped and dirs != stamped:
+                _pair(box, "the imported model said", ";".join(stamped[:2])
+                      + (" and %d more" % (len(stamped) - 2) if len(stamped) > 2 else ""),
+                      icon="ERROR")
 
         box = _section(lay, "vtmb_s_geom", "Geometry", icon="MESH_DATA")
         if box is not None:
@@ -762,6 +806,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "dropped %s"
                         % ", ".join("%s x%d" % (k, v)
                                     for k, v in sorted(r["dropped"].items())))
+        unresolved = _unresolved(
+            context, obj, self.filepath,
+            blender_scratch.scene_includes(obj) if self.chain else (),
+            paths.cdtexture_list(self.cdtexture))
+        for kind, bad in sorted(unresolved.items()):
+            self.report({"WARNING"}, "%d %s resolve against nothing and will not draw: %s"
+                        % (len(bad), kind, ", ".join(bad[:4])))
         self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
                               "%d materials, %d animations (%d travelling), "
                               "%d sequences, %d chained, %d hitboxes, %d faces, "
@@ -773,8 +824,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         return {"FINISHED"}
 
 
-CLASSES = [VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
-           EXPORT_OT_vtmb_mdl_scratch] + list(blender_templates.CLASSES)
+CLASSES = ([VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
+            EXPORT_OT_vtmb_mdl_scratch] + list(blender_templates.CLASSES)
+           + list(blender_panel.CLASSES))
 
 if hasattr(bpy.types, "FileHandler"):
     class IO_FH_vtmb_mdl(bpy.types.FileHandler):
@@ -812,6 +864,7 @@ def unregister():
             menu.remove(fn)
         except Exception:
             pass
+    blender_panel.unregister_props()
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)
@@ -826,13 +879,15 @@ def register():
     # importer keeps the old object and the reload buys nothing.
     for m in (checksum, sections, relocs, mdl, mdl_write, mdl_build, mdl_rebuild,
               mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild, bone_templates,
-              blender_import, blender_export, blender_scratch, blender_templates):
+              blender_import, blender_export, blender_scratch, blender_templates,
+              blender_panel):
         importlib.reload(m)
     # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
     # class of the same bl_idname otherwise makes register_class raise.
     unregister()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    blender_panel.register_props()
     bpy.types.TOPBAR_MT_file_import.append(_menu)
     bpy.types.TOPBAR_MT_file_export.append(_menu_export)
     bpy.types.TOPBAR_MT_file_export.append(_menu_export_scratch)

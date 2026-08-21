@@ -23,6 +23,7 @@ from . import blender_export as export_mod
 from . import mdl as mdl_mod
 from . import mdl_build as build_mod
 from . import mdl_write as write_mod
+from . import paths as paths_mod
 from . import vtx_rebuild as vtxr_mod
 
 # A bone needs at least one bit of the 0xFFFC used-by mask or it gets no bone matrix and
@@ -294,7 +295,7 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
             for ri in range(len(runs))], kept, added
 
 
-def add_meshes(d, mesh_objs, bone_index, scale=1.0, cdtexture="models/"):
+def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     """One bodypart per object, holding one model whose meshes are its material slots.
 
     A bodypart is a variant selector -- the engine draws one of its models, chosen by
@@ -312,7 +313,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0, cdtexture="models/"):
         for slot, verts, faces in runs:
             name = mats[slot].name if slot < len(mats) and mats[slot] else obj.name
             if name not in slot_of:
-                slot_of[name] = build_mod.add_material(d, name, cdtexture)
+                slot_of[name] = build_mod.add_material(d, name)
             meshes.append((slot_of[name], verts, faces))
         if meshes:
             build_mod.add_model(d, meshes,
@@ -447,19 +448,23 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
     return len(actions), moved
 
 
+def scene_cdtextures(arm_obj):
+    """The material directories an import stamped.
+
+    Empty is not the same as `models/`: 4442 of the 4445 shipped models are not `models/`,
+    so a caller with nothing here picks its own default rather than being handed one.
+    """
+    return paths_mod.engine_paths(arm_obj.get("vtmb_cdtexture"))
+
+
 def scene_includes(arm_obj):
     """The chain an import stamped, or a template wrote, as a list of engine paths.
 
     An import stores it verbatim; a bone-set template writes the same key, which is where
-    a generated skeleton gets its animations from. Duplicates are dropped in first-seen
-    order -- the engine walks the array and a repeat costs a whole second bone map.
+    a generated skeleton gets its animations from. Duplicates are dropped -- the engine
+    walks the array and a repeat costs a whole second bone map.
     """
-    out = []
-    for p in (arm_obj.get("vtmb_includes") or ()):
-        p = str(p).replace("\\", "/").strip()
-        if p and p not in out:
-            out.append(p)
-    return out
+    return paths_mod.engine_paths(arm_obj.get("vtmb_includes"))
 
 
 def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="flesh",
@@ -473,10 +478,11 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
         _set_hull(d, lo, hi)
     for p in includes:
         build_mod.add_include(d, p)
+    build_mod.set_cdtextures(d, paths_mod.cdtexture_list(cdtexture))
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
-    faces, unskinned, kept = add_meshes(d, mesh_objs, bone_index, scale, cdtexture)
+    faces, unskinned, kept = add_meshes(d, mesh_objs, bone_index, scale)
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
     _n, moved = add_actions(context, arm_obj, d, actions, scale, use_range, activity,

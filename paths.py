@@ -39,6 +39,40 @@ def content_root(path):
         d = parent
 
 
+def content_relative(path, name):
+    """What follows the last `name/` component of `path`, forward-slashed, or None.
+
+    A picked file can sit in the install, in an extraction or in a loose tree of the user's
+    own, and none of those roots is knowable from the path alone; the marker component is,
+    so it is what the engine-relative part gets cut from.
+    """
+    parts = os.path.abspath(path).replace("\\", "/").rstrip("/").split("/")
+    low = [p.lower() for p in parts]
+    if name.lower() not in low:
+        return None
+    return "/".join(parts[len(low) - low[::-1].index(name.lower()):])
+
+
+def engine_paths(seq):
+    """Separators normalised, blanks dropped, repeats dropped in first-seen order."""
+    out = []
+    for p in (seq or ()):
+        p = str(p).replace("\\", "/").strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def cdtexture_list(value, default=MODELS_DIR + "/"):
+    """A `;`-separated field or a sequence, as the list the file stores.
+
+    Never empty: a model with no directory at all resolves no material, so the default
+    stands in for a field the user cleared.
+    """
+    out = engine_paths(value.split(";") if isinstance(value, str) else value)
+    return out or engine_paths([default])
+
+
 def split_list(text):
     return [p.strip() for p in str(text or "").replace(",", ";").split(";") if p.strip()]
 

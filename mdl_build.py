@@ -963,9 +963,29 @@ def add_include(d, name):
     return len(d.includes) - 1
 
 
+def set_cdtextures(d, paths):
+    """The directories under `materials/` a name is tried against, in order.
+
+    A list and not a string: the lookup is a cross product, each of `numtextures` names
+    against each of these until one resolves, and nothing binds a prefix to a particular
+    material -- `toreador_female_armor_0` carries 11 for 10 materials. No separator is
+    inserted at the join, so an entry naming a directory ends in a slash. Normalising
+    separators and dropping repeats differs from the shipped bytes on 106 of 4445 models,
+    which resolve the same either way.
+    """
+    out = []
+    for p in ([paths] if isinstance(paths, str) else paths):
+        p = str(p).replace("\\", "/").strip()
+        if p not in out:
+            out.append(p)
+    d.cdtextures = out
+    return out
+
+
 def add_material(d, name, cdtexture="models/"):
+    # Only a fallback: the list is the file's, not the first material's.
     if not d.cdtextures:
-        d.cdtextures = [cdtexture]
+        set_cdtextures(d, cdtexture)
     d.textures.append(Rec(bytearray(20), name))
     d.skin = [list(range(len(d.textures)))]
     return len(d.textures) - 1
