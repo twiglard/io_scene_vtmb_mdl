@@ -378,6 +378,11 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         ids = v.orig_vert_ids(g)
         acc = faces_by_model.setdefault(g.model, [])
         for tri in v.triangles(g):
+            # A trilist may state a degenerate face -- the strip walk already filters
+            # its own -- and the material assignment below needs me.polygons and
+            # `faces` index-parallel, which any face Blender refuses would break.
+            if len(set(tri)) < 3:
+                continue
             acc.append((tuple(mesh.vertexoffset + ids[i] for i in tri),
                         mesh.material))
 
@@ -391,6 +396,10 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         me.from_pydata([[c * scale for c in v_.pos] for v_ in verts], [],
                        [list(f[0]) for f in faces])
         me.update()
+        if len(me.polygons) != len(faces):
+            raise ValueError("%s: Blender kept %d of %d faces; every material after "
+                             "the first dropped face would land on the wrong polygon"
+                             % (me.name, len(me.polygons), len(faces)))
 
         slots = {}
         for _tri, matidx in faces:
