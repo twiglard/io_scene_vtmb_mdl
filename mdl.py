@@ -199,7 +199,8 @@ class Movement:
 
 
 class Seq:
-    __slots__ = ("index", "label", "activity", "groupsize", "blends", "bbmin", "bbmax")
+    __slots__ = ("index", "label", "activity", "flags", "groupsize", "blends",
+                 "bbmin", "bbmax")
 
 
 class Mesh:
@@ -309,6 +310,10 @@ class Mdl:
         s.index = i
         s.label = self._cstr(off + struct.unpack_from("<i", d, off)[0])
         s.activity = self._cstr(off + struct.unpack_from("<i", d, off + 4)[0])
+        # STUDIO_LOOPING is bit 0 of THIS field, not of mstudioanimdesc_t.flags at the
+        # same offset of that struct: a file carrying the animdesc bit and not this one
+        # plays once and stops -- measured in game 2026-08-22 on ztest/zskel_loop.mdl.
+        s.flags = struct.unpack_from("<i", d, off + 8)[0]
         # The cull volume, and the one field a from-scratch writer cannot leave zero:
         # zero here and the engine draws the model, then drops it the moment the camera
         # turns. See plans/todo-vtmb-mdl-roadmap.md item 31.

@@ -374,7 +374,7 @@ def armature_actions(arm_obj):
 
 
 def match_indices(anim_names, source, arm_obj=None):
-    """Which action replaces which animation, as ({index: action}, unwritten).
+    """Which action replaces which animation, as ({index: action}, unwritten, addable).
 
     The name decides; `vtmb_anim_index` answers only for an action nobody else contests.
     `action.copy()` carries custom properties over, so `run_0.001`, `run_0.002` and
@@ -382,6 +382,11 @@ def match_indices(anim_names, source, arm_obj=None):
     `bpy.data.actions` order, which the author cannot see, so none is written and the tie
     is reported. `unwritten` is (animation, action, kept) for every candidate left out,
     `kept` being the action that took the slot or None when the animation is left alone.
+
+    `addable` is the same actions the `anim is None` rows name, as objects rather than
+    names: an action of this file's that matches no animation of it, and one the armature
+    plays that claims nothing at all. Those are exactly the ones an append can take, and
+    they are collected here so the rule lives in one place rather than in the dialog.
 
     Takes names rather than an Mdl so the dialog can call it every redraw off its cached
     list.
@@ -410,6 +415,7 @@ def match_indices(anim_names, source, arm_obj=None):
             unwritten += [(anim_names[j], a.name, None) for a in acts]
     # Came from this file and now points at no animation of it -- a rename, or a stamp
     # that outlived the animation it named.
+    addable = list(loose)
     unwritten += [(None, a.name, None) for a in loose]
     # Keying into a fresh action leaves neither a name nor a stamp, so it never became a
     # candidate above and would otherwise be dropped without appearing anywhere at all.
@@ -419,11 +425,24 @@ def match_indices(anim_names, source, arm_obj=None):
         if act not in seen and act.name not in named_out:
             unwritten.append((None, act.name, None))
             named_out.add(act.name)
-    return found, unwritten
+            addable.append(act)
+    return found, unwritten, addable
 
 
 def match_actions(m, source, arm_obj=None):
     return match_indices([a.name for a in m.anims], source, arm_obj)
+
+
+def split_unwritten(unwritten, adding):
+    """(rows an append would take, rows nothing takes).
+
+    A row with no animation named it is an action matching nothing, which is the append
+    candidate; every other row is a contested slot, which adding cannot help.
+    """
+    if not adding:
+        return [], list(unwritten)
+    return ([u for u in unwritten if u[0] is None],
+            [u for u in unwritten if u[0] is not None])
 
 
 def unwritten_line(anim, act, kept):
@@ -475,14 +494,17 @@ def read_materials(m, source):
 def apply_sequences(d, arm_obj, anim_names):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
-    Matched by position: the stash is written in file order and this path cannot change how
-    many sequences there are. Blends are stored as animation names because an index means
-    nothing once the file is re-emitted, so they resolve back through `anim_names`.
+    Matched by position: the stash is written in file order. A file carrying more than the
+    stash does is one an append has just grown, and the sequences past its end are ones the
+    scene says nothing about, so they keep what `add_sequence` wrote; a stash longer than
+    the file claims sequences that are not there and is refused. Blends are stored as
+    animation names because an index means nothing once the file is re-emitted, so they
+    resolve back through `anim_names`.
     """
     stash = arm_obj.get("vtmb_sequences")
     if not stash:
         return 0
-    if len(stash) != len(d.seqs):
+    if len(stash) > len(d.seqs):
         raise ValueError("the armature carries %d sequences and the file has %d"
                          % (len(stash), len(d.seqs)))
     index = {n: k for k, n in enumerate(anim_names)}
@@ -530,8 +552,14 @@ def verify_writer(src):
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, keep_travel=True,
-                   travel="keep", mesh_fields=(), verify=True):
+                   travel="keep", mesh_fields=(), verify=True, add=()):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
+
+    `add` is actions appended as new animations rather than replacing one, each with a
+    sequence of the same name -- the engine reaches an animation only through a sequence,
+    so one with none is dead weight. Appending renumbers nothing, every stored index
+    pointing below the insertion point, and `emit` requantises the animations already in
+    the file when the new pose widens the file-wide `mstudiobone_t` scales.
 
     The file is always rebuilt from its own decoded records -- every count from a `len()`,
     every offset from where its target landed -- so an empty map is meaningful and re-emits
@@ -552,7 +580,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise ValueError("%s has no animation data" % arm_obj.name)
     restore = ad.action if ad else None
 
-    edits, wrote = {}, []
+    edits, wrote, pending = {}, [], []
     try:
         for index, action in sorted(actions.items()):
             if ad.action is not action:
@@ -580,6 +608,24 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                             "flags": action.get("vtmb_flags")}
             wrote.append((index, anim.name, action.name, len(frames),
                           len(anim.movements if movements is None else movements)))
+
+        for action in add:
+            if ad.action is not action:
+                ad.action = action
+            lo, hi = action.frame_range
+            a = int(round(lo)) if frame_start is None else frame_start
+            b = int(round(hi)) if frame_end is None else frame_end
+            frames = list(range(a, b + 1))
+            if not frames:
+                raise ValueError("%s: empty frame range" % action.name)
+            # No donor animation behind this one, so there is no travel to take back out
+            # and nothing for "keep" to keep: an appended animation either has the blocks
+            # fitted here or has none.
+            poses = read_poses(context, arm_obj, m, frames, scale)
+            movements = ()
+            if travel == "extract":
+                movements, poses = write_mod.extract_travel(m, poses)
+            pending.append((action, poses, tuple(movements), len(frames)))
     finally:
         if ad is not None and ad.action is not restore:
             ad.action = restore
@@ -598,7 +644,18 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
             d.textures[ref].name = name
             scene["materials"] += 1
+    # Before the append, not after: apply_sequences refuses outright when the armature's
+    # stash and the file disagree on how many sequences there are.
     scene["sequences"] = apply_sequences(d, arm_obj, [r.name for r in d.anims])
+
+    added = []
+    for action, poses, movements, nframes in pending:
+        rate = float(fps or action.get("vtmb_fps") or context.scene.render.fps)
+        i = build_mod.add_animation(d, action.name, poses, rate,
+                                    int(action.get("vtmb_flags") or 0), movements)
+        build_mod.add_sequence(d, action.name, i, action.get("vtmb_activity"),
+                               int(action.get("vtmb_seq_flags") or 0))
+        added.append((i, action.name, nframes, len(movements)))
 
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0}
@@ -619,8 +676,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     data = build_mod.emit(d, checksum=d.checksum)
     with open(dest, "wb") as f:
         f.write(data)
-    return {"wrote": wrote, "bones": len(m.bones), "mesh": mesh, "scene": scene,
-            "bytes": len(data), "was": len(m.d), "anims": len(m.anims)}
+    return {"wrote": wrote, "added": added, "bones": len(m.bones), "mesh": mesh,
+            "scene": scene, "bytes": len(data), "was": len(m.d), "anims": len(m.anims)}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

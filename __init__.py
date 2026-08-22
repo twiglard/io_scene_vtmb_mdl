@@ -151,8 +151,8 @@ def _matches(op, context):
     (animation, action, kept) triples it would leave out."""
     path = _base_path(op, context)
     anims = _base_anims(path)
-    hits, unwritten = blender_export.match_indices([n for n, _ in anims], path,
-                                                   context.active_object)
+    hits, unwritten, _add = blender_export.match_indices([n for n, _ in anims], path,
+                                                         context.active_object)
     return [(anims[i][0], a.name) for i, a in sorted(hits.items())], unwritten
 
 
@@ -323,6 +323,16 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         name="Replace", items=_target_items,
         description="Which of that file's animations get poses from Blender. The rest of "
                     "the file changes only where Mesh below says so")
+    add_new: bpy.props.BoolProperty(
+        name="Add the rest as new", default=False,
+        description="Append every action that matches no animation of the file, "
+                    "instead of listing it under Not written and dropping it. Each "
+                    "gets a sequence of the same name, because the engine reaches an "
+                    "animation only through one. Nothing is renumbered -- the "
+                    "appended animation goes on the end and every index already "
+                    "stored points below it -- and the animations already in the file "
+                    "keep their poses, since one posscale/rotscale set serves the "
+                    "whole file and they are re-encoded when a new pose widens it")
     keep_travel: bpy.props.BoolProperty(
         name="Was applied", default=True,
         description="Take the travel back out of the keys before writing. Tick this "
@@ -413,6 +423,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             row = box.split(factor=SPLIT)
             row.label(text="Replace")
             row.prop(self, "target", text="")
+            row = box.split(factor=SPLIT)
+            row.label(text="Unmatched")
+            row.prop(self, "add_new", text="Add the rest as new")
             if self.target == ALL:
                 hits, unwritten = _matches(self, context)
                 _pair(box, "matched", "%d of %d" % (len(hits), len(_base_anims(base))),
@@ -422,13 +435,21 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                              else "%s ← %s" % (name, act_name)))
                 if len(hits) > 4:
                     box.label(text="    and %d more" % (len(hits) - 4))
-                if unwritten:
+                adds, rest = blender_export.split_unwritten(unwritten, self.add_new)
+                if adds:
+                    _pair(box, "added", "%d animation%s" % (
+                        len(adds), "" if len(adds) == 1 else "s"), icon="ADD")
+                    for u in adds[:3]:
+                        box.label(text="    %s → new animation and sequence" % u[1])
+                    if len(adds) > 3:
+                        box.label(text="    and %d more" % (len(adds) - 3))
+                if rest:
                     _pair(box, "not written", "%d action%s" % (
-                        len(unwritten), "" if len(unwritten) == 1 else "s"), icon="ERROR")
-                    for u in unwritten[:3]:
+                        len(rest), "" if len(rest) == 1 else "s"), icon="ERROR")
+                    for u in rest[:3]:
                         box.label(text="    " + blender_export.unwritten_line(*u))
-                    if len(unwritten) > 3:
-                        box.label(text="    and %d more" % (len(unwritten) - 3))
+                    if len(rest) > 3:
+                        box.label(text="    and %d more" % (len(rest) - 3))
             elif self.target != NONE:
                 auto = _auto_name(self, context)
                 if self.target == ACTIVE and not auto:
@@ -488,24 +509,28 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         frame = context.scene.frame_current
         try:
             m = mdl.Mdl(src)
+            matched, unwritten, addable = blender_export.match_actions(m, src, obj)
+            adds = list(addable) if self.add_new else []
             if self.target == NONE:
                 actions = {}
             elif self.target == ALL:
-                actions, unwritten = blender_export.match_actions(m, src, obj)
-                if not actions:
+                actions = matched
+                if not actions and not adds:
                     raise ValueError("no action shares a name with an animation of %s"
                                      % os.path.basename(src))
-                if unwritten:
+                _taken, rest = blender_export.split_unwritten(unwritten, self.add_new)
+                if rest:
                     self.report({"WARNING"},
-                                blender_export.describe_unwritten(unwritten))
+                                blender_export.describe_unwritten(rest))
             else:
                 act = obj.animation_data.action
                 actions = {blender_export.resolve_target(
                     m, act, "" if self.target == ACTIVE else self.target): act}
+                adds = [a for a in adds if a is not act]
             r = blender_export.export_actions(
                 context, obj, src, self.filepath, actions,
                 keep_travel=self.keep_travel, travel=self.travel,
-                mesh_fields=_mesh_fields(self),
+                mesh_fields=_mesh_fields(self), add=adds,
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
         except Exception as exc:
@@ -532,8 +557,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "Export them together to re-encode."
                         % (r["scene"]["bones"], "" if r["scene"]["bones"] == 1 else "s",
                            r["scene"]["stale"], "" if r["scene"]["stale"] == 1 else "s"))
+        # The stamp is what makes the next export replace this animation rather than
+        # append it a second time. `vtmb_source` is left alone when the action already
+        # has one: the name match comes first anyway, and repointing it would move the
+        # donor out from under an action exported to a scratch path.
+        for i, name, _nf, _mv in r["added"]:
+            act = bpy.data.actions.get(name)
+            if act is None:
+                continue
+            act["vtmb_anim_index"] = i
+            if not act.get("vtmb_source"):
+                act["vtmb_source"] = self.filepath
         what = ", ".join("%s from %r (%d frames)" % (n, a, f)
                          for _, n, a, f, _ in r["wrote"]) or "nothing"
+        if r["added"]:
+            what += "; added %s" % ", ".join("%s (%d frames)" % (n, f)
+                                             for _i, n, f, _mv in r["added"])
         extra = ("; %s of %d vertices over %d meshes"
                  % ("+".join(mesh["fields"]), mesh["verts"], mesh["models"])
                  if mesh["verts"] else "")

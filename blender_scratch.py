@@ -179,6 +179,23 @@ def original_runs(obj, me):
     return runs
 
 
+def wound(corners, recs):
+    """`corners` in the order the format wants: winding against the normals being written.
+
+    Not a fixed flip of Blender's order. An imported mesh already carries the file's winding
+    against the normals the import stashed, and reversing that would break the round trip;
+    a mesh built in Blender carries the opposite. The pair being emitted decides.
+    """
+    p = [r[0] for r in recs]
+    u = [p[1][k] - p[0][k] for k in range(3)]
+    w = [p[2][k] - p[0][k] for k in range(3)]
+    gn = (u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0])
+    n = [sum(r[1][k] for r in recs) for k in range(3)]
+    if sum(gn[k] * n[k] for k in range(3)) > 0:
+        return tuple(reversed(corners))
+    return tuple(corners)
+
+
 def split_mesh(obj, bone_index, scale=1.0):
     """([(material slot, verts, faces), ...], unskinned, kept) per distinct corner.
 
@@ -233,7 +250,7 @@ def split_mesh(obj, bone_index, scale=1.0):
                 at = seen[key] = len(verts)
                 verts.append(rec(vi, n, u, w))
             corners.append(at)
-        faces.append(tuple(corners))
+        faces.append(wound(corners, [verts[at] for at in corners]))
     return ([(k, per_slot[k][0], per_slot[k][1]) for k in sorted(per_slot)],
             unskinned, 0)
 
@@ -290,7 +307,8 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
             corners.append((ri, at))
         if corners[0][0] != corners[1][0] or corners[1][0] != corners[2][0]:
             return None
-        out[corners[0][0]][1].append(tuple(c[1] for c in corners))
+        out[corners[0][0]][1].append(
+            wound([c[1] for c in corners], [out[c[0]][0][c[1]] for c in corners]))
     return [(runs[ri][0], out[ri][0], out[ri][1])
             for ri in range(len(runs))], kept, added
 
@@ -444,7 +462,8 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
         a = build_mod.add_animation(d, act.name, poses, fps, flags, movements)
-        build_mod.add_sequence(d, act.name, a, act.get("vtmb_activity", activity))
+        build_mod.add_sequence(d, act.name, a, act.get("vtmb_activity", activity),
+                               int(act.get("vtmb_seq_flags", 0)))
     return len(actions), moved
 
 

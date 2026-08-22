@@ -437,8 +437,8 @@ def verify(src, out, same_checksum=True):
         n = sum(1 for x, y in zip(sa, sg) if x != y) + abs(len(sa) - len(sg))
         bad.append("%d of %d strings resolve differently" % (n, max(len(sa), len(sg))))
     cmp("bones", [_bone(x) for x in a.bones], [_bone(x) for x in g.bones])
-    cmp("sequences", [(s.label, s.activity, s.groupsize, s.blends) for s in a.seqs],
-                     [(s.label, s.activity, s.groupsize, s.blends) for s in g.seqs])
+    cmp("sequences", [(s.label, s.activity, s.flags, s.groupsize, s.blends) for s in a.seqs],
+                     [(s.label, s.activity, s.flags, s.groupsize, s.blends) for s in g.seqs])
     cmp("animdescs", [(x.name, x.fps, x.flags, x.numframes) for x in a.anims],
                      [(x.name, x.fps, x.flags, x.numframes) for x in g.anims])
     cmp("movements",

@@ -554,6 +554,23 @@ def _rest_local_inv(m, arm_obj):
     return out
 
 
+def _seq_flags(src, _cache={}):
+    """animation index -> the flags of the first sequence citing it.
+
+    The scratch exporter writes one sequence per action, so first-citer is the pairing
+    a re-export reproduces. An animation no sequence names keeps 0.
+    """
+    got = _cache.get(src.path)
+    if got is None:
+        got = {}
+        for s in src.seqs:
+            for row in s.blends:
+                for i in row:
+                    got.setdefault(i, s.flags)
+        _cache[src.path] = got
+    return got
+
+
 def build_actions(m, arm_obj, wanted, scale, root_motion=True):
     """wanted is (source model, animation); source is m for the file's own animations
     and a chained include for the rest, which decode against their own bones."""
@@ -615,6 +632,7 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
                     c += 1
         action["vtmb_fps"] = a.fps
         action["vtmb_flags"] = a.flags
+        action["vtmb_seq_flags"] = _seq_flags(src).get(a.index, 0)
         action["vtmb_numframes"] = a.numframes
         action["vtmb_source"] = src.path
         action["vtmb_anim_index"] = a.index

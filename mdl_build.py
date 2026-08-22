@@ -1305,8 +1305,9 @@ def stamp_sequence_boxes(d):
     return n
 
 
-def add_sequence(d, label, anim, activity=None):
+def add_sequence(d, label, anim, activity=None, flags=0):
     raw = bytearray(764)
+    struct.pack_into("<i", raw, 0x008, int(flags))
     struct.pack_into("<i", raw, 0x00c, -1)
     struct.pack_into("<i", raw, 0x010, 1)
     struct.pack_into("<i", raw, 0x034, 1)
