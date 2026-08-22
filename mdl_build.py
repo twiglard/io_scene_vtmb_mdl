@@ -227,8 +227,8 @@ def from_bytes(b):
         d.bones.append(r)
 
     for k in range(i(248)):
-        s = i(252) + k * BONECONTROLLER_STRIDE
-        d.bonecontrollers.append(Rec(b[s:s + BONECONTROLLER_STRIDE]))
+        at = i(252) + k * BONECONTROLLER_STRIDE
+        d.bonecontrollers.append(Rec(b[at:at + BONECONTROLLER_STRIDE]))
 
     for k in range(i(256)):
         o = i(260) + k * 12
@@ -877,16 +877,50 @@ def _skeleton(d):
     return _Bones(bones)
 
 
+def _extract(buf, off, frame):
+    """One int16 out of an RLE channel inside a standalone block, as Mdl.extract reads
+    one out of a whole file."""
+    k = frame
+    while buf[off + 1] <= k:
+        k -= buf[off + 1]
+        off += (buf[off] + 1) * 2
+    valid = buf[off]
+    return struct.unpack_from("<h", buf, off + (k + 1 if valid > k else valid) * 2)[0]
+
+
+def _block_tracks(m, r):
+    """A carried animation's channels, decoded off its own block bytes the way
+    mdl_write.read_tracks decodes them off a file."""
+    blk = r.extra["block"]
+    t = W.Tracks()
+    t.name = r.name
+    t.fps, t.flags, t.numframes = struct.unpack_from("<fii", r.raw, 0x04)
+    for b in m.bones:
+        o = b.index * 32
+        t.weights[b.index] = struct.unpack_from("<f", blk, o)[0]
+        offs = struct.unpack_from("<7i", blk, o + 4)
+        for c in range(7):
+            if offs[c]:
+                t.chan[(b.index, c)] = [_extract(blk, o + offs[c], f)
+                                        for f in range(t.numframes)]
+    return t
+
+
 def quantise(d):
     """Fit every bone's scales to the widest authored pose, then encode.
 
     One scale per bone serves every animation in the file, so a per-animation fit would
-    silently requantise the others -- which is why the poses are held until here.
+    silently requantise the others -- which is why the poses are held until here, and why
+    the blocks `from_bytes` carried over verbatim are requantised below whenever the fit
+    widened a scale: their int16s were encoded against the donor's scales, and decoding
+    them against the widened ones scales every carried value by the same ratio the scale
+    grew. `mdl_write.write_many` does the identical rescale for a donor's animations.
     """
     pending = [r for r in d.anims if r.extra.get("poses")]
     if not pending:
         return 0
     m = _skeleton(d)
+    old = W.file_scales(m)
     filled = []
     for r in pending:
         out = []
@@ -900,6 +934,16 @@ def quantise(d):
         struct.pack_into("<4f", br.raw, 0x48, *scales[k][3:])
         m.bones[k].posscale = scales[k][:3]
         m.bones[k].rotscale = scales[k][3:]
+    if scales != old:
+        held = set(id(r) for r in pending)
+        for r in d.anims:
+            if id(r) in held or not r.extra.get("block"):
+                continue
+            t = _block_tracks(m, r)
+            before = dict(t.chan)
+            W.rescale(t, old, scales)
+            if t.chan != before:
+                r.extra["block"] = W._anim_block(m, t)
     for r, poses in zip(pending, filled):
         t = W.Tracks()
         t.name, t.numframes = r.name, len(poses)

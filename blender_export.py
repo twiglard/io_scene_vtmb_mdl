@@ -311,7 +311,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise ValueError("%s has no animation data" % arm_obj.name)
     restore = ad.action if ad else None
 
-    edits, wrote = {}, []
+    edits, wrote, yaw_lost = {}, [], []
     try:
         for index, action in sorted(actions.items()):
             if ad.action is not action:
@@ -332,6 +332,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             movements = None
             if travel == "extract":
                 movements, poses = write_mod.extract_travel(m, poses)
+                # 21 shipped blocks author a yaw (three monsters' turn animations), and
+                # fit_movements never writes one, so replacing those blocks straightens
+                # the turn. The user asked for a refit, so it proceeds -- named.
+                if any(mv.angle for mv in anim.movements):
+                    yaw_lost.append(anim.name)
             elif travel == "none":
                 movements = []
             edits[index] = {"poses": poses, "movements": movements,
@@ -372,7 +377,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "bones": len(m.bones), "mesh": mesh, "rebuild": built,
-            "bytes": len(data), "was": len(m.d), "anims": len(m.anims)}
+            "bytes": len(data), "was": len(m.d), "anims": len(m.anims),
+            "yaw_lost": yaw_lost}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

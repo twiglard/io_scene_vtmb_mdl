@@ -369,9 +369,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     write_weights: bpy.props.BoolProperty(
         name="Weights", default=False,
         description="Write which bones move each vertex and how much, from the vertex "
-                    "groups named after the bones. Three bones per vertex at most, each "
-                    "weight kept to 1/255, and the largest three win when Blender has "
-                    "more")
+                    "groups named after the bones. Four bones per vertex at most, and "
+                    "the largest four win when Blender has more. Three weights are "
+                    "stored at 1/255 each; the fourth is whatever they leave short of "
+                    "255, which is how the engine reads it")
 
     @classmethod
     def poll(cls, context):
@@ -534,6 +535,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if mesh["unsupported"]:
             self.report({"WARNING"}, "%s cannot be stored by every model of this file and "
                                      "was skipped there" % ", ".join(mesh["unsupported"]))
+        if r.get("yaw_lost"):
+            self.report({"WARNING"}, "the refitted travel carries no turn: the replaced "
+                                     "blocks of %s authored a yaw the root path cannot "
+                                     "express" % ", ".join(r["yaw_lost"][:4]))
         if r.get("rebuild"):
             rb = r["rebuild"]
             self.report({"INFO"}, "rebuilt: %d blocks, %d B unreferenced dropped, "

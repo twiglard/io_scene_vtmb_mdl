@@ -395,8 +395,11 @@ class Mdl:
                 uv = struct.unpack_from("<2H", d, o + 8) if model.filetype == 1 \
                     else struct.unpack_from("<2H", d, o + 4)
                 v.uv = (uv[0] / 65535.0, uv[1] / 65535.0)
-                v.bones, v.weights = [0] * 4, [1.0, 0.0, 0.0, 0.0]
-                v.numbones = 1
+                # The record carries no bone and no weight field, so it binds nothing.
+                # numbones 0 is what keeps a .vtx rebuilt for a packed model rigid --
+                # vtx_rebuild reads it, and a fabricated 1 skinned every vertex to bone 0.
+                v.bones, v.weights = [0] * 4, [0.0, 0.0, 0.0, 0.0]
+                v.numbones = 0
             out.append(v)
         return out
 
