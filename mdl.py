@@ -357,8 +357,12 @@ class Mdl:
             self.includes.append(
                 self._cstr(off + struct.unpack_from("<i", d, off)[0]))
 
-    def vertices(self, model):
-        """Decoded vertices for one model, in model.vertexbase order."""
+    def vertices(self, model, anorms=None):
+        """Decoded vertices for one model, in model.vertexbase order.
+
+        `anorms` is an anorms.Anorms when the caller located StudioRender.dll; without
+        it a packed model's normals stay the (0, 0, 1) placeholder, since the tables
+        they index live in that DLL and nowhere in the .mdl."""
         d, out = self.d, []
         stride = VERTEX_STRIDE.get(model.filetype)
         if stride is None:
@@ -391,7 +395,15 @@ class Mdl:
                 v.pos = tuple(model.quant_offset[c] + q[c] * QUANT_NORM[model.filetype]
                               * model.quant_scale[c]
                               for c in range(3))
-                v.normal = (0.0, 0.0, 1.0)
+                # The stored normal is a reference into StudioRender.dll's own tables:
+                # the u16 at +6 (filetype 1, a byte offset) or the byte at +3
+                # (filetype 2, an index) -- anorms.py has the disassembly.
+                if anorms is None:
+                    v.normal = (0.0, 0.0, 1.0)
+                elif model.filetype == 1:
+                    v.normal = anorms.normal(1, struct.unpack_from("<H", d, o + 6)[0])
+                else:
+                    v.normal = anorms.normal(2, d[o + 3])
                 uv = struct.unpack_from("<2H", d, o + 8) if model.filetype == 1 \
                     else struct.unpack_from("<2H", d, o + 4)
                 v.uv = (uv[0] / 65535.0, uv[1] / 65535.0)

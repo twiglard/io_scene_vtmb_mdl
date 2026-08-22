@@ -13,6 +13,7 @@ import zlib
 import bpy
 import mathutils
 
+from . import anorms as anorms_mod
 from . import mdl as mdl_mod
 from . import paths as paths_mod
 from . import tth as tth_mod
@@ -357,6 +358,18 @@ def _material(m, index, content):
     return mat
 
 
+def _anorms(roots):
+    """(tables or None, why-not). A packed model's normals live in StudioRender.dll,
+    so the tables come from the user's own install or not at all."""
+    path = anorms_mod.find(roots)
+    if path is None:
+        return None, "no Bin/%s beside any content root" % anorms_mod.IMAGE
+    try:
+        return anorms_mod.Anorms(path), None
+    except (OSError, ValueError, struct.error) as exc:
+        return None, str(exc)
+
+
 def build_meshes(context, m, arm_obj, name, scale, content):
     path, blob = content.companion(m, vtx_mod.SUFFIXES)
     if path is None:
@@ -365,6 +378,10 @@ def build_meshes(context, m, arm_obj, name, scale, content):
     if v.checksum != m.checksum:
         return [], ("checksum mismatch: .vtx %#x vs .mdl %#x -- they are not a pair"
                     % (v.checksum & 0xffffffff, m.checksum & 0xffffffff))
+    tables = why = None
+    if any(mo.filetype != 0 and mo.numvertices
+           for bp in m.bodyparts for mo in bp.models):
+        tables, why = _anorms(content.roots)
 
     models = [(bp, mo) for bp in m.bodyparts for mo in bp.models]
     faces_by_model = {}
@@ -386,7 +403,7 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         faces = faces_by_model.get(gi)
         if not faces:
             continue
-        verts = m.vertices(model)
+        verts = m.vertices(model, tables)
         me = bpy.data.meshes.new("%s_%s" % (name, model.name.rsplit(".", 1)[0]))
         me.from_pydata([[c * scale for c in v_.pos] for v_ in verts], [],
                        [list(f[0]) for f in faces])
@@ -405,7 +422,10 @@ def build_meshes(context, m, arm_obj, name, scale, content):
             u, w = verts[loop.vertex_index].uv
             uv.data[loop.index].uv = (u, 1.0 - w)
 
-        if model.filetype == 0:
+        if model.filetype == 0 or tables is not None:
+            # A packed model's decoded normals are the authored ones off StudioRender's
+            # tables; without the DLL there is nothing to set and Blender's recomputed
+            # normals stand, which loses the authored hard edges.
             me.normals_split_custom_set_from_vertices(
                 [v_.normal for v_ in verts])
             # Custom split normals are stored as two 16-bit angles and come back off by
@@ -413,6 +433,7 @@ def build_meshes(context, m, arm_obj, name, scale, content):
             att = me.attributes.new("vtmb_normal", "FLOAT_VECTOR", "POINT")
             att.data.foreach_set("vector",
                                  [c for v_ in verts for c in v_.normal])
+        if model.filetype == 0:
             # Slot order is neither by weight nor by bone -- it is whatever studiomdl read
             # out of the SMD -- so vertex groups alone cannot reproduce it.
             att = me.attributes.new("vtmb_skin", "FLOAT_COLOR", "POINT")
@@ -443,7 +464,11 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         obj.parent = arm_obj
         obj.modifiers.new(name="Armature", type="ARMATURE").object = arm_obj
         objs.append(obj)
-    return objs, None
+    note = None
+    if why is not None:
+        note = ("authored normals unavailable for the packed meshes -- %s -- so "
+                "Blender recomputed them, which loses authored hard edges" % why)
+    return objs, note
 
 
 def _bind_slot(arm_obj, action):
