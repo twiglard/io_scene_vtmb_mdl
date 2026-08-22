@@ -655,6 +655,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "%d vertices of a rebuilt mesh are in no vertex "
                                      "group and were bound to bone 0"
                         % mesh["unskinned"])
+        if mesh["crowded"]:
+            total = sum(k for _n, k in mesh["crowded"])
+            self.report({"WARNING"}, "%d vertex%s carr%s a fifth vertex group, which no "
+                                     "record can hold: %s. The four heaviest are written "
+                                     "and the fourth bone takes what the rest held"
+                        % (total, "" if total == 1 else "es",
+                           "ies" if total == 1 else "y",
+                           ", ".join("%s x%d" % (n, k) for n, k in mesh["crowded"][:3])
+                           + ("" if len(mesh["crowded"]) <= 3
+                              else " and %d more mesh%s" % (len(mesh["crowded"]) - 3,
+                                   "" if len(mesh["crowded"]) == 4 else "es"))))
         if mesh["renumbered"]:
             self.report({"WARNING"}, "%d rebuilt mesh%s could not keep the file's "
                                      "own vertex numbering, so nothing it keyed by "
@@ -989,6 +1000,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
                                      "bone 0, which drags them wherever it goes"
                         % r["unskinned"])
+        if r["crowded"]:
+            total = sum(k for _n, k in r["crowded"])
+            self.report({"WARNING"}, "%d vertex%s carr%s a fifth vertex group, which no "
+                                     "record can hold: %s. The four heaviest are written "
+                                     "and the fourth bone takes what the rest held"
+                        % (total, "" if total == 1 else "es",
+                           "ies" if total == 1 else "y",
+                           ", ".join("%s x%d" % (n, k) for n, k in r["crowded"][:3])
+                           + ("" if len(r["crowded"]) <= 3
+                              else " and %d more mesh%s" % (len(r["crowded"]) - 3,
+                                   "" if len(r["crowded"]) == 4 else "es"))))
         if r["dropped"]:
             self.report({"WARNING"}, "dropped %s"
                         % ", ".join("%s x%d" % (k, v)

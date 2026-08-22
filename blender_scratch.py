@@ -337,10 +337,14 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     """
     slot_of = {}
     total_unskinned = total_kept = 0
+    crowded = []
     for obj in mesh_objs:
         runs, unskinned, kept, _why = split_mesh(obj, bone_index, scale)
         total_unskinned += unskinned
         total_kept += kept
+        over = export_mod.crowded_vertices(obj, bone_index)
+        if over:
+            crowded.append((obj.name, over))
         mats = obj.data.materials
         meshes = []
         for slot, verts, faces in runs:
@@ -352,7 +356,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
             build_mod.add_model(d, meshes,
                                 bodypart=obj.get("vtmb_bodypart") or obj.name,
                                 model=obj.get("vtmb_model") or obj.name + ".smd")
-    return list(d.faces), total_unskinned, total_kept
+    return list(d.faces), total_unskinned, total_kept, crowded
 
 
 _ARM = ("upperarm", "forearm", "hand", "finger", "thumb")
@@ -516,12 +520,12 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
-    faces, unskinned, kept = add_meshes(d, mesh_objs, bone_index, scale)
+    faces, unskinned, kept, crowded = add_meshes(d, mesh_objs, bone_index, scale)
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
     _n, moved = add_actions(context, arm_obj, d, actions, scale, use_range, activity,
                             travel)
-    return d, faces, unskinned, kept, moved
+    return d, faces, unskinned, kept, moved, crowded
 
 
 def _set_hull(d, lo, hi):
@@ -576,8 +580,8 @@ def write(d, faces, path, checksum):
 
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
-    d, faces, unskinned, kept, moved = build(context, arm_obj, mesh_objs, actions,
-                                             embedded_name(path), **kw)
+    d, faces, unskinned, kept, moved, crowded = build(
+        context, arm_obj, mesh_objs, actions, embedded_name(path), **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "travelling": moved,
@@ -588,5 +592,5 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "faces": st["tris_out"], "verts": st["verts_out"],
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16
                                for bp in d.bodyparts for x in bp.kids),
-            "kept": kept,
+            "kept": kept, "crowded": crowded,
             "unskinned": unskinned, "dropped": dict(d.dropped)}

@@ -39,9 +39,29 @@ def supported(filetype, fields):
     return tuple(f for f in fields if f in ok), tuple(f for f in fields if f not in ok)
 
 
+# A weight below this quantises to a zero byte, so losing it costs the vertex nothing.
+WEIGHT_FLOOR = 1.0 / 255.0
+
+
+def dropped_weights(weights):
+    """How many bindings past the fourth would quantise above zero.
+
+    A record carries four bones and no more, so a fifth group is discarded wherever it
+    appears. Callers that gather bindings themselves ask this before truncating -- by the
+    time a `Vertex` reaches `u8_weights` there are already only four, and nothing here can
+    tell a vertex that had exactly four from one that had six.
+    """
+    return sum(1 for w in sorted(weights, reverse=True)[4:] if w > WEIGHT_FLOOR)
+
+
 def u8_weights(weights):
     """The first three of four weights as bytes; the fourth is the shortfall from 255 and
-    is never stored, so the three are left short exactly when there is a fourth bone."""
+    is never stored, so the three are left short exactly when there is a fourth bone.
+
+    A fifth weight is gone before this sees it, and what it held lands on the fourth bone:
+    the three bytes are written from the kept weights and the engine derives the fourth as
+    whatever they leave short of 255. `dropped_weights` is what counts the loss.
+    """
     w = (list(weights) + [0.0] * 4)[:4]
     total = sum(w)
     if total > 1.0 + 1e-6:

@@ -273,6 +273,24 @@ def _one_skin(v, groups, bone_index, stash):
     return w, b, n
 
 
+def crowded_vertices(obj, bone_index):
+    """Vertices carrying a fifth bone group, which no record can hold.
+
+    Counted off the object and not off what `_one_skin` returns, which has already taken
+    the four heaviest. A group naming no bone is not a binding and does not count -- that
+    is a group which never skinned, not skinning the format lost. What the fifth held is
+    not simply gone: the three stored bytes come from the kept weights and the engine
+    derives the fourth as their shortfall, so the fourth bone absorbs it.
+    """
+    groups = obj.vertex_groups
+    n = 0
+    for v in obj.data.vertices:
+        ws = [g.weight for g in v.groups if groups[g.group].name in bone_index]
+        if len(ws) > 4 and mesh_mod.dropped_weights(ws):
+            n += 1
+    return n
+
+
 def read_mesh(obj, model, bone_index, fields):
     """One `mdl.Vertex` per file vertex, in file order, inverting what the importer did.
 
@@ -364,10 +382,12 @@ def rebuild_cell(d, obj, bi, mi, bone_index):
 
 def read_meshes(m, source, fields):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
-    models it does not and the fields the file cannot carry."""
+    models it does not, the fields the file cannot carry, and the objects holding a vertex
+    whose fifth bone group no record can hold."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
     edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
+    crowded = []
     for bi, mi, _bp, mo in mesh_mod.models_of(m):
         ok, no = mesh_mod.supported(mo.filetype, fields)
         obj = found.get((bi, mi))
@@ -375,6 +395,9 @@ def read_meshes(m, source, fields):
             missing.append(mo.name)
             unsupported |= set(no)
             continue
+        over = crowded_vertices(obj, bone_index)
+        if over:
+            crowded.append((obj.name, over))
         if _must_rebuild(obj, mo, ok):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.
@@ -384,7 +407,7 @@ def read_meshes(m, source, fields):
         if ok:
             edits[(bi, mi)], n = read_mesh(obj, mo, bone_index, ok)
             renormals += n
-    return edits, rebuild, missing, sorted(unsupported), renormals
+    return edits, rebuild, missing, sorted(unsupported), renormals, crowded
 
 
 def named_index(anim_names, action):
@@ -788,11 +811,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
-            "unskinned": 0, "renumbered": 0}
+            "unskinned": 0, "renumbered": 0, "crowded": []}
     revised = {}
     if mesh_fields:
-        cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"] = \
-            read_meshes(m, source, mesh_fields)
+        cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
+            mesh["crowded"] = read_meshes(m, source, mesh_fields)
         if not cells and not rebuild and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
         for (bi, mi), verts in sorted(cells.items()):
