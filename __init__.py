@@ -361,22 +361,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "longer action")
     write_positions: bpy.props.BoolProperty(
         name="Positions", default=False,
-        description="Write each vertex's location. Moving vertices is allowed; adding or "
-                    "removing them is not, because the triangle lists live in the .vtx "
-                    "files and every section below the mesh would have to move")
+        description="Write each vertex's location. Adding and removing vertices is "
+                    "allowed: a mesh whose count moved is rebuilt whole and its "
+                    ".dx80.vtx rewritten beside it")
     write_normals: bpy.props.BoolProperty(
         name="Normals", default=False,
         description="Write each vertex's normal, which is what the file shades with. "
-                    "Every face meeting at a vertex must agree on it, since the format "
-                    "stores one normal per vertex and spells a hard edge by duplicating "
-                    "the vertex")
+                    "The format stores one per vertex and spells a hard edge by "
+                    "duplicating the vertex, which the rebuild does for you")
     write_uvs: bpy.props.BoolProperty(
         name="UVs", default=False,
-        description="Write the texture coordinates without touching the geometry they "
-                    "sit on. Every face meeting at a vertex must agree on the "
-                    "coordinate: the file stores one UV per vertex and spells a seam by "
-                    "duplicating the vertex, so a seam newly cut in Blender has nowhere "
-                    "to go")
+        description="Write the texture coordinates. The file stores one UV per vertex "
+                    "and spells a seam by duplicating the vertex, so a seam cut in "
+                    "Blender rebuilds the mesh rather than being refused")
     write_weights: bpy.props.BoolProperty(
         name="Weights", default=False,
         description="Write which bones move each vertex and how much, from the vertex "
@@ -559,6 +556,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if mesh["unsupported"]:
             self.report({"WARNING"}, "%s cannot be stored by every model of this file and "
                                      "was skipped there" % ", ".join(mesh["unsupported"]))
+        for name, was, now in mesh["rebuilt"]:
+            self.report({"INFO"}, "%s was rebuilt: %d vertices -> %d, and the "
+                                  ".dx80.vtx rewritten with it" % (name, was, now))
+        if mesh["unskinned"]:
+            self.report({"WARNING"}, "%d vertices of a rebuilt mesh are in no vertex "
+                                     "group and were bound to bone 0"
+                        % mesh["unskinned"])
+        if mesh["renumbered"]:
+            self.report({"WARNING"}, "%d rebuilt mesh%s could not keep the file's "
+                                     "own vertex numbering, so nothing it keyed by "
+                                     "vertex survives"
+                        % (mesh["renumbered"],
+                           "" if mesh["renumbered"] == 1 else "es"))
+        for name in r["stale"]:
+            self.report({"WARNING"}, "%s beside the model still describes the old "
+                                     "geometry; only .dx80.vtx is written" % name)
         if r["scene"]["bones"] and r["scene"]["stale"]:
             self.report({"WARNING"}, "%d bone%s moved; the %d animation%s you did not export "
                                      "still key the old skeleton and may not follow it. "

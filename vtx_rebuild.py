@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Re-emit a .vtx from its own geometry, taking bone bindings from the paired .mdl. No bpy.
 
-This is the path an exporter takes when a vertex or face count changes: it discards the
-donor's strips and vertex records and builds new ones, so it exercises everything
-`vtx_write` decides -- the strip partition, the hardware bone slots and the bone state
-changes that name them. `vtx_write` alone only relays out what it parsed.
+`rebuild` discards the donor's strips and vertex records and builds new ones, so it
+exercises everything `vtx_write` decides -- the strip partition, the hardware bone slots and
+the bone state changes that name them, where `vtx_write` alone only relays out what it
+parsed. That makes it the corpus comparison; it is not what an exporter calls.
+
+`revise` is, and does the opposite: it keeps every strip group the edit did not touch, byte
+for byte as the compiler emitted it, and re-emits only the cells named. LOD 0 only, and a
+named mesh must be a single strip group, because which group a new triangle belongs to is
+studiomdl's decision and is recorded nowhere.
+
+`seed` and `scratch` write a .vtx for a model that never had one.
 """
 
 import os
@@ -85,6 +92,95 @@ def rebuild(mdl_path, vtx_path, keep=None):
                         vb = vertex_bones(src_mesh, orig_ids, verts) \
                             if grp.flags & W.SG_VERTS_ARE_BONED else None
                         W.rebuild_group(grp, orig_ids, tris, vb,
+                                        max_bones=v.maxbones_strip,
+                                        max_per_vert=v.maxbones_vert)
+                        st["tris_out"] += len(grp.indices) // 3
+                        st["verts_out"] += grp.numverts
+                        st["strips"] += len(grp.strips)
+                        st["groups"] += 1
+    return v.to_bytes(), st
+
+
+def _canon(tri):
+    """One triangle as a rotation starting at its lowest corner, so two spellings of the
+    same face compare equal while a reversed winding still does not."""
+    t = tuple(tri)
+    i = t.index(min(t))
+    return t[i:] + t[:i]
+
+
+def _same_faces(a, b):
+    return sorted(_canon(t) for t in a) == sorted(_canon(t) for t in b)
+
+
+def revise(mdl, vtx_path, faces):
+    """One .vtx re-emitted with new triangles for the cells named and the rest untouched.
+
+    `mdl` is the model as it will be written, since a changed mesh's bone bindings come out
+    of it; `faces` is {(bodypart, model, mesh): [(a, b, c), ...]} into that mesh's own
+    vertices. A cell not named keeps the donor's own triangles, which `rebuild` reproduces
+    byte for byte, so editing one mesh leaves every other alone.
+
+    Only LOD 0 is revised; the lower LODs keep their own triangles, which stay valid
+    because an addition never moves an original vertex id.
+
+    A mesh split over several strip groups can only be re-emitted if its faces did not
+    actually move: the groups partition it by whether a vertex is reached by a morph target
+    and whether the strip fits the hardware bone palette, and which side a *new* triangle
+    falls is studiomdl's decision and is recorded nowhere.
+
+    The .mdl's checksum is written through unchanged: the pair only has to agree with each
+    other, and both files are written together.
+    """
+    reader = R.Vtx(vtx_path)
+    v = W.VtxFile(vtx_path)
+    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0)
+    ri = 0
+    for i, bp in enumerate(v.bodyparts):
+        for j, model in enumerate(bp.models):
+            src_model = mdl.bodyparts[i].models[j]
+            verts = mdl.vertices(src_model)
+            for li, lod in enumerate(model.lods):
+                for k, mesh in enumerate(lod.meshes):
+                    src_mesh = src_model.meshes[k]
+                    # LOD 0 only. A lower LOD draws a subset of the same mesh vertices by
+                    # their original ids, so an edit that adds vertices leaves its
+                    # triangles valid, and handing it LOD 0's would replace it with them.
+                    new = faces.get((i, j, k)) if li == 0 else None
+                    donor = []
+                    for n, grp in enumerate(mesh.groups):
+                        sg = reader.groups[ri + n]
+                        ids = grp.orig_vert_ids() if grp.numverts else []
+                        donor.append((sg, ids,
+                                      [tuple(t) for t in reader.triangles(sg)]
+                                      if grp.numverts else []))
+                    if new is not None and len(mesh.groups) != 1:
+                        # The comparison is in mesh-local indices, which is what the caller
+                        # speaks; `rebuild_group` wants the group-local ones kept above.
+                        flat = [tuple(ids[x] for x in t)
+                                for _s, ids, ts in donor for t in ts]
+                        if _same_faces(flat, new):
+                            new = None
+                        else:
+                            raise ValueError(
+                                "bodypart %d model %d mesh %d is split over %d strip "
+                                "groups, and which of them a new triangle belongs to is "
+                                "studiomdl's decision and is recorded nowhere"
+                                % (i, j, k, len(mesh.groups)))
+                    for n, grp in enumerate(mesh.groups):
+                        ri += 1
+                        if new is None:
+                            if not grp.numverts:
+                                continue
+                            orig, tris = donor[n][1], donor[n][2]
+                        else:
+                            st["revised"] += 1
+                            orig = sorted(set(x for t in new for x in t))
+                            local = dict((o, m) for m, o in enumerate(orig))
+                            tris = [tuple(local[x] for x in t) for t in new]
+                        vb = (vertex_bones(src_mesh, orig, verts)
+                              if grp.flags & W.SG_VERTS_ARE_BONED else None)
+                        W.rebuild_group(grp, orig, tris, vb,
                                         max_bones=v.maxbones_strip,
                                         max_per_vert=v.maxbones_vert)
                         st["tris_out"] += len(grp.indices) // 3

@@ -18,7 +18,11 @@ the Unofficial Patch works with no extraction step.
 
 - *File > Export > VTMB Model (.mdl)* rebuilds a `.mdl` from its own decoded records,
   using an existing file as the donor. Animations come from Blender's poses; vertex
-  positions, normals, UVs and weights are optional.
+  positions, normals, UVs and weights are optional. Vertex and face counts may change: a
+  mesh that moved is rebuilt whole and its `.dx80.vtx` rewritten beside the model, while a
+  mesh that did not comes back byte for byte. Only `.dx80.vtx` is written, so a
+  `.dx7_2bone.vtx`, `.dx90.vtx` or `.sw.vtx` beside the model goes stale and is named in a
+  warning — the engine asks for `.dx80.vtx` first and tests only the flavour it loaded.
 - *File > Export > VTMB Model, no donor (.mdl)* authors a `.mdl` **and** its matching
   `.dx80.vtx` from the scene alone, with no donor file at all.
 
@@ -65,21 +69,29 @@ Stated up front, because hitting one should not be how it gets discovered.
 
 **The format cannot express these.**
 
-- One UV per vertex. A seam is spelled by duplicating the vertex, which changes the
-  vertex count.
 - Four bone weights per vertex, maximum. The exporter keeps the heaviest four.
 - No weights on the two quantised vertex layouts — those records carry no bone or weight
-  field at all, so roughly a third of the game's models are rigid by construction.
+  field at all, so roughly a third of the game's models are rigid by construction. An
+  export that changes such a mesh's vertex count rebuilds it as the unquantised layout, so
+  it gains weights rather than losing them.
+- 20 000 vertices per model, the renderer's own ceiling, and 32 767 per mesh, which is the
+  width of the `.vtx` field naming a vertex. Both are refused by name. Nothing shipped
+  comes near either — the heaviest model in the game is 18 000 vertices — but a subdivide
+  reaches them quickly, because a vertex carrying more than one UV or normal is duplicated.
 
 **Not implemented on the donor path.** These are boundaries, not permanent limits.
 
-- Changing the vertex or face count.
+- Editing a mesh the compiler split over several strip groups, if the edit actually moved
+  its faces. Which group a *new* triangle belongs to is studiomdl's decision and is
+  recorded nowhere. 547 of 9705 top-LOD meshes are split that way, 5.64%; the rest edit
+  freely, and a split mesh whose faces did not move is patched like any other.
 - Removing a bone.
 - Authoring new materials or textures. Repointing an existing one is a text edit to the
   `.vmt`; supplying a genuinely new image would need a `.tth` encoder, which does not
   exist here.
 - Skin families past the first, so alternate looks are invisible in Blender.
-- Adding or removing an animation. The dialog replaces; it does not append.
+- Removing an animation. The dialog replaces, and *Add the rest as new* appends; neither
+  drops one.
 
 **What the no-donor path leaves out**, listed verbatim in its own export dialog:
 
@@ -89,9 +101,10 @@ Stated up front, because hitting one should not be how it gets discovered.
 - spring bones, procedural bones, IK chains and bone controllers
 - attachments, sequence events and autolayers
 
-Cloth is the one thing that blocks a rebuild outright: over the 4464 models of a full
-install, 4391 rebuild and verify byte-for-byte and the 73 refusals are cloth carriers in
-every case.
+Nothing blocks a rebuild: over the 4464 models of a full install, all 4464 re-author and
+verify against the donor with none differing. Cloth carriers included — the region moves
+whole, and a cloth-bound mesh whose vertex count changed has its per-vertex arrays regrown
+for the new count.
 
 ## Licence
 

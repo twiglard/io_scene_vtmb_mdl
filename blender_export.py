@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Blender side of the VTMB MDL exporter: actions back into a .mdl's animations.
+"""Blender side of the VTMB MDL exporter: a scene back into an existing .mdl.
 
-Animation is the only thing written. Mesh, UVs, the skeleton's bind pose, materials,
-sequences, hitboxes and everything else keep the bytes of the .mdl being rewritten, so
-what comes out is that model with some of its animations replaced -- never a model built
-from the scene.
+The file is rebuilt from its own decoded records with the scene applied on top: the
+animations named, the skeleton, the material names, the sequence table, and whichever of
+positions, normals, UVs and weights the caller asked for. Everything else keeps the donor's
+bytes, so an unedited model comes back byte for byte.
+
+A mesh whose vertex count moved, or whose UV corners disagree -- a seam, which the format
+spells by duplicating the vertex -- is rebuilt whole and its `.dx80.vtx` rewritten beside
+the model. A mesh that did not move takes the index-for-index patch instead.
 """
 
 import math
@@ -19,6 +23,7 @@ from . import mdl_build as build_mod
 from . import mdl_rebuild as rebuild_mod
 from . import mdl_write as write_mod
 from . import mesh_write as mesh_mod
+from . import vtx_rebuild as vtxr_mod
 
 
 UV_TOL = 1e-6
@@ -186,9 +191,13 @@ def _per_vertex(me, count, get):
 
 
 def _one_uv(me, count, uv_layer):
-    """One UV per vertex, refusing a vertex whose loops disagree: the file stores one UV
-    per vertex and spells a seam by duplicating the vertex, so a seam cut in Blender has
-    nowhere to go without changing the count."""
+    """One UV per vertex, refusing a vertex whose loops disagree.
+
+    The refusal is unreachable: `_must_rebuild` tests the same vertices against the same
+    UV_TOL under the same `"uvs" in fields` gate and routes a disagreement to the split
+    path before this runs. It stands as the precondition of the in-place path rather than
+    as a limit -- the format spells a seam by duplicating the vertex, and the rebuild does.
+    """
     per = _per_vertex(me, count, lambda l: tuple(uv_layer.data[l.index].uv))
     split = [i for i, vs in enumerate(per)
              if any(max(abs(a - b) for a, b in zip(vs[0], v)) > UV_TOL for v in vs)]
@@ -293,23 +302,77 @@ def read_mesh(obj, model, bone_index, fields):
     return out, edited
 
 
+def _must_rebuild(obj, model, fields):
+    """Whether this object has outgrown the in-place path.
+
+    In place patches fields index for index and is byte-identical wherever nothing moved,
+    so it stays the default; the split path rewrites the whole model and is what a changed
+    count or a UV seam needs. A seam is a vertex whose corners disagree, which the format
+    spells by duplicating the vertex -- so it is a count change wearing another hat.
+    """
+    me = obj.data
+    if len(me.vertices) != model.numvertices:
+        return True
+    if "uvs" not in fields:
+        return False
+    uv = me.uv_layers.active
+    if uv is None:
+        return False
+    per = _per_vertex(me, model.numvertices, lambda l: tuple(uv.data[l.index].uv))
+    return any(vs and any(max(abs(a - b) for a, b in zip(vs[0], v)) > UV_TOL for v in vs)
+               for vs in per)
+
+
+def rebuild_cell(d, obj, bi, mi, bone_index):
+    """One model's geometry replaced from the scene, and its per-mesh triangles.
+
+    Refuses a renumbering the file cannot absorb rather than dropping what it would break:
+    `split_mesh` reports `kept` 0 when the original partition could not be recovered, and
+    a flex payload or a cloth binding keyed to the old numbering would then be carried onto
+    the wrong vertices. With neither of those present renumbering costs nothing.
+    """
+    # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
+    from . import blender_scratch as scratch_mod
+    runs, unskinned, kept = scratch_mod.split_mesh(obj, bone_index, 1.0)
+    mr = d.bodyparts[bi].kids[mi]
+    if not kept:
+        why = []
+        if any(x.kids for x in mr.kids):
+            why.append("morph targets, which are keyed by vertex")
+        if mr.extra.get("cloth"):
+            why.append("a cloth binding, which is one entry per vertex per row")
+        if why:
+            raise ValueError(
+                "%s: the file's own vertex numbering could not be recovered -- a vertex "
+                "was deleted, or a triangle spans two of the file's meshes -- and this "
+                "model carries %s" % (obj.name, " and ".join(why)))
+    faces = build_mod.replace_model(d, bi, mi, [(None, v, f) for _slot, v, f in runs])
+    return faces, unskinned, kept
+
+
 def read_meshes(m, source, fields):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not and the fields the file cannot carry."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
-    edits, missing, unsupported, renormals = {}, [], set(), 0
+    edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
     for bi, mi, _bp, mo in mesh_mod.models_of(m):
         ok, no = mesh_mod.supported(mo.filetype, fields)
-        unsupported |= set(no)
         obj = found.get((bi, mi))
         if obj is None:
             missing.append(mo.name)
+            unsupported |= set(no)
             continue
+        if _must_rebuild(obj, mo, ok):
+            # The split writes 44-byte records, so a quantised model gains the weights and
+            # normals its own record has no field for; nothing is unsupported there.
+            rebuild[(bi, mi)] = obj
+            continue
+        unsupported |= set(no)
         if ok:
             edits[(bi, mi)], n = read_mesh(obj, mo, bone_index, ok)
             renormals += n
-    return edits, missing, sorted(unsupported), renormals
+    return edits, rebuild, missing, sorted(unsupported), renormals
 
 
 def named_index(anim_names, action):
@@ -550,6 +613,45 @@ def verify_writer(src):
     return bad
 
 
+def vtx_path(path, flavour="dx80"):
+    """The .vtx beside a .mdl. Only .dx80 is written, which is the flavour
+    `Mod_LoadVtxFile_vtmb` asks for first."""
+    stem = path[:-4] if path.lower().endswith(".mdl") else path
+    return "%s.%s.vtx" % (stem, flavour)
+
+
+def stale_flavours(dest):
+    """Other .vtx flavours beside the file just written, which now disagree with it.
+
+    Only `.dx80.vtx` is emitted, so a `.dx7_2bone.vtx` next to a model whose geometry moved
+    still describes the old one. The engine tests only the flavour it loaded and takes
+    `.dx80.vtx` first, so this is a warning and not a refusal.
+    """
+    return [os.path.basename(p) for p in
+            (vtx_path(dest, "dx7_2bone"), vtx_path(dest, "dx90"), vtx_path(dest, "sw"))
+            if os.path.exists(p)]
+
+
+def revise_vtx(source, dest, data, revised):
+    """Rewrite the .vtx for a model whose geometry moved, and return what it cost.
+
+    The donor's own file supplies every strip group the edit did not touch, so a change to
+    one mesh leaves the others byte for byte as the compiler emitted them.
+    """
+    src = vtx_path(source)
+    if not os.path.exists(src):
+        raise ValueError("%s has no .dx80.vtx beside it, and a changed vertex or face "
+                         "count needs one rewritten -- the engine draws nothing when the "
+                         "pair disagrees" % os.path.basename(source))
+    blob, st = vtxr_mod.revise(mdl_mod.Mdl("<written>", data=data), src, revised)
+    out = vtx_path(dest)
+    with open(out, "wb") as f:
+        f.write(blob)
+    st["path"] = out
+    st["bytes"] = len(blob)
+    return st
+
+
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, keep_travel=True,
                    travel="keep", mesh_fields=(), verify=True, add=()):
@@ -658,11 +760,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         added.append((i, action.name, nframes, len(movements)))
 
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
-            "missing": [], "unsupported": [], "normals": 0}
+            "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
+            "unskinned": 0, "renumbered": 0}
+    revised = {}
     if mesh_fields:
-        cells, mesh["missing"], mesh["unsupported"], mesh["normals"] = \
+        cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"] = \
             read_meshes(m, source, mesh_fields)
-        if not cells and not mesh["missing"]:
+        if not cells and not rebuild and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
         for (bi, mi), verts in sorted(cells.items()):
             rec = d.bodyparts[bi].kids[mi]
@@ -670,14 +774,27 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                 m.bodyparts[bi].models[mi], verts, mesh_fields, rec.extra["verts"])
             mesh["verts"] += n
         mesh["models"] = len(cells)
+        bone_index = {b.name: b.index for b in m.bones}
+        for (bi, mi), obj in sorted(rebuild.items()):
+            was = m.bodyparts[bi].models[mi].numvertices
+            faces, unskinned, kept = rebuild_cell(d, obj, bi, mi, bone_index)
+            for k, tris in enumerate(faces):
+                revised[(bi, mi, k)] = tris
+            now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
+                      for x in d.bodyparts[bi].kids[mi].kids)
+            mesh["rebuilt"].append((obj.name, was, now))
+            mesh["unskinned"] += unskinned
+            mesh["renumbered"] += 0 if kept else 1
 
-    # The donor's checksum is kept: the .vtx beside this file still carries it, and the
-    # engine draws nothing at all when the two disagree.
+    # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
+    # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
+    vtx = revise_vtx(source, dest, data, revised) if revised else None
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "bones": len(m.bones), "mesh": mesh,
-            "scene": scene, "bytes": len(data), "was": len(m.d), "anims": len(m.anims)}
+            "scene": scene, "bytes": len(data), "was": len(m.d), "anims": len(m.anims),
+            "vtx": vtx, "stale": stale_flavours(dest) if revised else []}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

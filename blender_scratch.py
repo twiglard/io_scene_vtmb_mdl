@@ -179,21 +179,16 @@ def original_runs(obj, me):
     return runs
 
 
-def wound(corners, recs):
-    """`corners` in the order the format wants: winding against the normals being written.
+def wound(corners):
+    """`corners` in the order the format wants, which is the reverse of Blender's.
 
-    Not a fixed flip of Blender's order. An imported mesh already carries the file's winding
-    against the normals the import stashed, and reversing that would break the round trip;
-    a mesh built in Blender carries the opposite. The pair being emitted decides.
+    Blender winds a triangle with its outward normal and the format winds it against, so
+    the conversion is unconditional in both directions -- `blender_import` reverses on the
+    way in and this reverses on the way out, and a round trip writes the file's own order
+    back. Nothing here reads a normal to decide it: a normal cannot say which side is out
+    on a mesh that stores none, which is every filetype 1 and 2 donor.
     """
-    p = [r[0] for r in recs]
-    u = [p[1][k] - p[0][k] for k in range(3)]
-    w = [p[2][k] - p[0][k] for k in range(3)]
-    gn = (u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0])
-    n = [sum(r[1][k] for r in recs) for k in range(3)]
-    if sum(gn[k] * n[k] for k in range(3)) > 0:
-        return tuple(reversed(corners))
-    return tuple(corners)
+    return tuple(reversed(corners))
 
 
 def split_mesh(obj, bone_index, scale=1.0):
@@ -250,7 +245,7 @@ def split_mesh(obj, bone_index, scale=1.0):
                 at = seen[key] = len(verts)
                 verts.append(rec(vi, n, u, w))
             corners.append(at)
-        faces.append(wound(corners, [verts[at] for at in corners]))
+        faces.append(wound(corners))
     return ([(k, per_slot[k][0], per_slot[k][1]) for k in sorted(per_slot)],
             unskinned, 0)
 
@@ -263,20 +258,16 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
     and an edit copies or interpolates them, so they belong to nobody but the original.
     None when a triangle straddles two runs, which cannot be written without renumbering.
     """
-    used = set()
-    for tri in me.loop_triangles:
-        for li in tri.loops:
-            used.add(me.loops[li].vertex_index)
-
     where, run_of_slot, out, seen, kept = {}, {}, [], [], 0
     for ri, (slot, members) in enumerate(runs):
         run_of_slot[slot] = ri
         verts, keys = [], {}
         for vi in members:
             where[vi] = ri
-            # LODs are stripped, so a vertex no face reaches is written by nobody.
-            if vi not in used:
-                continue
+            # Written even where no face reaches it. The import strips the LODs, so a
+            # vertex only a lower one draws arrives loose, and the .vtx still names it by
+            # its own id -- 3716 of blueblood_female's 9129 are that, and dropping them
+            # left every lower LOD pointing past the end of its mesh.
             n, (u, w) = stash[vi], uvs[vi]
             keys[key_of(vi, n, u, w)] = len(verts)
             verts.append(rec(vi, n, u, w))
@@ -307,8 +298,7 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
             corners.append((ri, at))
         if corners[0][0] != corners[1][0] or corners[1][0] != corners[2][0]:
             return None
-        out[corners[0][0]][1].append(
-            wound([c[1] for c in corners], [out[c[0]][0][c[1]] for c in corners]))
+        out[corners[0][0]][1].append(wound([c[1] for c in corners]))
     return [(runs[ri][0], out[ri][0], out[ri][1])
             for ri in range(len(runs))], kept, added
 

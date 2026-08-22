@@ -400,8 +400,12 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         mesh = model.meshes[g.mesh]
         ids = v.orig_vert_ids(g)
         acc = faces_by_model.setdefault(g.model, [])
+        # Reversed, because the format winds a triangle against its own outward normal and
+        # Blender winds it with: carried through unchanged, every imported mesh faces inward
+        # and backface culling shows the far wall through the near one. The exporter reverses
+        # back, so the file's own order is what a round trip writes.
         for tri in v.triangles(g):
-            acc.append((tuple(mesh.vertexoffset + ids[i] for i in tri),
+            acc.append((tuple(mesh.vertexoffset + ids[i] for i in reversed(tri)),
                         mesh.material))
 
     objs = []

@@ -14,11 +14,18 @@ where the scalars come from and nowhere else, which is what lets the corpus chec
 whose real input is a Blender scene.
 
 Sections whose internal structure is unimplemented are *carried*, not dropped: cloth moves
-as one rigid region with its pointers recomputed (`_cloth_region`).  Where a description
-changes a cloth-bound mesh's vertex count the arrays cannot be resized, so that model's
-cloth is dropped and named (`_drop_stale_cloth`).  `Desc.dropped` counts everything not
-carried, and `emit` refuses unless the caller passes `drop=True`; over `gamedata\\models`
-nothing populates it, all 3263 procedural bones being proctype 1.
+as one rigid region with its pointers recomputed (`_cloth_region`), and a cloth-bound mesh
+whose vertex count changed has its three per-vertex arrays rebuilt for that count
+(`_regrow_cloth`).  `_drop_stale_cloth` is the backstop for a count that moved without
+saying so.  `Desc.dropped` counts everything not carried, and `emit` refuses unless the
+caller passes `drop=True`; over `gamedata\\models` nothing populates it, all 3263
+procedural bones being proctype 1.
+
+`replace_model` is the third entry point, between the two: it rewrites one existing model's
+geometry mesh by mesh and keeps everything else those records hold, including per vertex the
+donor's own `bonecountcode` high bits and tangent (`_carry_vertex_fields`, `_skin_key`),
+which nothing in a scene supplies.  It is what an exporter calls for a mesh whose vertex
+count or UV seams moved.
 """
 
 import os
@@ -227,6 +234,7 @@ def _cloth_region(b, mo):
     if lo % ALIGN:
         raise Refused("cloth region starts at %d, not %d-aligned" % (lo, ALIGN))
     return {"data": bytes(b[lo:hi]), "cols": m.i(mo + 0xc8), "table": tbl - lo,
+            "rows": rows,
             "slots": [(k, at - lo) for k, at in slots],
             "meshes": dict((k, ([x - lo for x in v], n)) for k, (v, n) in binds.items())}
 
@@ -237,10 +245,11 @@ def _drop_stale_cloth(d):
     `mstudiomesh_t+0x30/+0x34/+0x38` are per-vertex arrays of `rows * numvertices` entries
     and the engine reads that many whatever the array's real length is, so a carried array
     against a changed count is read past its end -- anomalies §M, where a mis-sized region
-    faulted in `Cloth_BuildSpringBatches_vtmb` on render rather than on load.  Growing them
-    with zero entries is the better answer and cannot be written yet: neither the element
-    order nor the meaning of a zero entry has been read out of the code, and `+0x38`'s
-    element size is a fit that already fails on one shipped mesh.
+    faulted in `Cloth_BuildSpringBatches_vtmb` on render rather than on load.
+
+    This is the backstop, not the answer: `_regrow_cloth` rebuilds the arrays for the new
+    count and `replace_model` calls it, so a path that reaches here changed a count without
+    saying so.
     """
     for bp in d.bodyparts:
         for mr in bp.kids:
@@ -256,6 +265,41 @@ def _drop_stale_cloth(d):
                 mr.extra["clothsphere"] = b""
                 d.drop("cloth on a mesh whose vertex count changed")
                 break
+
+
+def _regrow_cloth(mr, k, new_n):
+    """Mesh `k`'s three per-vertex cloth arrays, rebuilt for a new vertex count.
+
+    Row-major -- row r's slice starts at `numvertices * r`, recon 29.3 -- so a count change
+    moves every row and the arrays cannot be carried as they stand. Each row keeps its own
+    entries and a vertex the edit added takes the format's own "none": 0xff on +0x30, 0 on
+    +0x34 and +0x38. Nothing inside needs remapping, because +0x34 holds a particle index
+    and +0x38 a cloth-normal index, neither of them a vertex.
+
+    Grown arrays are appended and the three mesh fields re-aimed. Nothing inside the region
+    moves: the table stores no count and every object payload offset is object-relative, so
+    only the mesh pointers change, which `_emit_model` patches anyway.
+    """
+    cl = mr.extra.get("cloth")
+    if not cl or k not in cl["meshes"]:
+        return False
+    spans, old_n = cl["meshes"][k]
+    if old_n == new_n:
+        return False
+    rows, data, out = cl["rows"], bytearray(cl["data"]), []
+    for at, width, none in zip(spans, (1, 2, 2), (bytes((0xff,)), bytes(2), bytes(2))):
+        buf = bytearray()
+        for r in range(rows):
+            src = at + old_n * r * width
+            buf += data[src:src + min(old_n, new_n) * width]
+            buf += none * max(0, new_n - old_n)
+        while len(data) % ALIGN:
+            data += bytes(1)
+        out.append(len(data))
+        data += buf
+    cl["data"] = bytes(data)
+    cl["meshes"][k] = (out, new_n)
+    return True
 
 
 def _sized(b, base, cnt_off, idx_off, stride):
@@ -1085,6 +1129,101 @@ def add_model(d, meshes, bodypart="studio", model="model"):
 def add_mesh(d, verts, faces, material=0, bodypart="studio", model="model"):
     """One bodypart holding one model holding one mesh."""
     return add_model(d, [(material, verts, faces)], bodypart, model)
+
+
+def _skin_key(rec, at):
+    """What a filetype-0 record's skin block says, without its slot order.
+
+    `_pack_verts` sorts by descending weight, so a vertex whose two bones differ by 1/255
+    comes back with its slots swapped -- the same skinning, different bytes. The file's
+    order is not derivable from anything, which is why it is kept rather than reproduced.
+    """
+    w = list(rec[at:at + 3])
+    w.append(255 - sum(w))
+    n = rec[at + 3] % 5
+    return sorted(zip(struct.unpack_from("<4h", rec, at + 4)[:n], w[:n]))
+
+
+def _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was, new_n):
+    """Give each vertex an edit did not add its donor `bonecountcode` and tangent back.
+
+    Only `code % 5` is read, and the high bits are never zero for a given count and mean
+    something unread, so `mesh_write.count_code` keeps them and `_pack_verts` cannot --
+    it has no donor to keep them from. The tangent is the same case from the other side:
+    `_perp` returns an arbitrary perpendicular, ignoring the UV a real tangent basis is
+    built against, so the file's own vector is better wherever there is one.
+    """
+    old_n, old_off = was
+    for j in range(min(old_n, new_n)):
+        src, at = (old_off + j) * 44, j * 44
+        if src + 44 > len(old_vb):
+            break
+        donor, ours = _skin_key(old_vb, src), _skin_key(pvb, at)
+        # A rigid vertex is `numbones == 0` and lives in model space. Nothing in a Blender
+        # scene spells that -- `split_mesh` gives a vertex in no group `[(0, 1.0)]` so a
+        # scratch model still follows its armature -- so the donor's reading is kept where
+        # the two only differ that way. 1453 of 4423 shipped models are rigid.
+        if donor == ours or (not donor and ours == [(0, 255)]):
+            pvb[at:at + 12] = old_vb[src:src + 12]
+        else:
+            pvb[at + 3] = (old_vb[src + 3] - old_vb[src + 3] % 5) + pvb[at + 3] % 5
+        t = (old_off + j) * 16
+        if t + 16 <= len(old_tb):
+            ptb[j * 16:(j + 1) * 16] = old_tb[t:t + 16]
+
+
+def replace_model(d, bi, mi, meshes, keep_center=True):
+    """Rewrite one existing model's geometry, keeping everything else its records carry.
+
+    `meshes` is `add_model`'s -- [(material, verts, faces), ...] -- one entry per mesh the
+    model already holds, in that order. The partition is what `mstudiomesh_t.vertexoffset`
+    addresses and what the .vtx indexes, so a caller that cannot preserve it has renumbered
+    every vertex and must say so rather than call this.
+
+    Flexes, eyeballs, materialtype, meshid and the mesh centre stay with the record they
+    were read from. `mstudiomesh_t.center` is not the centroid over the corpus, and
+    `boundingradius` is 0.0 on every shipped record, so neither is refitted.
+    Returns the per-mesh face lists, for the .vtx the caller then has to write.
+    """
+    mr = d.bodyparts[bi].kids[mi]
+    if len(meshes) != len(mr.kids):
+        raise Refused("%d meshes in the scene against %d in bodypart %d model %d; the "
+                      "file's mesh partition is what the .vtx indexes"
+                      % (len(meshes), len(mr.kids), bi, mi))
+    # Read before the loop overwrites them: under the preserved-numbering contract new
+    # local index j < the mesh's old count is old index j, which is what lets the two
+    # fields below come back rather than be re-derived.
+    was = [struct.unpack_from("<2i", x.raw, 0x08) for x in mr.kids]
+    old_ft = struct.unpack_from("<i", mr.raw, 0x9c)[0]
+    old_vb = mr.extra.get("verts") or b""
+    old_tb = mr.extra.get("tangents") or b""
+    vb, tb, offset, faces = bytearray(), bytearray(), 0, []
+    for k, (material, verts, tris) in enumerate(meshes):
+        pvb, ptb = _pack_verts(verts)
+        if old_ft == 0:
+            _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was[k], len(verts))
+        vb += pvb
+        tb += ptb
+        raw = mr.kids[k].raw
+        # None keeps the donor's: the material a mesh draws with is the file's own index
+        # into mstudiotexture_t[], and a Blender material slot number is not that.
+        if material is not None:
+            struct.pack_into("<i", raw, 0x00, material)
+        struct.pack_into("<i", raw, 0x08, len(verts))
+        struct.pack_into("<i", raw, 0x0c, offset)
+        if not keep_center:
+            struct.pack_into("<3f", raw, 0x24,
+                             *[sum(v[0][c] for v in verts) / max(1, len(verts))
+                               for c in range(3)])
+        _regrow_cloth(mr, k, len(verts))
+        offset += len(verts)
+        faces.append(list(tris))
+    mr.extra["verts"] = bytes(vb)
+    mr.extra["tangents"] = bytes(tb)
+    # 44-byte records are filetype 0 whatever the donor was: 1 and 2 carry no weight or
+    # bone field at all, so a quantised donor gains skinning here rather than losing it.
+    struct.pack_into("<i", mr.raw, 0x9c, 0)
+    return faces
 
 
 def _perp(n):
