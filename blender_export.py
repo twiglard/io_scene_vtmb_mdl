@@ -328,24 +328,24 @@ def rebuild_cell(d, obj, bi, mi, bone_index):
 
     Refuses a renumbering the file cannot absorb rather than dropping what it would break:
     `split_mesh` reports `kept` 0 when the original partition could not be recovered, and
-    a flex payload or a cloth binding keyed to the old numbering would then be carried onto
-    the wrong vertices. With neither of those present renumbering costs nothing.
+    names which of its eight conditions forced that. A flex payload or a cloth binding
+    keyed to the old numbering would be carried onto the wrong vertices; with neither of
+    those present renumbering costs nothing.
     """
     # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
     from . import blender_scratch as scratch_mod
-    runs, unskinned, kept = scratch_mod.split_mesh(obj, bone_index, 1.0)
+    runs, unskinned, kept, why = scratch_mod.split_mesh(obj, bone_index, 1.0)
     mr = d.bodyparts[bi].kids[mi]
     if not kept:
-        why = []
+        carries = []
         if any(x.kids for x in mr.kids):
-            why.append("morph targets, which are keyed by vertex")
+            carries.append("morph targets, which are keyed by vertex")
         if mr.extra.get("cloth"):
-            why.append("a cloth binding, which is one entry per vertex per row")
-        if why:
+            carries.append("a cloth binding, which is one entry per vertex per row")
+        if carries:
             raise ValueError(
-                "%s: the file's own vertex numbering could not be recovered -- a vertex "
-                "was deleted, or a triangle spans two of the file's meshes -- and this "
-                "model carries %s" % (obj.name, " and ".join(why)))
+                "%s: the file's own vertex numbering could not be recovered -- %s -- and "
+                "this model carries %s" % (obj.name, why, " and ".join(carries)))
     faces = build_mod.replace_model(d, bi, mi, [(None, v, f) for _slot, v, f in runs])
     return faces, unskinned, kept
 

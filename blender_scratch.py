@@ -156,22 +156,36 @@ def identity_map(obj, me):
     return out
 
 
-def original_runs(obj, me):
+def original_runs(obj, me, why=None):
     """The file's mesh partition as [(material slot, [Blender vertex, ...]), ...].
 
     None unless every original vertex is still present: one that has gone cannot be put
     back in its slot, and renumbering around the hole is what the map exists to avoid.
     A slot naming two runs is also refused, since a vertex the edit added is placed by
-    slot and there would be no saying which of them it belongs to.
+    slot and there would be no saying which of them it belongs to. Each of those appends
+    to `why`, which the caller reports and cannot work out for itself.
     """
+    if why is None:
+        why = []
     spec = obj.get("vtmb_meshes")
+    if not spec:
+        why.append("the object carries no vtmb_meshes, so it came from no .mdl import")
+        return None
     ident = identity_map(obj, me)
-    if not spec or ident is None:
+    if ident is None:
+        why.append("the object carries no vtmb_orig tags, so no vertex of the scene can "
+                   "be matched to one of the file's")
         return None
     runs, at, slots = [], 0, set()
     for slot, n in spec:
         members = [ident.get(at + k) for k in range(int(n))]
-        if any(x is None for x in members) or int(slot) in slots:
+        if any(x is None for x in members):
+            lost = next(at + k for k in range(int(n)) if members[k] is None)
+            why.append("file vertex %d is claimed by no vertex of the scene, so it was "
+                       "deleted or its tag was lost" % lost)
+            return None
+        if int(slot) in slots:
+            why.append("material slot %d names two of the file's meshes" % int(slot))
             return None
         slots.add(int(slot))
         runs.append((int(slot), members))
@@ -192,12 +206,14 @@ def wound(corners):
 
 
 def split_mesh(obj, bone_index, scale=1.0):
-    """([(material slot, verts, faces), ...], unskinned, kept) per distinct corner.
+    """([(material slot, verts, faces), ...], unskinned, kept, why) per distinct corner.
 
     The format stores one normal, one UV and one skin per vertex, so a seam or a hard edge
     is spelled by duplicating the vertex. `kept` counts the originals written back into
     their own mesh in file order; it is 0 when the partition had to be rebuilt from the
-    material slots instead, which puts every vertex in triangle-visit order.
+    material slots instead, which puts every vertex in triangle-visit order. `why` names
+    the one condition that forced that, and is None where it did not happen -- eight
+    separate ones reach it and the caller refuses on the wrong one otherwise.
     """
     me = obj.data
     if not me.polygons:
@@ -223,13 +239,19 @@ def split_mesh(obj, bone_index, scale=1.0):
         return (vi, round(n[0] / NORMAL_Q), round(n[1] / NORMAL_Q),
                 round(n[2] / NORMAL_Q), round(u / UV_Q), round(w / UV_Q))
 
-    if stash is not None and uvs is not None:
-        runs = original_runs(obj, me)
+    why = []
+    if stash is None:
+        why.append("nothing stashed the file's own normals on this mesh, which is every "
+                   "filetype 1 and 2 model")
+    elif uvs is None:
+        why.append("nothing stashed the file's own UVs on this mesh")
+    else:
+        runs = original_runs(obj, me, why)
         if runs is not None:
             out = _split_preserved(me, runs, stash, uvs, normals, uv_layer,
-                                   rec, key_of)
+                                   rec, key_of, why)
             if out is not None:
-                return out[0], unskinned, out[1]
+                return out[0], unskinned, out[1], None
 
     per_slot = {}
     for tri in me.loop_triangles:
@@ -247,10 +269,10 @@ def split_mesh(obj, bone_index, scale=1.0):
             corners.append(at)
         faces.append(wound(corners))
     return ([(k, per_slot[k][0], per_slot[k][1]) for k in sorted(per_slot)],
-            unskinned, 0)
+            unskinned, 0, why[0] if why else "the file's partition was not recoverable")
 
 
-def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
+def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why):
     """Every original vertex back in its own slot, then whatever an edit added after it.
 
     A vertex with no original of its own is placed in the run its triangle's material slot
@@ -285,6 +307,8 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
             if not own:
                 ri = run_of_slot.get(tri.material_index)
                 if ri is None:
+                    why.append("a triangle sits on material slot %d, which names no mesh "
+                               "of the file" % tri.material_index)
                     return None
             n = stash[vi] if own else tuple(normals[li].vector)
             u, w = uv_layer.data[li].uv
@@ -297,6 +321,7 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of):
                     added += 1
             corners.append((ri, at))
         if corners[0][0] != corners[1][0] or corners[1][0] != corners[2][0]:
+            why.append("a triangle spans two of the file's meshes")
             return None
         out[corners[0][0]][1].append(wound([c[1] for c in corners]))
     return [(runs[ri][0], out[ri][0], out[ri][1])
@@ -313,7 +338,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     slot_of = {}
     total_unskinned = total_kept = 0
     for obj in mesh_objs:
-        runs, unskinned, kept = split_mesh(obj, bone_index, scale)
+        runs, unskinned, kept, _why = split_mesh(obj, bone_index, scale)
         total_unskinned += unskinned
         total_kept += kept
         mats = obj.data.materials
