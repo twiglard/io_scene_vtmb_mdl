@@ -179,6 +179,16 @@ def build_armature(context, m, name, scale):
          "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
                      for i in col] for col in s.blends]}
         for s in m.seqs]
+    if m.springbones:
+        # By name, as the sequences above are: the record's indices are this file's own
+        # bone order, which nothing else in Blender preserves.
+        arm_obj["vtmb_spring_bones"] = [
+            {"first_bone": m.bones[sb.first_bone].name,
+             "terminal": m.bones[sb.terminal].name if sb.terminal >= 0 else "",
+             "gravity": sb.gravity, "damping": sb.damping,
+             "spring_exponent": sb.spring_exponent, "max_angle_deg": sb.max_angle,
+             "unknown8": sb.unknown8}
+            for sb in m.springbones]
     return arm_obj
 
 

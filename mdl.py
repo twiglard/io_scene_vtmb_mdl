@@ -19,11 +19,22 @@ HDR_NUMTEXTURES = 292
 HDR_NUMCDTEXTURES = 300
 HDR_NUMSKINREF = 308
 HDR_NUMBODYPARTS = 320
+HDR_NUMSPRINGBONES = 396
 HDR_NUMINCLUDEMODELS = 404
 
 # Measured, not from Valve: the record is 116 bytes with the name offset at +0, and no
 # other stride parses the corpus. The 24 trailing -1s are the pose-parameter remap.
 INCLUDE_STRIDE = 116
+
+# The secondary-motion chain record client.dll builds per-frame hair, ponytail and
+# breast physics from. Its reader is SpringBone_BuildChainList at 0x10096650: it walks
+# studiohdr +396/+400 at stride 28 and hands +24, +20, +16, +12, +4, +0 to the chain
+# constructor at 0x100ac0f0, which multiplies +24 by pi/180 and evaluates
+# pow(10, -(+20)); the per-frame solve is 0x100ad2c0. +8 it never reads or passes on --
+# shipped values are {9, 30, 60} and its meaning is unrecovered. The loader also ORs
+# 0xfffc into every chain bone's flags (engine.dll 0x2000ccf0), which is why these bones
+# draw at all.
+SPRINGBONE_STRIDE = 28
 
 BONE_STRIDE = 160
 BONE_POS = 0x20
@@ -207,6 +218,16 @@ class BodyPart:
     __slots__ = ("index", "name", "base", "models")
 
 
+class SpringBone:
+    """One chain: `first_bone` starts moving, and the chain follows first children down
+    to `terminal`, or to the leaf when terminal is -1 -- which is what all 600 shipped
+    records state. `max_angle` is degrees; the runtime spring coefficient is
+    10 ** -spring_exponent."""
+
+    __slots__ = ("index", "first_bone", "terminal", "unknown8", "gravity", "damping",
+                 "spring_exponent", "max_angle")
+
+
 class Vertex:
     __slots__ = ("pos", "normal", "uv", "bones", "weights", "numbones")
 
@@ -245,6 +266,7 @@ class Mdl:
                      for i in range(numseq)]
         self._read_materials()
         self._read_bodyparts()
+        self._read_springbones()
         self._read_includes()
 
     def _cstr(self, off):
@@ -347,6 +369,24 @@ class Mdl:
             e.materialtype, e.materialparam = struct.unpack_from("<2i", d, eo + 24)
             m.meshes.append(e)
         return m
+
+    def _read_springbones(self):
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMSPRINGBONES)
+        self.springbones = []
+        for i in range(n):
+            sb = SpringBone()
+            sb.index = i
+            (sb.first_bone, sb.terminal, sb.unknown8, sb.gravity, sb.damping,
+             sb.spring_exponent, sb.max_angle) = \
+                struct.unpack_from("<2i5f", d, idx + i * SPRINGBONE_STRIDE)
+            # 107 models carry 600 records and every one is in range, so a miss here is
+            # a wrong stride or a truncated file, not content to tolerate.
+            if not 0 <= sb.first_bone < len(self.bones) \
+                    or not -1 <= sb.terminal < len(self.bones):
+                raise ValueError("spring bone %d names bones %d and %d of %d"
+                                 % (i, sb.first_bone, sb.terminal, len(self.bones)))
+            self.springbones.append(sb)
 
     def _read_includes(self):
         d = self.d
