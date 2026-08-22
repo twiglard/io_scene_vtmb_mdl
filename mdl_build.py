@@ -1047,17 +1047,45 @@ def set_cdtextures(d, paths):
     """
     out = []
     for p in ([paths] if isinstance(paths, str) else paths):
-        p = str(p).replace("\\", "/").strip()
+        p = _norm_cdtexture(p)
         if p not in out:
             out.append(p)
     d.cdtextures = out
     return out
 
 
-def add_material(d, name, cdtexture="models/"):
-    # Only a fallback: the list is the file's, not the first material's.
-    if not d.cdtextures:
-        set_cdtextures(d, cdtexture)
+def _norm_cdtexture(p):
+    return str(p).replace("\\", "/").strip()
+
+
+def add_cdtexture(d, path):
+    """Append a directory the list does not already carry. True if it was new.
+
+    Resolution is a cross product -- every material name against every directory until one
+    resolves -- so a new entry at the end cannot change what already resolved, and order
+    decides only which of two candidates wins. Normalising here is what lets a repeat
+    compare equal to an entry `set_cdtextures` wrote.
+    """
+    p = _norm_cdtexture(path)
+    if p in d.cdtextures:
+        return False
+    d.cdtextures.append(p)
+    return True
+
+
+def add_material(d, name, cdtexture=None):
+    """One `mstudiotexture_t`, with the one-family skin table rebuilt around it.
+
+    `cdtexture` is the directory this material's `.vmt` lives in and is appended when the
+    file does not already carry it. The list is the file's and not this material's, so an
+    existing entry is never replaced and never reordered. `None` leaves a populated list
+    alone and seeds an empty one with `models/`, which only `new()` can produce -- 4442 of
+    the 4445 shipped models are not `models/`, so that default is a marker and not a guess.
+    """
+    if cdtexture is not None:
+        add_cdtexture(d, cdtexture)
+    elif not d.cdtextures:
+        set_cdtextures(d, "models/")
     d.textures.append(Rec(bytearray(20), name))
     d.skin = [list(range(len(d.textures)))]
     return len(d.textures) - 1
