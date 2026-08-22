@@ -255,7 +255,10 @@ def fit_movements(path, eps=1e-4):
     v0/v1 are distance per block span, not per second: (v0+v1)/2 equals the block's own
     step in all 11013 shipped blocks. One block per frame is exact at every integer frame,
     which is the only place the engine is asked for; merging would only save bytes.
-    `angle` stays 0, as it is in every shipped block -- a turn lives in `vector`.
+    `angle` stays 0. It is not unauthored -- 21 blocks in a patched install carry one,
+    the gargoyle, hengeyokai and creation1 turn animations, all flagged 0x800 -- but a
+    root path alone cannot say which part of a turn was the entity's, so this never
+    invents one and the exporter warns when it replaces blocks that had one.
     """
     rel = [[p[i] - path[0][i] for i in range(3)] for p in path]
     if all(max(abs(c) for c in p) <= eps for p in rel):
@@ -286,9 +289,11 @@ def fit_movements(path, eps=1e-4):
 def extract_travel(m, poses):
     """Move the root bone's path out of the poses and into movement blocks.
 
-    Equivalent only because `angle` is 0 in every shipped block: the engine applies
-    anim_position as a pure translation of every world matrix, and translating the root
-    of a hierarchy translates all of it, so no other bone's pose changes.
+    Equivalent whenever `angle` is 0, which is every shipped block but 21: the engine
+    then applies anim_position as a pure translation of every world matrix, and
+    translating the root of a hierarchy translates all of it, so no other bone's pose
+    changes. A donor block carrying an angle has no equivalent here -- the caller is the
+    one who can see the donor's blocks and owns that warning.
     """
     path = [list(p[0][0]) for p in poses]
     mvs = fit_movements(path)
