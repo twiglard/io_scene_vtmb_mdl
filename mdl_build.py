@@ -40,6 +40,12 @@ except ImportError:
 HDR_SIZE = 424
 ALIGN = 4
 
+# 20000, not the SDK header's 25000: CCachedRenderData's four arrays are MAXSTUDIOVERTS+1
+# and all four spans agree on 20001.  SetupComputation accumulates mstudiomesh_t.numvertices
+# between two StartModel calls, so the cap is per mstudiomodel_t, and a model past it passes
+# every offline check and then draws nothing.  Recon §35.1.
+MAXSTUDIOVERTS = 20000
+
 # A bone carrying no bit of the 0xfffc used-by mask gets no bone matrix, so anything skinned
 # to it draws nothing.  0x10 is the corpus norm: 62439 of 62702 bones carry it.
 BONE_USED = 0x10
@@ -473,6 +479,20 @@ def _block_len(b, blk, numbones, numframes):
 
 
 
+def model_vertex_counts(d):
+    """(bodypart index, model name, numvertices) per mstudiomodel_t, in emission order.
+
+    The count is the one `_emit_model` writes at +0x90, so a guard on it and the field
+    cannot disagree.
+    """
+    out = []
+    for i, bp in enumerate(d.bodyparts):
+        for mr in bp.kids:
+            name = bytes(mr.raw[0:128]).split(b"\0")[0].decode("latin1", "replace")
+            out.append((i, name, len(mr.extra.get("tangents") or b"") // 16))
+    return out
+
+
 def emit(d, checksum=None, drop=False):
     """Bytes for the description.  Every count comes from a len() and every offset from
     where its target landed, so a description with a record added emits a valid file.
@@ -484,6 +504,14 @@ def emit(d, checksum=None, drop=False):
     if d.dropped and not drop:
         raise Refused("description drops %s"
                       % ", ".join("%s x%d" % (k, v) for k, v in sorted(d.dropped.items())))
+    counts = model_vertex_counts(d)
+    over = [c for c in counts if c[2] > MAXSTUDIOVERTS]
+    if over:
+        raise Refused("model %r carries %d vertices against MAXSTUDIOVERTS %d, so the "
+                      "renderer draws nothing%s"
+                      % (over[0][1], over[0][2], MAXSTUDIOVERTS,
+                         "" if len(counts) == 1 else
+                         " (%s)" % ", ".join("%s %d" % (n, c) for _, n, c in counts)))
     stamp_sequence_boxes(d)
     quantise(d)
     o = Out()

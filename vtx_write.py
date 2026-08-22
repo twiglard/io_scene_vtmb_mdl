@@ -517,6 +517,13 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
         for v in tri:
             if not 0 <= v < n:
                 raise ValueError("triangle names vertex %d of %d" % (v, n))
+    # Ahead of the packing loop: past it, struct.error fires first and names the format
+    # string rather than the mesh.
+    top = max(orig_ids) if n else -1
+    if top > SHORT_MAX:
+        raise ValueError("origMeshVertID %d, and the field is a short: a mesh cannot "
+                         "carry more than %d vertices. This strip group holds %d of "
+                         "them" % (top, SHORT_MAX + 1, n))
     boned = bool(group.flags & SG_VERTS_ARE_BONED)
     hw = bool(group.flags & SG_IS_HW_SKINNED)
     if boned and vert_bones is None:
@@ -553,8 +560,9 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
     for name, c in (("vertices", len(recs)), ("indices", len(indices)),
                     ("strips", len(strips))):
         if c > SHORT_MAX:
-            raise ValueError("%d %s in one strip group; the count field is a short"
-                             % (c, name))
+            raise ValueError("%d %s in one strip group, split from %d mesh vertices; "
+                             "the count field is a short, so the bound is %d"
+                             % (c, name, n, SHORT_MAX))
     group.verts = b"".join(recs)
     group.indices = indices
     group.strips = strips

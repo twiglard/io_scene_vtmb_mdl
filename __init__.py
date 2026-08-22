@@ -28,6 +28,7 @@ from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write, pat
 
 import importlib
 import os
+import traceback
 
 import bpy
 from bpy_extras.io_utils import ExportHelper, ImportHelper
@@ -287,7 +288,9 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
                 game_root=game_root, mods=mods, extra_roots=extract,
                 root_motion=self.root_motion)
         except Exception as exc:
-            self.report({"ERROR"}, "%s: %s" % (type(exc).__name__, exc))
+            traceback.print_exc()
+            self.report({"ERROR"}, "%s: %s -- traceback on the console"
+                        % (type(exc).__name__, exc))
             return {"CANCELLED"}
         if r["warning"]:
             self.report({"WARNING"}, r["warning"])
@@ -533,8 +536,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 mesh_fields=_mesh_fields(self), add=adds,
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
+        except mdl_build.Refused as exc:
+            self.report({"ERROR"}, "refused: %s" % exc)
+            return {"CANCELLED"}
         except Exception as exc:
-            self.report({"ERROR"}, "%s: %s" % (type(exc).__name__, exc))
+            traceback.print_exc()
+            self.report({"ERROR"}, "%s: %s -- traceback on the console"
+                        % (type(exc).__name__, exc))
             return {"CANCELLED"}
         finally:
             context.scene.frame_set(frame)
@@ -838,11 +846,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
                 activity=self.activity, hitboxes=self.fit_hitboxes, travel=self.travel,
                 includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
-        except blender_scratch.Refused as exc:
+        except (blender_scratch.Refused, mdl_build.Refused) as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
         except Exception as exc:
-            self.report({"ERROR"}, "%s: %s" % (type(exc).__name__, exc))
+            traceback.print_exc()
+            self.report({"ERROR"}, "%s: %s -- traceback on the console"
+                        % (type(exc).__name__, exc))
             return {"CANCELLED"}
         if r["unskinned"]:
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
