@@ -154,6 +154,18 @@ def read_bones(m, arm_obj, scale):
     return out
 
 
+def surplus_bones(m, arm_obj):
+    """Bones the armature has that the file does not, in armature order.
+
+    `read_bones` and `read_poses` both walk the file's bone list, so one added in Blender
+    is simply never visited and leaves no trace in the output. Writing it needs the
+    rebuilder (roadmap item 10); naming it costs one pass and turns an invisible loss into
+    a reported one.
+    """
+    have = {b.name for b in m.bones}
+    return [b.name for b in arm_obj.data.bones if b.name not in have]
+
+
 def mesh_objects(m, source):
     """{(bodypart index, model index): object} for the scene meshes belonging to `m`.
 
@@ -734,7 +746,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     d = build_mod.apply_anims(build_mod.from_bytes(bytes(m.d)), edits, source)
 
-    scene = {"bones": 0, "materials": 0, "sequences": 0, "stale": 0}
+    scene = {"bones": 0, "materials": 0, "sequences": 0, "stale": 0,
+             "surplus": surplus_bones(m, arm_obj)}
     poses = read_bones(m, arm_obj, scale)
     if poses:
         build_mod.set_bone_poses(d, poses)

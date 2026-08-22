@@ -126,6 +126,18 @@ def _mesh_status(op, context, base, fields):
             len(mesh_write.models_of(m)), sorted(no))
 
 
+def _surplus_bones(op, context, base):
+    """Bones the armature has and the file does not, for the dialog. [] on any error:
+    the draw runs on every redraw and a bad path is the Model section's to report."""
+    obj = context.active_object
+    if not base or obj is None or obj.type != "ARMATURE":
+        return []
+    try:
+        return blender_export.surplus_bones(_cached_mdl(base), obj)
+    except Exception:
+        return []
+
+
 def _mesh_verts(base):
     """Vertices the file's models declare. 0 for the animation libraries and null.mdl."""
     try:
@@ -417,6 +429,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 else:
                     box.label(text="saved as %s" % os.path.basename(self.filepath),
                               icon="INFO")
+                extra = _surplus_bones(self, context, base)
+                if extra:
+                    _pair(box, "bones not in the file", "%d, not written" % len(extra),
+                          icon="ERROR")
+                    box.label(text="    " + ", ".join(extra[:3])
+                              + ("" if len(extra) <= 3 else " and %d more"
+                                 % (len(extra) - 3)))
 
         box = _section(lay, "vtmb_anims", "Animations", icon="ACTION")
         if box is not None:
@@ -572,6 +591,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name in r["stale"]:
             self.report({"WARNING"}, "%s beside the model still describes the old "
                                      "geometry; only .dx80.vtx is written" % name)
+        surplus = r["scene"]["surplus"]
+        if surplus:
+            self.report({"WARNING"}, "%d bone%s of this armature %s not in %s and %s not "
+                                     "written: %s%s. The file's own bone list is what an "
+                                     "export walks, so a bone added in Blender is left out"
+                        % (len(surplus), "" if len(surplus) == 1 else "s",
+                           "is" if len(surplus) == 1 else "are",
+                           os.path.basename(src),
+                           "was" if len(surplus) == 1 else "were",
+                           ", ".join(surplus[:4]),
+                           "" if len(surplus) <= 4 else " and %d more" % (len(surplus) - 4)))
         if r["scene"]["bones"] and r["scene"]["stale"]:
             self.report({"WARNING"}, "%d bone%s moved; the %d animation%s you did not export "
                                      "still key the old skeleton and may not follow it. "
@@ -598,7 +628,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                  % ("+".join(mesh["fields"]), mesh["verts"], mesh["models"])
                  if mesh["verts"] else "")
         scene = r["scene"]
-        if any(scene.values()):
+        if any(scene[k] for k in ("bones", "materials", "sequences")):
             extra += ("; the scene moved %d bones, renamed %d materials and changed %d "
                       "sequence fields"
                       % (scene["bones"], scene["materials"], scene["sequences"]))
