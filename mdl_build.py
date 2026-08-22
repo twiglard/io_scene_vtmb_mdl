@@ -227,8 +227,8 @@ def from_bytes(b):
         d.bones.append(r)
 
     for k in range(i(248)):
-        s = i(252) + k * BONECONTROLLER_STRIDE
-        d.bonecontrollers.append(Rec(b[s:s + BONECONTROLLER_STRIDE]))
+        at = i(252) + k * BONECONTROLLER_STRIDE
+        d.bonecontrollers.append(Rec(b[at:at + BONECONTROLLER_STRIDE]))
 
     for k in range(i(256)):
         o = i(260) + k * 12
