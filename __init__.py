@@ -18,7 +18,7 @@ bl_info = {
     "category": "Import-Export",
 }
 
-from . import (checksum, mdl, mdl_rebuild, mdl_write, mesh_write, paths, relocs,
+from . import (anorms, checksum, mdl, mdl_rebuild, mdl_write, mesh_write, paths, relocs,
                sections, tth, vpk, vtx, blender_import, blender_export)
 
 import importlib
@@ -592,8 +592,8 @@ def unregister():
 def register():
     # addon_utils compares only __init__.py's mtime, so without this an edit to any
     # other module survives a disable/enable cycle as stale code.
-    for m in (checksum, sections, relocs, mdl, mdl_write, mdl_rebuild, mesh_write,
-              paths, tth, vpk, vtx, blender_import, blender_export):
+    for m in (anorms, checksum, sections, relocs, mdl, mdl_write, mdl_rebuild,
+              mesh_write, paths, tth, vpk, vtx, blender_import, blender_export):
         importlib.reload(m)
     # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
     # class of the same bl_idname otherwise makes register_class raise.

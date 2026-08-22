@@ -24,8 +24,9 @@ else:
 
 FIELDS = ("positions", "normals", "uvs", "weights")
 
-# Which fields the record can carry at all. filetype 1 and 2 store a normal *index* into
-# a table this code does not parse, so a normal cannot be written for them.
+# Which fields the record can carry at all. filetype 1 and 2 store a normal *reference*
+# into StudioRender.dll's own tables (anorms.py decodes them); writing one would need a
+# nearest-entry search over the table, which is not done, so a normal cannot be written.
 BY_FILETYPE = {0: ("positions", "normals", "uvs", "weights"),
                1: ("positions", "uvs"),
                2: ("positions", "uvs")}
