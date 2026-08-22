@@ -66,6 +66,7 @@ def _section(lay, idname, title, icon="NONE"):
 # Blender frees enum item strings it does not own, so the list a dynamic callback returns
 # has to stay referenced here or the dropdown shows garbage.
 _ANIM_ITEMS = []
+_DROP_ITEMS = []
 _ANIM_CACHE = {}
 _MDL_CACHE = {}
 
@@ -126,6 +127,22 @@ def _mesh_status(op, context, base, fields):
             len(mesh_write.models_of(m)), sorted(no))
 
 
+def _drop_takes(op, context, base):
+    """Sequence labels a delete of `op.drop` would take with it, or None if the file has
+    no such animation. The refusal itself is `mdl_build.remove_animation`'s; this only
+    says what the user is about to lose."""
+    try:
+        m = _cached_mdl(base)
+    except Exception:
+        return None
+    names = [a.name for a in m.anims]
+    if op.drop not in names:
+        return None
+    i = names.index(op.drop)
+    return [s.label for s in m.seqs
+            if i in [x for col in s.blends for x in col]]
+
+
 def _surplus_bones(op, context, base):
     """Bones the armature has and the file does not, for the dialog. [] on any error:
     the draw runs on every redraw and a bad path is the Model section's to report."""
@@ -167,6 +184,24 @@ def _matches(op, context):
     hits, unwritten, _add = blender_export.match_indices([n for n, _ in anims], path,
                                                          context.active_object)
     return [(anims[i][0], a.name) for i, a in sorted(hits.items())], unwritten
+
+
+def _drop_items(self, context):
+    """The file's animations, plus a first entry that removes none.
+
+    Blender takes a dynamic enum's first item as its default, so the do-nothing entry has
+    to be first or opening the dialog would arm a delete.
+    """
+    global _DROP_ITEMS
+    items = [(NONE, "Nothing", "Remove no animation. The default")]
+    for i, (n, nf) in enumerate(_base_anims(_base_path(self, context))):
+        items.append((n, "[%d] %s" % (i, n),
+                      "Remove %s, %d frames long, and every sequence left with nothing "
+                      "to play. A sequence that blends it alongside others is refused "
+                      "instead, since one corner of a blend grid cannot be left empty"
+                      % (n, nf)))
+    _DROP_ITEMS = items
+    return _DROP_ITEMS
 
 
 def _target_items(self, context):
@@ -348,6 +383,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "stored points below it -- and the animations already in the file "
                     "keep their poses, since one posscale/rotscale set serves the "
                     "whole file and they are re-encoded when a new pose widens it")
+    drop: bpy.props.EnumProperty(
+        name="Delete", items=_drop_items,
+        description="One animation to remove from the file, taken after everything "
+                    "else so the slots above still mean what they said. The sequences "
+                    "it leaves with nothing to play go with it -- the engine reaches an "
+                    "animation only through a sequence -- and a sequence that blends it "
+                    "alongside others is refused rather than left with a hole. The action "
+                    "stays in the blend; delete that too if you do not want it appended "
+                    "back")
     keep_travel: bpy.props.BoolProperty(
         name="Was applied", default=True,
         description="Take the travel back out of the keys before writing. Tick this "
@@ -445,6 +489,23 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             row = box.split(factor=SPLIT)
             row.label(text="Unmatched")
             row.prop(self, "add_new", text="Add the rest as new")
+            row = box.split(factor=SPLIT)
+            row.label(text="Delete")
+            row.prop(self, "drop", text="")
+            if self.drop != NONE:
+                takes = _drop_takes(self, context, base)
+                if takes is None:
+                    box.label(text="    %s is not an animation of this file" % self.drop,
+                              icon="ERROR")
+                elif takes:
+                    box.label(text="    and the %d sequence%s that play%s only it: %s"
+                              % (len(takes), "" if len(takes) == 1 else "s",
+                                 "s" if len(takes) == 1 else "", ", ".join(takes[:3]))
+                              + ("" if len(takes) <= 3 else " and %d more"
+                                 % (len(takes) - 3)), icon="TRASH")
+                else:
+                    box.label(text="    no sequence plays it, so none goes with it",
+                              icon="TRASH")
             if self.target == ALL:
                 hits, unwritten = _matches(self, context)
                 _pair(box, "matched", "%d of %d" % (len(hits), len(_base_anims(base))),
@@ -546,10 +607,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 actions = {blender_export.resolve_target(
                     m, act, "" if self.target == ACTIVE else self.target): act}
                 adds = [a for a in adds if a is not act]
+            # Writing an animation and removing it in the same pass is contradictory, and
+            # appending its action back is worse: the delete runs last and would leave the
+            # file holding a fresh copy of what was asked to go.
+            gone = "" if self.drop == NONE else self.drop
+            if gone:
+                names = [a.name for a in m.anims]
+                if gone in names:
+                    actions.pop(names.index(gone), None)
+                adds = [a for a in adds if a.name != gone]
             r = blender_export.export_actions(
                 context, obj, src, self.filepath, actions,
                 keep_travel=self.keep_travel, travel=self.travel,
-                mesh_fields=_mesh_fields(self), add=adds,
+                mesh_fields=_mesh_fields(self), add=adds, drop=gone,
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
         except mdl_build.Refused as exc:
@@ -608,6 +678,21 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "Export them together to re-encode."
                         % (r["scene"]["bones"], "" if r["scene"]["bones"] == 1 else "s",
                            r["scene"]["stale"], "" if r["scene"]["stale"] == 1 else "s"))
+        gone = r["dropped"]
+        if gone["anim"]:
+            # apply_sequences matches the stash to the file by position and refuses one
+            # claiming more sequences than are there, so a delete that took sequences
+            # makes every later export fail until this is written again.
+            if gone["seqs"]:
+                obj["vtmb_sequences"] = blender_import.sequence_stash(
+                    mdl.Mdl(self.filepath))
+            self.report({"WARNING"}, "removed animation %s%s. Its action is still in the "
+                                     "blend and will be offered as an append"
+                        % (gone["anim"],
+                           "" if not gone["seqs"] else
+                           " and the %d sequence%s that played only it"
+                           % (len(gone["seqs"]),
+                              "" if len(gone["seqs"]) == 1 else "s")))
         # The stamp is what makes the next export replace this animation rather than
         # append it a second time. `vtmb_source` is left alone when the action already
         # has one: the name match comes first anyway, and repointing it would move the

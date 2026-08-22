@@ -188,13 +188,23 @@ def build_armature(context, m, name, scale):
     arm_obj["vtmb_includes"] = list(m.includes)
     # Per-model and not per-material, so nothing else in the scene can carry it back out.
     arm_obj["vtmb_cdtexture"] = list(m.material_paths)
-    arm_obj["vtmb_sequences"] = [
-        {"label": s.label, "activity": s.activity,
-         "groupsize": list(s.groupsize),
-         "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
-                     for i in col] for col in s.blends]}
-        for s in m.seqs]
+    arm_obj["vtmb_sequences"] = sequence_stash(m)
     return arm_obj
+
+
+def sequence_stash(m):
+    """`arm["vtmb_sequences"]` for a file: label, activity, group size and the blend grid.
+
+    Blends are stored as animation names because an index means nothing once the file is
+    re-emitted. Matched back by position, so anything that changes how many sequences the
+    file has has to write this again -- `apply_sequences` refuses a stash claiming more
+    sequences than are there.
+    """
+    return [{"label": s.label, "activity": s.activity,
+             "groupsize": list(s.groupsize),
+             "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
+                         for i in col] for col in s.blends]}
+            for s in m.seqs]
 
 
 def missing_paths(content, includes=(), cdtextures=(), material_names=()):

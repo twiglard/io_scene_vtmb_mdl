@@ -666,7 +666,7 @@ def revise_vtx(source, dest, data, revised):
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, keep_travel=True,
-                   travel="keep", mesh_fields=(), verify=True, add=()):
+                   travel="keep", mesh_fields=(), verify=True, add=(), drop=""):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -674,6 +674,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     so one with none is dead weight. Appending renumbers nothing, every stored index
     pointing below the insertion point, and `emit` requantises the animations already in
     the file when the new pose widens the file-wide `mstudiobone_t` scales.
+
+    `drop` is one animation of the file, by name, to remove. It is taken last, so every
+    index above is one the caller stated against the file as it was; removing it takes the
+    sequences it leaves with nothing to play, which is why the caller has to restamp
+    `arm_obj["vtmb_sequences"]` from what came back.
 
     The file is always rebuilt from its own decoded records -- every count from a `len()`,
     every offset from where its target landed -- so an empty map is meaningful and re-emits
@@ -772,6 +777,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                                int(action.get("vtmb_seq_flags") or 0))
         added.append((i, action.name, nframes, len(movements)))
 
+    dropped = {"anim": "", "seqs": []}
+    if drop:
+        names = [r.name for r in d.anims]
+        if drop not in names:
+            raise ValueError("%s has no animation %r to remove"
+                             % (os.path.basename(source), drop))
+        seqs, _left = build_mod.remove_animation(d, names.index(drop))
+        dropped = {"anim": drop, "seqs": seqs}
+
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
             "unskinned": 0, "renumbered": 0}
@@ -805,8 +819,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     vtx = revise_vtx(source, dest, data, revised) if revised else None
     with open(dest, "wb") as f:
         f.write(data)
-    return {"wrote": wrote, "added": added, "bones": len(m.bones), "mesh": mesh,
-            "scene": scene, "bytes": len(data), "was": len(m.d), "anims": len(m.anims),
+    return {"wrote": wrote, "added": added, "dropped": dropped, "bones": len(m.bones),
+            "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
+            "anims": len(m.anims), "sequences": len(d.seqs),
             "vtx": vtx, "stale": stale_flavours(dest) if revised else []}
 
 

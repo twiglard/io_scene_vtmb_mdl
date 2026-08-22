@@ -1492,3 +1492,49 @@ def add_sequence(d, label, anim, activity=None, flags=0):
                        "knockbacks": [], "dodge": None, "block": None,
                        "seq2e8": None, "seq2ec": None}))
     return len(d.seqs) - 1
+
+
+def remove_animation(d, i):
+    """Drop animation `i` and every sequence left with nothing to play.
+
+    A sequence's blend grid is the only thing in the file that names an animation, so a
+    delete costs that table and whatever the sequences it empties are themselves named by:
+    autolayers are sequence indices and renumber behind them. A grid citing the dropped
+    animation *beside* others is refused -- one corner of a blend needs a replacement this
+    cannot invent -- and so is the last animation of a sequence group the file still has to
+    have. Every count is a `len()` at emit, so nothing else moves.
+
+    Returns (removed sequence indices, remaining animation count).
+    """
+    if not 0 <= i < len(d.anims):
+        raise Refused("no animation %d to remove: the file has %d" % (i, len(d.anims)))
+    name = d.anims[i].name
+    doomed = []
+    for k, r in enumerate(d.seqs):
+        cites = _seq_anims(r.raw)
+        if i not in cites:
+            continue
+        others = sorted(set(cites) - {i})
+        if others:
+            raise Refused("sequence %r blends animation %r with %d other%s, so removing it "
+                          "would leave a hole in the blend grid"
+                          % (r.name, name, len(others), "" if len(others) == 1 else "s"))
+        doomed.append(k)
+    gone = set(doomed)
+
+    for k in reversed(doomed):
+        del d.seqs[k]
+    for r in d.seqs:
+        gx, gy = struct.unpack_from("<2i", r.raw, 0x23c)
+        for x in range(max(1, gx)):
+            for y in range(max(1, gy)):
+                at = 0x38 + x * 0x20 + y * 2
+                a = struct.unpack_from("<h", r.raw, at)[0]
+                if a > i:
+                    struct.pack_into("<h", r.raw, at, a - 1)
+        al = r.extra.get("autolayers") or []
+        if al:
+            r.extra["autolayers"] = [x - sum(1 for g in gone if g < x)
+                                     for x in al if x not in gone]
+    del d.anims[i]
+    return doomed, len(d.anims)
