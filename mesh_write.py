@@ -19,16 +19,19 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import mdl as M
+    import normal_table as NT
 else:
     from . import mdl as M
+    from . import normal_table as NT
 
 FIELDS = ("positions", "normals", "uvs", "weights")
 
-# Which fields the record can carry at all. filetype 1 and 2 store a normal *index* into
-# a table this code does not parse, so a normal cannot be written for them.
+# Which fields the record can carry at all. filetype 1 and 2 carry no weight or bone field
+# at all -- those models are rigid by construction -- but their normal is an index into one
+# of StudioRender's two tables and `normal_table` resolves both, to 2.0 and 10.5 degrees.
 BY_FILETYPE = {0: ("positions", "normals", "uvs", "weights"),
-               1: ("positions", "uvs"),
-               2: ("positions", "uvs")}
+               1: ("positions", "normals", "uvs"),
+               2: ("positions", "normals", "uvs")}
 
 
 def supported(filetype, fields):
@@ -99,6 +102,16 @@ def _encode(data, model, verts, fields, base):
                                               model.quant_scale[c], norm)))
                      for c in range(3)]
                 struct.pack_into("<3H" if model.filetype == 1 else "<3B", data, o, *q)
+            if "normals" in fields and v.normal is not None:
+                # An index, not a vector: the nearest entry of the table the engine reads,
+                # which is 2.0 degrees for filetype 1 and 10.5 for filetype 2. An entry
+                # already in the table comes back as itself, so an unedited normal is
+                # written with the bytes it was read with.
+                raw = NT.encode(model.filetype, v.normal)
+                if model.filetype == 1:
+                    struct.pack_into("<H", data, o + 6, raw)
+                else:
+                    data[o + 3] = raw
             if "uvs" in fields and v.uv is not None:
                 uv = [max(0, min(65535, int(round(x * 65535.0)))) for x in v.uv]
                 struct.pack_into("<2H", data,

@@ -457,14 +457,15 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         att.data.foreach_set("vector",
                              [c for v_ in verts for c in (v_.uv[0], 1.0 - v_.uv[1])])
 
+        # Every filetype carries a normal: 0 stores the vector, 1 and 2 an index into one
+        # of StudioRender's two tables, which `normal_table` resolves.
+        me.normals_split_custom_set_from_vertices([v_.normal for v_ in verts])
+        # Custom split normals are stored as two 16-bit angles and come back off by
+        # up to 9.2e-03, so the exporter needs the exact ones to write back.
+        att = me.attributes.new("vtmb_normal", "FLOAT_VECTOR", "POINT")
+        att.data.foreach_set("vector", [c for v_ in verts for c in v_.normal])
+
         if model.filetype == 0:
-            me.normals_split_custom_set_from_vertices(
-                [v_.normal for v_ in verts])
-            # Custom split normals are stored as two 16-bit angles and come back off by
-            # up to 9.2e-03, so the exporter needs the exact ones to write back.
-            att = me.attributes.new("vtmb_normal", "FLOAT_VECTOR", "POINT")
-            att.data.foreach_set("vector",
-                                 [c for v_ in verts for c in v_.normal])
             # Slot order is neither by weight nor by bone -- it is whatever studiomdl read
             # out of the SMD -- so vertex groups alone cannot reproduce it.
             att = me.attributes.new("vtmb_skin", "FLOAT_COLOR", "POINT")

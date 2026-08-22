@@ -16,16 +16,19 @@ denominator per check rather than one file count for all four.
 import collections
 import math
 import os
+import struct
 import sys
 
 if __package__ in (None, ""):
-    # Import the two format modules directly rather than through the package, whose
+    # Import the format modules directly rather than through the package, whose
     # __init__ is the addon entry point and pulls in bpy.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import mdl as mdl_mod
+    import normal_table as NT
     import vtx as vtx_mod
 else:
     from . import mdl as mdl_mod
+    from . import normal_table as NT
     from . import vtx as vtx_mod
 
 CHECKS = ("rest", "quats", "vertices", "geometry", "includes")
@@ -154,13 +157,24 @@ def check_vertices(m, verbose=True):
                 out = [v for v in vs
                        if any(not rng[c][0] - slack[c] <= v.pos[c] <= rng[c][1] + slack[c]
                               for c in range(3))]
-                n += len(vs)
+                # The normal is an index into a table with no count and no bounds check in
+                # the binary, so what grades the field's offset and stride is that every
+                # stored value lands inside it. A weight there is not: neither quantised
+                # record has a weight or bone field, so those models are rigid.
+                stride = mdl_mod.VERTEX_STRIDE[model.filetype]
+                nbad = 0
+                for i in range(model.numvertices):
+                    o = model.vertexbase + i * stride
+                    raw = (struct.unpack_from("<H", m.d, o + 6)[0]
+                           if model.filetype == 1 else m.d[o + 3])
+                    nbad += NT.decode(model.filetype, raw) is None
+                n += len(vs) * 2
                 if verbose:
                     print("  %d verts %r filetype=%d: %d outside the quantisation range "
-                          "%s; normals and weights are not in the file"
+                          "%s, %d normals outside the table; no weight is in the file"
                           % (len(vs), model.name, model.filetype, len(out),
-                             " ".join("%.3f..%.3f" % (a, b) for a, b in rng)))
-                ok &= not out
+                             " ".join("%.3f..%.3f" % (a, b) for a, b in rng), nbad))
+                ok &= not out and not nbad
                 continue
             lens = [math.sqrt(sum(x * x for x in v.normal)) for v in vs]
             # A handful of degenerate verts carry a null normal; only a normal that is
@@ -178,7 +192,7 @@ def check_vertices(m, verbose=True):
                       % (len(vs), model.name, worst_n, null_n, off_w, len(bad)))
             ok &= worst_n < 1e-3 and off_w <= max(8, len(vs) // 10) and not bad
     if not n:
-        why = ("filetype %s carries no normal or weight"
+        why = ("filetype %s carries no vertex to grade"
                % sorted(ftypes) if ftypes else "no model with vertices")
         if verbose:
             print("  normals and weights : NOT MEASURED, %s" % why)

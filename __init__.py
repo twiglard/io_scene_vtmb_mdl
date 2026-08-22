@@ -21,7 +21,8 @@ bl_info = {
     "category": "Import-Export",
 }
 
-from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write, paths,
+from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write,
+               normal_table, paths,
                relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write, bone_templates,
                blender_import, blender_export, blender_scratch, blender_templates,
                blender_panel)
@@ -639,8 +640,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         % (len(mesh["missing"]), "" if len(mesh["missing"]) == 1 else "s",
                            os.path.basename(src), ", ".join(mesh["missing"][:4])))
         if mesh["normals"]:
-            self.report({"WARNING"}, "%d normals came from Blender rather than the file, "
-                                     "which costs up to 0.9 degrees each"
+            self.report({"WARNING"}, "%d normals came from Blender rather than the file: "
+                                     "up to 0.9 degrees on a filetype-0 model, and 2.0 or "
+                                     "10.5 on a quantised one, whose normal is an index "
+                                     "into a table the renderer holds"
                         % mesh["normals"])
         if mesh["unsupported"]:
             self.report({"WARNING"}, "%s cannot be stored by every model of this file and "
@@ -1061,8 +1064,9 @@ def register():
     # other module survives a disable/enable cycle as stale code.
     # Dependency order: a module has to be reloaded before anything that imports it, or the
     # importer keeps the old object and the reload buys nothing.
-    for m in (checksum, sections, relocs, mdl, mdl_write, mdl_build, mdl_rebuild,
-              mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild, bone_templates,
+    for m in (checksum, sections, relocs, normal_table, mdl, mdl_write, mdl_build,
+              mdl_rebuild, mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild,
+              bone_templates,
               blender_import, blender_export, blender_scratch, blender_templates,
               blender_panel):
         importlib.reload(m)

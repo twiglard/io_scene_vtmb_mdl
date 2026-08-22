@@ -199,8 +199,8 @@ def wound(corners):
     Blender winds a triangle with its outward normal and the format winds it against, so
     the conversion is unconditional in both directions -- `blender_import` reverses on the
     way in and this reverses on the way out, and a round trip writes the file's own order
-    back. Nothing here reads a normal to decide it: a normal cannot say which side is out
-    on a mesh that stores none, which is every filetype 1 and 2 donor.
+    back. Nothing here reads a normal to decide it: the winding is the format's own
+    convention and holds whether or not a mesh has a normal to compare against.
     """
     return tuple(reversed(corners))
 
@@ -241,8 +241,8 @@ def split_mesh(obj, bone_index, scale=1.0):
 
     why = []
     if stash is None:
-        why.append("nothing stashed the file's own normals on this mesh, which is every "
-                   "filetype 1 and 2 model")
+        why.append("nothing stashed the file's own normals on this mesh -- it was "
+                   "built by hand, or imported before every filetype carried one")
     elif uvs is None:
         why.append("nothing stashed the file's own UVs on this mesh")
     else:

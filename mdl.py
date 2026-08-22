@@ -6,7 +6,15 @@ evidence is in plans/todo-ghidra-vtmb-recon.md sections 19 and 21.
 """
 
 import math
+import os
 import struct
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import normal_table as NT
+else:
+    from . import normal_table as NT
 
 MAGIC = b"IDST"
 VERSION = 2531
@@ -449,7 +457,12 @@ class Mdl:
                 nrm = QUANT_NORM[model.filetype]
                 v.pos = tuple(model.quant_offset[c] + q[c] * nrm * model.quant_scale[c]
                               for c in range(3))
-                v.normal = (0.0, 0.0, 1.0)
+                # An index into one of StudioRender's two tables, not a vector. Out of
+                # range is a file this will not invent a normal for, and (0,0,1) is what
+                # every one of these read before the tables were known.
+                raw = (struct.unpack_from("<H", d, o + 6)[0]
+                       if model.filetype == 1 else d[o + 3])
+                v.normal = NT.decode(model.filetype, raw) or (0.0, 0.0, 1.0)
                 uv = struct.unpack_from("<2H", d, o + 8) if model.filetype == 1 \
                     else struct.unpack_from("<2H", d, o + 4)
                 v.uv = (uv[0] / 65535.0, uv[1] / 65535.0)
