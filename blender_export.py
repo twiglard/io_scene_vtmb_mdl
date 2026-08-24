@@ -49,7 +49,7 @@ def _rows(mat, scale):
     return [[mat[i][0], mat[i][1], mat[i][2], mat[i][3] / scale] for i in range(3)]
 
 
-def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion=False):
+def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False):
     """Local (pos, quat) per bone per frame, inverting everything the importer applied.
 
     `pose.bones[].matrix` is object space, and the importer's rest_local_inv and
@@ -66,7 +66,7 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion=False)
     for f in frames:
         scene.frame_set(f)
         world = [_rows(pb.matrix, scale) for pb in pbs]
-        if root_motion and anim is not None and anim.movements:
+        if root_motion_in_keys and anim is not None and anim.movements:
             off = mdl_mod.mat_inverse(mdl_mod.root_motion_matrix(anim, f))
             world = [mdl_mod.mat_mul(off, w) for w in world]
         out.append(write_mod.local_from_world(m, world))
@@ -688,8 +688,8 @@ def revise_vtx(source, dest, data, revised):
 
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
-                   frame_start=None, frame_end=None, fps=None, keep_travel=True,
-                   travel="keep", mesh_fields=(), verify=True, add=(), drop=""):
+                   frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
+                   root_motion="keep", mesh_fields=(), verify=True, add=(), drop=""):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -735,15 +735,16 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             if not frames:
                 raise ValueError("%s: empty frame range" % action.name)
 
-            # "extract" wants the travel still in the poses, so root motion is only taken
-            # back out when the donor's own blocks are the ones being kept.
+            # "extract" wants the motion still in the poses, so it is only taken back out
+            # when the donor's own blocks are the ones being kept.
             poses = read_poses(context, arm_obj, m, frames, scale, anim,
-                               root_motion=(travel == "keep" and keep_travel
-                                            and bool(action.get("vtmb_root_motion"))))
+                               root_motion_in_keys=(root_motion == "keep"
+                                                    and root_motion_in_keys
+                                                    and bool(action.get("vtmb_root_motion"))))
             movements = None
-            if travel == "extract":
-                movements, poses = write_mod.extract_travel(m, poses)
-            elif travel == "none":
+            if root_motion == "extract":
+                movements, poses = write_mod.extract_root_motion(m, poses)
+            elif root_motion == "none":
                 movements = []
             edits[index] = {"poses": poses, "movements": movements,
                             "fps": fps if fps else action.get("vtmb_fps"),
@@ -760,13 +761,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             frames = list(range(a, b + 1))
             if not frames:
                 raise ValueError("%s: empty frame range" % action.name)
-            # No donor animation behind this one, so there is no travel to take back out
-            # and nothing for "keep" to keep: an appended animation either has the blocks
-            # fitted here or has none.
+            # No donor animation behind this one, so there is no root motion to take back
+            # out and nothing for "keep" to keep: an appended animation either has the
+            # blocks fitted here or has none.
             poses = read_poses(context, arm_obj, m, frames, scale)
             movements = ()
-            if travel == "extract":
-                movements, poses = write_mod.extract_travel(m, poses)
+            if root_motion == "extract":
+                movements, poses = write_mod.extract_root_motion(m, poses)
             pending.append((action, poses, tuple(movements), len(frames)))
     finally:
         if ad is not None and ad.action is not restore:

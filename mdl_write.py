@@ -254,7 +254,7 @@ def fit_movements(path, eps=1e-4):
     """The straight ground-plane ramp behind one `mstudiomovement_t`, and the per-frame
     displacement it accounts for.
 
-    studiomdl extracts the *net* travel, never the path: one block along the frame-0 to
+    studiomdl extracts the *net* motion, never the path: one block along the frame-0 to
     last-frame displacement, its speed ramping as `d(t) = v0 t + (v1 - v0) t^2 / 2` over
     normalised time, which is exactly what `anim_position` integrates back
     (`utils/studiomdl/simplify.cpp:315`, `extractLinearMotion`). `v0` and `v1` come from
@@ -273,7 +273,7 @@ def fit_movements(path, eps=1e-4):
     the chord becomes entity motion. Troika splits a turning walk into a block per span,
     which this does not.
 
-    Returns `([], [])` when the ground-plane travel is under `eps`.
+    Returns `([], [])` when the ground-plane displacement is under `eps`.
     """
     n = len(path) - 1
     if n < 1:
@@ -309,14 +309,14 @@ def fit_movements(path, eps=1e-4):
     return [mv], ramp
 
 
-def extract_travel(m, poses):
-    """Move the root bone's net ground-plane travel out of the poses and into one movement
+def extract_root_motion(m, poses):
+    """Move the root bone's net ground-plane motion out of the poses and into one movement
     block, subtracting only the ramp `fit_movements` fitted.
 
     Whatever the ramp does not account for stays in the keys: andrei's `run_0` keeps its
     21 units of rise and 6.7 of fore-aft sway on the root while the block carries the 93.5
     forward, so the bound is still in the animation. Pinning the root instead takes the
-    bound out with the travel and the character runs flat.
+    bound out with the motion and the character runs flat.
 
     Sound only because `angle` is 0: the engine applies anim_position as a pure translation
     of every world matrix, and translating the root of a hierarchy translates all of it, so

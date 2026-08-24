@@ -1296,7 +1296,7 @@ def add_animation(d, name, poses, fps=30.0, flags=0, movements=()):
 
     `movements` is `mstudiomovement_t` records, which the engine applies to the entity
     rather than to the skeleton.  Empty means the animation plays where it stands: leave
-    travel in the poses instead and the skeleton itself walks away from the origin, and
+    the motion in the poses instead and the skeleton itself walks away from the origin, and
     snaps back when the sequence loops.
     """
     raw = bytearray(72)
@@ -1424,7 +1424,7 @@ def _anim_boxes(d, carried):
     """{animation index: (min, max)} over every frame, for the animations still holding
     their poses. Root motion is not applied: `movements` carries the model away from the
     origin and the engine offsets the whole entity, so a sequence box that already included
-    the travel would be counted twice."""
+    that offset would be counted twice."""
     m = _skeleton(d)
     out = {}
     for i, r in enumerate(d.anims):

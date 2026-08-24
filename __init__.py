@@ -300,7 +300,7 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
                     "this file's own tree")
     root_motion: bpy.props.BoolProperty(
         name="Root motion", default=True,
-        description="Put back the travel studiomdl took out of the animation and left in "
+        description="Put back the motion studiomdl took out of the animation and left in "
                     "mstudiomovement_t, so a walk cycle crosses the scene instead of "
                     "marching in place. Off gives the bone data exactly as stored")
     anim_filter: bpy.props.StringProperty(
@@ -393,28 +393,29 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "alongside others is refused rather than left with a hole. The action "
                     "stays in the blend; delete that too if you do not want it appended "
                     "back")
-    keep_travel: bpy.props.BoolProperty(
+    root_motion_in_keys: bpy.props.BoolProperty(
         name="Imported with root motion", default=True,
-        description="This action's keys still carry the travel an import put into them, "
+        description="This action's keys still carry the motion an import put into them, "
                     "so it has to come back out before writing. Untick only for an "
                     "action imported with Root motion off. Leaving it ticked wrongly "
-                    "writes the travel a second time on top of what the file already "
+                    "writes the motion a second time on top of what the file already "
                     "stores and the animation covers twice the ground. Not the same as "
                     "the mode below: this is about the keys in the scene, that is about "
                     "the movement blocks in the file")
-    travel: bpy.props.EnumProperty(
+    root_motion: bpy.props.EnumProperty(
         name="Root motion",
         items=[("keep", "Engine carries the character, as the file has it",
                 "Reuse the movement blocks the file already has, unchanged. Right "
                 "whenever you did not move the animation, only changed how it looks. "
                 "This is about the file's blocks; whether the keys in the scene still "
-                "carry travel is the checkbox above, and the two are set separately"),
+                "carry root motion is the checkbox above, and the two are set "
+                "separately"),
                ("extract", "Engine carries the character",
                 "Fit new movement blocks to the root bone's path in the scene, "
                 "replacing whatever the file had. Use this when you changed where the "
                 "animation goes, not just how it looks"),
                ("none", "Skeleton moves, engine does not",
-                "Write no movement blocks. The travel stays in the keys, so the skeleton "
+                "Write no movement blocks. The motion stays in the keys, so the skeleton "
                 "itself walks away from the origin and snaps back when the sequence "
                 "loops, and the engine never advances the character")],
         default="keep")
@@ -553,10 +554,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     box.prop(self, "use_range")
 
         if self.target != NONE:
-            box = _section(lay, "vtmb_travel", "Root motion", icon="ORIENTATION_GIMBAL")
+            box = _section(lay, "vtmb_rootmotion", "Root motion",
+                           icon="ORIENTATION_GIMBAL")
             if box is not None:
-                box.prop(self, "keep_travel")
-                box.prop(self, "travel", text="")
+                box.prop(self, "root_motion_in_keys")
+                box.prop(self, "root_motion", text="")
 
         nverts = _mesh_verts(base)
         fields = _mesh_fields(self)
@@ -624,7 +626,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 adds = [a for a in adds if a.name != gone]
             r = blender_export.export_actions(
                 context, obj, src, self.filepath, actions,
-                keep_travel=self.keep_travel, travel=self.travel,
+                root_motion_in_keys=self.root_motion_in_keys,
+                root_motion=self.root_motion,
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
@@ -852,7 +855,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         name="Scene range", default=False,
         description="Sample the scene's Start and End frames rather than each action's "
                     "own first and last keyframe")
-    travel: bpy.props.EnumProperty(
+    root_motion: bpy.props.EnumProperty(
         name="Root motion",
         items=[("extract", "Engine carries the character",
                 "Put the ground distance the root covers into a movement block, so the "
@@ -860,7 +863,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 "The bob and sway stay in the keys. This is what a walk cycle wants, "
                 "and what an import with Root motion on needs putting back"),
                ("none", "Skeleton moves, engine does not",
-                "Write no movement blocks. The skeleton itself travels and snaps back "
+                "Write no movement blocks. The skeleton itself moves and snaps back "
                 "when the sequence loops, which is right only for something that really "
                 "does move in place")],
         default="extract")
@@ -953,7 +956,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             box.prop(self, "activity")
             row = box.row()
             row.label(text="Root motion")
-            row.prop(self, "travel", text="")
+            row.prop(self, "root_motion", text="")
             box.prop(self, "chain")
             chain = blender_scratch.scene_includes(obj)
             if not chain:
@@ -991,7 +994,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
                 scale=self.scale, surfaceprop=self.surfaceprop,
                 cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
-                activity=self.activity, hitboxes=self.fit_hitboxes, travel=self.travel,
+                activity=self.activity, hitboxes=self.fit_hitboxes,
+                root_motion=self.root_motion,
                 includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
         except (blender_scratch.Refused, mdl_build.Refused) as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
@@ -1028,11 +1032,11 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "%d %s resolve against nothing and will not draw: %s"
                         % (len(bad), kind, ", ".join(bad[:4])))
         self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
-                              "%d materials, %d animations (%d travelling), "
+                              "%d materials, %d animations (%d with root motion), "
                               "%d sequences, %d chained, %d hitboxes, %d faces, "
                               "%d verts, %d + %d bytes"
                     % (os.path.basename(self.filepath), r["bones"], r["bodyparts"],
-                       r["materials"], r["anims"], r["travelling"], r["seqs"],
+                       r["materials"], r["anims"], r["with_root_motion"], r["seqs"],
                        r["includes"], r["hitboxes"], r["faces"], r["verts"], r["bytes"],
                        r["vtx_bytes"]))
         return {"FINISHED"}

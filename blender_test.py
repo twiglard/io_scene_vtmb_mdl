@@ -53,7 +53,7 @@ def worst_pose_error(mod, arm, m, anim, frames, src=None, root_motion=True):
     dg = bpy.context.evaluated_depsgraph_get()
     remap = None if src is None or src is m else m.bone_remap(src)
     src = src or m
-    travel = root_motion and bool(anim.movements)
+    in_keys = root_motion and bool(anim.movements)
     worst_rot, worst_pos, at, worst_excess, n = 0.0, 0.0, None, float("-inf"), 0
     for frame in frames:
         bpy.context.scene.frame_set(frame)
@@ -61,7 +61,7 @@ def worst_pose_error(mod, arm, m, anim, frames, src=None, root_motion=True):
         local = src.local_pose(anim, frame) if remap is None \
             else m.retarget_pose(src, anim, frame, remap)
         world = m.world_matrices(local)
-        if travel:
+        if in_keys:
             off = mod.mdl.root_motion_matrix(anim, frame)
             world = [mod.mdl.mat_mul(off, w) for w in world]
         for b in m.bones:
@@ -148,13 +148,14 @@ def check_export(mod, arm, m, anim, path):
 
 
 def check_root_motion(mod, path, m):
-    """Re-import one travelling animation on its own. The offset reaches Blender only
-    through the keys, so nothing short of a posed armature says whether it got there."""
+    """Re-import one animation that carries root motion, on its own. The offset reaches
+    Blender only through the keys, so nothing short of a posed armature says whether it
+    got there."""
     moving = [a for a in m.anims if a.movements]
     print("  animations with movement blocks: %d/%d" % (len(moving), len(m.anims)))
     if not moving:
         return True
-    # Prefer one that turns: any travelling animation covers the translation, but only a
+    # Prefer one that turns: any moving animation covers the translation, but only a
     # nonzero yaw reaches root_motion_matrix's rotation, and 21 of 11052 carry one.
     pick = max(moving, key=lambda a: max(abs(mv.angle) for mv in a.movements))
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -177,7 +178,7 @@ def check_root_motion(mod, path, m):
             break
     last = max(0, a.numframes - 1)
     pos, yaw = mod.mdl.anim_position(a, last)
-    print("  %r: %d frames, travel %.3f units, yaw %.2f deg"
+    print("  %r: %d frames, root motion %.3f units, yaw %.2f deg"
           % (a.name, a.numframes, mathutils.Vector(pos).length, yaw))
     frames = sorted({0, last // 2, last})
     wr, wp, at, ex = worst_pose_error(mod, arm, m, a, frames)
@@ -187,7 +188,7 @@ def check_root_motion(mod, path, m):
     print("  with the offset left out:  rotation %.7f, translation %.7f units"
           % (wr0, wp0))
     # Without that second number the first passes just as well on an animation that
-    # happens not to travel, which would test nothing.
+    # happens not to move, which would test nothing.
     return wr < ROT_TOL and ex <= 0.0 and wp0 > 1.0
 
 

@@ -462,9 +462,9 @@ def _ordered(actions):
 
 
 def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
-                activity="ACT_IDLE", travel="extract"):
-    """`travel` is what becomes of the root bone's path. "extract" takes its net ground
-    travel into one `mstudiomovement_t` and leaves the rest -- the cycle's own sway and
+                activity="ACT_IDLE", root_motion="extract"):
+    """`root_motion` is what becomes of the root bone's path. "extract" takes its net
+    ground displacement into one `mstudiomovement_t` and leaves the rest -- the sway and
     rise -- in the keys, which is how a walk cycle is stored: the engine carries the
     entity, the skeleton stays put and still bobs. "none" leaves the whole path in the
     poses, which is right only for an animation that really does translate in model
@@ -475,8 +475,8 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
         if not poses:
             raise Refused("action %r has no frames" % act.name)
         movements = ()
-        if travel == "extract":
-            movements, poses = write_mod.extract_travel(build_mod._skeleton(d), poses)
+        if root_motion == "extract":
+            movements, poses = write_mod.extract_root_motion(build_mod._skeleton(d), poses)
             moved += bool(movements)
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
@@ -507,7 +507,7 @@ def scene_includes(arm_obj):
 
 def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="flesh",
           cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE",
-          hitboxes=False, travel="extract", includes=()):
+          hitboxes=False, root_motion="extract", includes=()):
     """(Desc, faces) for the scene. `hull` is (min, max) and stays the caller's:
     @180/@192 are the movement hull the .qc's $hbox sets, not the mesh's bounds."""
     d = build_mod.new(name, surfaceprop)
@@ -524,7 +524,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
     _n, moved = add_actions(context, arm_obj, d, actions, scale, use_range, activity,
-                            travel)
+                            root_motion)
     return d, faces, unskinned, kept, moved, crowded
 
 
@@ -584,7 +584,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
         context, arm_obj, mesh_objs, actions, embedded_name(path), **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
-            "travelling": moved,
+            "with_root_motion": moved,
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),
             "anims": len(d.anims), "seqs": len(d.seqs),
             "includes": len(d.includes),

@@ -602,7 +602,7 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
         _bind_slot(arm_obj, action)
         new_curve = _curve_factory(action, arm_obj)
         remap = None if src is m else m.bone_remap(src)
-        travel = root_motion and bool(a.movements)
+        in_keys = root_motion and bool(a.movements)
         nframes = max(1, a.numframes)
         # keyframe_points.co is (frame, value) interleaved and the frame column is the
         # same for every curve, so it is stamped once and the rest are slice copies.
@@ -614,7 +614,7 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
             local = src.local_pose(a, frame) if remap is None \
                 else m.retarget_pose(src, a, frame, remap)
             world = m.world_matrices(local)
-            if travel:
+            if in_keys:
                 off = mdl_mod.root_motion_matrix(a, frame)
                 world = [mdl_mod.mat_mul(off, w) for w in world]
             world = [_scaled(w, scale) for w in world]
@@ -651,9 +651,9 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
         action["vtmb_numframes"] = a.numframes
         action["vtmb_source"] = src.path
         action["vtmb_anim_index"] = a.index
-        # An exporter has to take the travel back out of the keys, so record whether it
-        # was ever put in -- a.movements alone does not say.
-        action["vtmb_root_motion"] = travel
+        # An exporter has to take the root motion back out of the keys, so record whether
+        # it was ever put in -- a.movements alone does not say.
+        action["vtmb_root_motion"] = in_keys
         action["vtmb_movements"] = len(a.movements)
         made.append(action)
     # Leave the first action assigned and slotted. Blender 4.4+ actions hold channels
