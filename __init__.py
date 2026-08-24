@@ -394,22 +394,29 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "stays in the blend; delete that too if you do not want it appended "
                     "back")
     keep_travel: bpy.props.BoolProperty(
-        name="Was applied", default=True,
-        description="Take the travel back out of the keys before writing. Tick this "
-                    "whenever the model was imported with Root motion on, or the travel "
-                    "is written a second time on top of what the file already stores and "
-                    "the animation covers twice the ground")
+        name="Imported with root motion", default=True,
+        description="This action's keys still carry the travel an import put into them, "
+                    "so it has to come back out before writing. Untick only for an "
+                    "action imported with Root motion off. Leaving it ticked wrongly "
+                    "writes the travel a second time on top of what the file already "
+                    "stores and the animation covers twice the ground. Not the same as "
+                    "the mode below: this is about the keys in the scene, that is about "
+                    "the movement blocks in the file")
     travel: bpy.props.EnumProperty(
-        name="Travel",
-        items=[("keep", "Leave the file's alone",
-                "Keep the movement blocks the file already has. Right whenever the "
-                "animation still travels the way it did"),
-               ("extract", "Rebuild from the root bone",
-                "Fit new movement blocks to the root bone's path. Use this when you "
-                "changed where the animation goes, not just how it looks"),
-               ("none", "Strip it",
-                "Write no movement blocks. The animation plays on the spot and the "
-                "engine does not move the character")],
+        name="Root motion",
+        items=[("keep", "Engine carries the character, as the file has it",
+                "Reuse the movement blocks the file already has, unchanged. Right "
+                "whenever you did not move the animation, only changed how it looks. "
+                "This is about the file's blocks; whether the keys in the scene still "
+                "carry travel is the checkbox above, and the two are set separately"),
+               ("extract", "Engine carries the character",
+                "Fit new movement blocks to the root bone's path in the scene, "
+                "replacing whatever the file had. Use this when you changed where the "
+                "animation goes, not just how it looks"),
+               ("none", "Skeleton moves, engine does not",
+                "Write no movement blocks. The travel stays in the keys, so the skeleton "
+                "itself walks away from the origin and snaps back when the sequence "
+                "loops, and the engine never advances the character")],
         default="keep")
     use_range: bpy.props.BoolProperty(
         name="Scene range", default=False,
@@ -549,9 +556,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             box = _section(lay, "vtmb_travel", "Root motion", icon="ORIENTATION_GIMBAL")
             if box is not None:
                 box.prop(self, "keep_travel")
-                row = box.split(factor=SPLIT)
-                row.label(text="Travel")
-                row.prop(self, "travel", text="")
+                box.prop(self, "travel", text="")
 
         nverts = _mesh_verts(base)
         fields = _mesh_fields(self)
@@ -848,13 +853,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         description="Sample the scene's Start and End frames rather than each action's "
                     "own first and last keyframe")
     travel: bpy.props.EnumProperty(
-        name="Travel",
-        items=[("extract", "Move the character",
+        name="Root motion",
+        items=[("extract", "Engine carries the character",
                 "Put the ground distance the root covers into a movement block, so the "
                 "engine carries the character while the animation plays on the spot. "
                 "The bob and sway stay in the keys. This is what a walk cycle wants, "
                 "and what an import with Root motion on needs putting back"),
-               ("none", "Leave it in the keys",
+               ("none", "Skeleton moves, engine does not",
                 "Write no movement blocks. The skeleton itself travels and snaps back "
                 "when the sequence loops, which is right only for something that really "
                 "does move in place")],
@@ -947,7 +952,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             box.prop(self, "use_range")
             box.prop(self, "activity")
             row = box.row()
-            row.label(text="Travel")
+            row.label(text="Root motion")
             row.prop(self, "travel", text="")
             box.prop(self, "chain")
             chain = blender_scratch.scene_includes(obj)
