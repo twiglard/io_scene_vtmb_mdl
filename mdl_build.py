@@ -1608,6 +1608,15 @@ def add_animation(d, name, poses, fps=30.0, flags=0, movements=()):
     the motion in the poses instead and the skeleton itself walks away from the origin, and
     snaps back when the sequence loops.
     """
+    nb = len(d.bones)
+    for f, frame in enumerate(poses):
+        if len(frame) != nb:
+            raise Refused("animation %r frame %d carries %d pose%s against the file's %d "
+                          "bone%s; `quantise` indexes it per bone, so a short frame raises "
+                          "an IndexError naming nothing and a long one is dropped without "
+                          "a word"
+                          % (name, f, len(frame), "" if len(frame) == 1 else "s",
+                             nb, "" if nb == 1 else "s"))
     raw = bytearray(72)
     struct.pack_into("<f", raw, 0x04, fps)
     struct.pack_into("<i", raw, 0x08, flags)
