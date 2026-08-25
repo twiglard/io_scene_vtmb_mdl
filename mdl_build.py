@@ -169,6 +169,10 @@ class Desc(object):
         self.hitboxsets = []
         self.attachments = []
         self.includes = []
+        # `emit` re-sweeps every sequence box rather than only the zero ones. Off by
+        # default so a file read out of bytes keeps the boxes it shipped.
+        self.refit_boxes = False
+        self.refit_count = 0
         self.anims = []
         self.seqs = []
         self.seqgroups = []
@@ -556,7 +560,7 @@ def emit(d, checksum=None, drop=False):
                       % (over[0][1], over[0][2], MAXSTUDIOVERTS,
                          "" if len(counts) == 1 else
                          " (%s)" % ", ".join("%s %d" % (n, c) for _, n, c in counts)))
-    stamp_sequence_boxes(d)
+    d.refit_count = stamp_sequence_boxes(d, force=bool(d.refit_boxes))
     quantise(d)
     o = Out()
     nb = len(d.bones)
@@ -1415,6 +1419,18 @@ def _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was, new_n):
             ptb[j * 16:(j + 1) * 16] = old_tb[t:t + 16]
 
 
+def set_model_name(d, bi, mi, name):
+    """`mstudiomodel_t.name`, `char name[128]` inline at +0x00 of the 224-byte record.
+
+    Inline and not a string-table offset, so this moves nothing: the same class of edit as
+    `studiohdr_t.name`. 128 bytes is not a limit in practice -- the longest of the corpus's
+    4567 model names is 69.
+    """
+    r = d.bodyparts[bi].kids[mi]
+    b = name.encode("latin-1", "replace")[:127]
+    r.raw[0:128] = b + b"\x00" * (128 - len(b))
+
+
 def replace_model(d, bi, mi, meshes, keep_center=True):
     """Rewrite one existing model's geometry, keeping everything else its records carry.
 
@@ -1675,7 +1691,7 @@ def _seq_anims(raw):
             for x in range(max(1, gx)) for y in range(max(1, gy))]
 
 
-def stamp_sequence_boxes(d):
+def stamp_sequence_boxes(d, force=False):
     """`mstudioseqdesc_t.bbmin`/`bbmax` @+0x1c/+0x28 -- the volume the engine culls the
     model against, and zero there means it draws and then vanishes as soon as the camera
     turns. The union over the sequence's blend animations of the skinned vertex sweep over
@@ -1684,6 +1700,11 @@ def stamp_sequence_boxes(d):
     Only a sequence whose box is still zero and whose every cited animation still holds its
     poses: one read out of a file keeps the box that file shipped, and one whose animation
     is already encoded cannot be swept. Returns how many were stamped.
+
+    `force` takes the non-zero ones too, which is what a donor whose geometry moved needs
+    -- its boxes still describe where the vertices used to be. It still cannot reach a
+    sequence whose animations were not re-encoded this pass, since there are no poses to
+    sweep, so the count coming back is what a caller has to report against `len(d.seqs)`.
     """
     if not d.seqs or not any(r.extra.get("poses") for r in d.anims):
         return 0
@@ -1692,7 +1713,7 @@ def stamp_sequence_boxes(d):
         return 0
     n, first = 0, False
     for k, r in enumerate(d.seqs):
-        if any(struct.unpack_from("<6f", r.raw, 0x1c)):
+        if not force and any(struct.unpack_from("<6f", r.raw, 0x1c)):
             continue
         want = _seq_anims(r.raw)
         cited = [boxes[i] for i in want if i in boxes]
