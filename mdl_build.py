@@ -1050,6 +1050,12 @@ def _renumber_verts(mr, i):
     return moved, rigid
 
 
+def _model_label(bi, mi, mr):
+    """How to name a model in a message. Every model carrying a cloth volume has an empty
+    name, so the indices are the only thing that identifies one to the user."""
+    return ("model %r" % mr.name) if mr.name else ("model %d.%d" % (bi, mi))
+
+
 def remove_bone(d, i):
     """Drop bone `i` and renumber every index that named a bone above it.
 
@@ -1098,15 +1104,16 @@ def remove_bone(d, i):
                   if struct.unpack_from("<i", r.raw, 0x08)[0] == i]
         bound += ["mouth %d" % k for k, r in enumerate(d.mouths)
                   if struct.unpack_from("<i", r.raw, 0x00)[0] == i]
-        for bp in d.bodyparts:
-            for mr in bp.kids:
-                bound += ["eyeball %d of model %r" % (j, mr.name)
+        for bi, bp in enumerate(d.bodyparts):
+            for mi, mr in enumerate(bp.kids):
+                where = _model_label(bi, mi, mr)
+                bound += ["eyeball %d of %s" % (j, where)
                           for j, x in enumerate(mr.extra.get("eyes") or [])
                           if struct.unpack_from("<i", x.raw, 0x04)[0] == i]
                 for key, stride, fields in (("clothcollide", 36, (0x00, 0x04)),
                                             ("clothsphere", 20, (0x00,))):
                     buf = mr.extra.get(key) or b""
-                    bound += ["%s %d of model %r" % (key, j, mr.name)
+                    bound += ["%s %d of %s" % (key, j, where)
                               for j in range(len(buf) // stride) for f in fields
                               if struct.unpack_from("<i", buf, j * stride + f)[0] == i]
         if bound:
@@ -1173,17 +1180,17 @@ def remove_bone(d, i):
         r.extra["links"] = bytes(links)
 
     moved = rigid = 0
-    for bp in d.bodyparts:
-        for mr in bp.kids:
+    for bi, bp in enumerate(d.bodyparts):
+        for mi, mr in enumerate(bp.kids):
+            where = _model_label(bi, mi, mr)
             for j, x in enumerate(mr.extra.get("eyes") or []):
-                patch(x.raw, 0x04, "eyeball %d of model %r" % (j, mr.name))
+                patch(x.raw, 0x04, "eyeball %d of %s" % (j, where))
             for key, stride, fields in (("clothcollide", 36, (0x00, 0x04)),
                                         ("clothsphere", 20, (0x00,))):
                 buf = bytearray(mr.extra.get(key) or b"")
                 for j in range(len(buf) // stride):
                     for f in fields:
-                        patch(buf, j * stride + f, "%s %d of model %r"
-                              % (key, j, mr.name))
+                        patch(buf, j * stride + f, "%s %d of %s" % (key, j, where))
                 mr.extra[key] = bytes(buf)
             a, b = _renumber_verts(mr, i)
             moved += a
