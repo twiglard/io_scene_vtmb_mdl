@@ -766,6 +766,31 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name in r["stale"]:
             self.report({"WARNING"}, "%s beside the model still describes the old "
                                      "geometry; only .dx80.vtx is written" % name)
+        phy = r.get("phy")
+        if phy is not None:
+            if phy["missing"]:
+                self.report({"WARNING"},
+                            "no %s beside the file just written, and the donor had one. "
+                            "A model with no .phy is not hit by traces at all, which is "
+                            "worse than being hit at the wrong shape -- copy it across"
+                            % phy["file"])
+            # A rename or a delete is the only failure that is not merely geometric: the
+            # solid is looked up by name and an unmatched one is not created at all.
+            for a, b in phy["renamed"]:
+                self.report({"ERROR"},
+                            "%s names bone %r, which this export renames to %r, so its "
+                            "solid will not be found and that part of the ragdoll will "
+                            "not be created. Rename it there too" % (phy["file"], a, b))
+            for a in phy["removed"]:
+                self.report({"ERROR"},
+                            "%s names bone %r, which this export removes, so its solid "
+                            "will not be found and that part of the ragdoll will not be "
+                            "created" % (phy["file"], a))
+            if phy["geometry"] and not phy["renamed"] and not phy["removed"]:
+                self.report({"WARNING"},
+                            "%s still describes the old geometry. Nothing here writes it "
+                            "and the engine never compares the two, so collision stays at "
+                            "the shape the donor had" % phy["file"])
         for gone in r.get("removed") or []:
             self.report({"WARNING"},
                         "%r is not in the armature and was removed from the file: "

@@ -876,6 +876,60 @@ def stale_flavours(dest):
             if os.path.exists(p)]
 
 
+def phy_path(p):
+    return (p[:-4] if p[-4:].lower() == ".mdl" else p) + ".phy"
+
+
+def phy_bone_names(path, names):
+    """Which of `names` the sibling `.phy` cites, or None when there is no `.phy`.
+
+    Collision and ragdoll live in that file and nothing here writes it. It references the
+    model by bone name and by nothing else -- over 2929 shipped files no key names a
+    vertex, a face, a mesh or a bone index -- so a moved vertex leaves collision merely
+    wrong, while a renamed or deleted bone leaves `CRagdollProp::CreateObjects` unable to
+    look the solid up at all. Anomalies I.9.
+
+    Matching every quoted value rather than a key list means a key some other tool added
+    cannot hide a reference from this.
+    """
+    ph = phy_path(path)
+    if not os.path.exists(ph):
+        return None
+    try:
+        with open(ph, "rb") as f:
+            b = f.read()
+        size, _, nsolid, _ = struct.unpack_from("<4i", b, 0)
+        o = size
+        for _ in range(nsolid):
+            o += 4 + struct.unpack_from("<i", b, o)[0]
+        text = b[o:].decode("ascii", "replace")
+    except (OSError, struct.error, IndexError):
+        # A file this cannot read is one to warn about rather than to fail the export on.
+        return set(names)
+    quoted = set(text.split('"')[1::2])
+    return set(n for n in names if n in quoted)
+
+
+def phy_report(source, dest, removed, renamed, geometry_moved):
+    """What the sibling `.phy` no longer describes, or None when it has nothing to say."""
+    old_names = [g["name"] for g in removed or ()] + [a for a, _ in renamed or ()]
+    cited = phy_bone_names(dest, old_names)
+    if cited is None:
+        # Nothing beside the file just written. Deleting a `.phy` is worse than leaving one
+        # stale: `CBaseAnimating::TestCollision` returns false with no solid, so the model
+        # stops being hit by traces at all rather than being hit at the wrong shape.
+        if os.path.exists(phy_path(source)) and os.path.abspath(source) != os.path.abspath(dest):
+            return {"file": os.path.basename(phy_path(dest)), "missing": True,
+                    "removed": [], "renamed": [], "geometry": geometry_moved}
+        return None
+    gone = sorted(g["name"] for g in removed or () if g["name"] in cited)
+    moved = sorted((a, b) for a, b in renamed or () if a in cited)
+    if not gone and not moved and not geometry_moved:
+        return None
+    return {"file": os.path.basename(phy_path(dest)), "missing": False,
+            "removed": gone, "renamed": moved, "geometry": geometry_moved}
+
+
 def revise_vtx(source, dest, data, revised):
     """Rewrite the .vtx for a model whose geometry moved, and return what it cost.
 
@@ -1125,7 +1179,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],
-            "stale": stale_flavours(dest) if (revised or removed or added_bones) else []}
+            "stale": stale_flavours(dest) if (revised or removed or added_bones) else [],
+            "phy": phy_report(source, dest, removed, renamed, bool(revised))}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

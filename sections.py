@@ -166,11 +166,15 @@ def build(b, want_anims, want_seqs):
         s = h["seqindex"] + k * 764
         m.stringat(s + m.i(s))
         m.stringat(s + m.i(s + 4))
-        # +0x2c4/+0x2c8 is numknockbacks/knockbackindex, recon 31. +0x2c0 is studiomdl's
-        # write cursor, always (numseq-k)*764 plus what had been appended, and is not a pointer.
+        # +0x2c4/+0x2c8 is numknockbacks/knockbackindex, recon 31.  vampire.dll 103ea982
+        # skips the sequence unless numknockbacks >= 1, which is what tells the 7 props
+        # carrying studiomdl's write cursor in +0x2bc/+0x2c0 from a real hit-volume table.
         nkb = m.i(s + 0x2c4)
         kb = s + m.i(s + 0x2c8)
         if nkb > 0:
+            nhv = m.i(s + 0x2bc)
+            if nhv > 0:
+                m.add("  seq%d hitvolume[]" % k, s + m.i(s + 0x2c0), nhv, 24)
             m.add("  seq%d mstudioknockback_t[]" % k, kb, nkb, 188)
             if 0 < kb and kb + nkb * 188 <= len(m.b):
                 for r in range(nkb):

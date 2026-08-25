@@ -119,9 +119,13 @@ def collect(b, cloth_vertex=True):
         # 7 sequences hold 764 at +0x294, the write cursor and not a count.
         if 0 < a.i(s + 0x294) < 64:
             a.rel(s, 0x298, "seqdesc.autolayerindex")
-        # +0x2c0 is a write cursor and +0x2b8 is -1 on 12464 of 12471, so neither is a pointer.
+        # +0x2b8 is -1 on 12464 of 12471 and nothing reads it.
         nkb = a.i(s + 0x2c4)
         if nkb > 0:
+            # 103ea982 skips the sequence below this, so +0x2c0 is a pointer only here; the 7
+            # props that reach it with nkb 0 hold studiomdl's write cursor in both words.
+            if a.i(s + 0x2bc) > 0:
+                a.rel(s, 0x2c0, "seqdesc.hitvolumeindex")
             a.rel(s, 0x2c8, "seqdesc.knockbackindex")
             kb = s + a.i(s + 0x2c8)
             for r in range(nkb):

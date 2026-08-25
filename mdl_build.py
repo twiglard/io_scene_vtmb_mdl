@@ -53,6 +53,11 @@ ALIGN = 4
 # every offline check and then draws nothing.  Recon §35.1.
 MAXSTUDIOVERTS = 20000
 
+# 350, not the SDK header's 1024 nor Valve's 128.  Nothing in the game validates numbones
+# against it, so an over-cap file indexes client.dll's per-bone arrays out of range rather than
+# being refused.  Corpus max is 343.  Measured four ways in recon §45.3.
+MAXSTUDIOBONES = 350
+
 # A bone carrying no bit of the 0xfffc used-by mask gets no bone matrix, so anything skinned
 # to it draws nothing.  0x10 is the corpus norm: 62439 of 62702 bones carry it.
 BONE_USED = 0x10
@@ -405,6 +410,9 @@ def from_bytes(b):
         na = i(o + 0x294)
         r.extra["autolayers"] = ([i(o + i(o + 0x298) + j * 4) for j in range(na)]
                                  if 0 < na < 64 else [])
+        # vampire.dll 103ea982 skips the sequence unless numknockbacks >= 1, so the 7 props
+        # whose +0x2bc/+0x2c0 both hold studiomdl's 768-byte write cursor carry no table.
+        r.extra["hitvolumes"] = _sized(b, o, 0x2bc, 0x2c0, 24) if i(o + 0x2c4) > 0 else b""
         kbs = []
         kb = o + i(o + 0x2c8)
         for j in range(max(0, i(o + 0x2c4))):
@@ -554,6 +562,10 @@ def emit(d, checksum=None, drop=False):
         raise Refused("description drops %s"
                       % ", ".join("%s x%d" % (k, v) for k, v in sorted(d.dropped.items())))
     _check_blocks(d)
+    if len(d.bones) > MAXSTUDIOBONES:
+        raise Refused("armature carries %d bones against MAXSTUDIOBONES %d, so the game "
+                      "indexes its per-bone arrays past the end"
+                      % (len(d.bones), MAXSTUDIOBONES))
     counts = model_vertex_counts(d)
     over = [c for c in counts if c[2] > MAXSTUDIOVERTS]
     if over:
@@ -673,6 +685,11 @@ def emit(d, checksum=None, drop=False):
             if al:
                 o.add("al%d" % k, struct.pack("<%di" % len(al), *al))
                 o.patch(("seqdescs", k * 764 + 0x298), ("al%d" % k, 0), base)
+            hv = r.extra.get("hitvolumes") or b""
+            struct.pack_into("<i", buf, k * 764 + 0x2bc, len(hv) // 24)
+            if hv:
+                o.add("hv%d" % k, hv)
+                o.patch(("seqdescs", k * 764 + 0x2c0), ("hv%d" % k, 0), base)
             kbs = r.extra.get("knockbacks") or []
             struct.pack_into("<i", buf, k * 764 + 0x2c4, len(kbs))
             if kbs:
@@ -1030,7 +1047,12 @@ def add_bone(d, name, parent=-1, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0),
     struct.pack_into("<3f", raw, 0x3c, 1.0 / 256, 1.0 / 256, 1.0 / 256)
     struct.pack_into("<4f", raw, 0x48, 1e-5, 1e-5, 1e-5, 1.0 / 32768)
     struct.pack_into("<i", raw, 0x88, flags)
-    struct.pack_into("<i", raw, 0x94, -1)
+    # physicsbone +0x94 indexes the sibling .phy's solid list.  A bone owning no solid
+    # takes its nearest ancestor's, else 0, which is what studiomdl does
+    # (collisionmodel.cpp:1955-1976); -1 is a value 0 of 61925 shipped bones carry.
+    struct.pack_into("<i", raw, 0x94,
+                     struct.unpack_from("<i", d.bones[parent].raw, 0x94)[0]
+                     if parent >= 0 else 0)
     d.bones.append(Rec(raw, name, None, {"surfaceprop": surfaceprop}))
     _stamp_posetobone(d)
     i = len(d.bones) - 1
@@ -1148,8 +1170,9 @@ def remove_bone(d, i):
 
     Nothing renumbers on its own: `emit` writes each `Rec.raw` verbatim, so an index left
     alone names a different bone and the file still writes. `physicsbone` is the one
-    bone-shaped field deliberately untouched -- it indexes the sibling `.phy`, reaching 14
-    at most over 25 391 corpus bones in files whose `numbones` runs to 82.
+    field naming something outside the bone array deliberately untouched -- it indexes the
+    sibling `.phy`'s solid list, not a bone, reaching 26 at most over 61 925 corpus bones
+    in files whose `numbones` runs to 343, and 0 of them are negative.
 
     Returns (name, [child names], vertex slots repointed, vertices left rigid, records
     rebound onto the parent).
@@ -1505,7 +1528,10 @@ def set_model_name(d, bi, mi, name):
     4567 model names is 69.
     """
     r = d.bodyparts[bi].kids[mi]
-    b = name.encode("latin-1", "replace")[:127]
+    b = name.encode("latin-1", "replace")
+    if len(b) > 127:
+        raise Refused("model name %r is %d bytes, and the field holds 127 plus a "
+                      "terminator" % (name, len(b)))
     r.raw[0:128] = b + b"\x00" * (128 - len(b))
 
 
@@ -1802,7 +1828,8 @@ def stamp_sequence_boxes(d, force=False):
         return 0
     n, first = 0, False
     for k, r in enumerate(d.seqs):
-        if not force and any(struct.unpack_from("<6f", r.raw, 0x1c)):
+        box = struct.unpack_from("<6f", r.raw, 0x1c)
+        if not force and any(box) and all(box[c] <= box[c + 3] for c in range(3)):
             continue
         want = _seq_anims(r.raw)
         cited = [boxes[i] for i in want if i in boxes]
@@ -1833,7 +1860,7 @@ def add_sequence(d, label, anim, activity=None, flags=0):
     struct.pack_into("<i", raw, 0x034, 1)
     struct.pack_into("<h", raw, 0x038, anim)
     struct.pack_into("<2i", raw, 0x23c, 1, 1)
-    struct.pack_into("<2f", raw, 0x264, 0.2, 0.2)
+    struct.pack_into("<3f", raw, 0x264, 0.2, 0.2, 0.2)
     struct.pack_into("<i", raw, 0x2b8, -1)
     struct.pack_into("<f", raw, 0x2cc, FLT_MIN)
     struct.pack_into("<f", raw, 0x2d0, FLT_MAX)

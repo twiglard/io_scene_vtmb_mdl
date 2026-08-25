@@ -236,7 +236,7 @@ def cursor_fields(b):
         s = a.i(276) + k * 764
         pair(s + 0x14, s + 0x18)
         pair(s + 0x2c4, s + 0x2c8)
-        # vampire.dll 103ea982 skips the melee tail unless numknockbacks >= 1, so
+        # vampire.dll 103ea982 skips the melee fields unless numknockbacks >= 1, so
         # +0x2c0 addresses a hit-volume table only there; the 7 props that reach it
         # with none hold studiomdl's write cursor in both +0x2bc and +0x2c0.
         if a.i(s + 0x2c4) > 0:
@@ -430,7 +430,7 @@ def _span(b, at, n):
 def melee(b):
     """Each sequence's hit-volume and knockback records, szactivity words blanked.
 
-    A sequence is compared below as five scalars, so the whole melee tail rode on
+    A sequence is compared below as five scalars, so every melee field rode on
     `masked_sections` happening to size it.  BUGS §17 is a writer that kept the record
     count at +0x2bc and wrote the offset at +0x2c0 as 0, which leaves the reader walking
     count*24 bytes from the seqdesc's own first byte.  Both halves are stated here: the
@@ -485,7 +485,7 @@ def verify(src, out, same_checksum=True):
     cmp("bones", [_bone(x) for x in a.bones], [_bone(x) for x in g.bones])
     cmp("sequences", [(s.label, s.activity, s.flags, s.groupsize, s.blends) for s in a.seqs],
                      [(s.label, s.activity, s.flags, s.groupsize, s.blends) for s in g.seqs])
-    cmp("melee tail", melee(src), melee(out))
+    cmp("hitvolume/knockback", melee(src), melee(out))
     cmp("animdescs", [(x.name, x.fps, x.flags, x.numframes) for x in a.anims],
                      [(x.name, x.fps, x.flags, x.numframes) for x in g.anims])
     cmp("movements",
