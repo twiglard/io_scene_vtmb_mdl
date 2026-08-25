@@ -998,6 +998,214 @@ def set_bone_poses(d, poses):
     _stamp_posetobone(d)
 
 
+def _renumber_verts(mr, i):
+    """Drop bone `i` from every vertex of one model and renumber the slots above it.
+
+    A slot that named `i` goes and the surviving weights rescale to 255, which is what
+    Blender's armature modifier draws once the group matches no bone. A vertex left with
+    none becomes `numbones` 0, model space, which is where Blender leaves it -- measured
+    at 1.267855 units from where the bone had been carrying it.
+    """
+    if struct.unpack_from("<i", mr.raw, 0x9c)[0] != 0:
+        return 0, 0                     # filetype 1 and 2 carry no bone field at all
+    vb = bytearray(mr.extra.get("verts") or b"")
+    moved = rigid = 0
+    for o in range(0, len(vb) - 43, 44):
+        n = vb[o + 3] % 5
+        if not n:
+            continue
+        w = [vb[o], vb[o + 1], vb[o + 2]]
+        w.append(255 - sum(w))
+        bones = list(struct.unpack_from("<4h", vb, o + 4))
+        keep = [(b - 1 if b > i else b, w[k]) for k, b in enumerate(bones[:n])
+                if b != i]
+        if len(keep) == n:
+            if max(bones[:n]) <= i:
+                continue
+            struct.pack_into("<4h", vb, o + 4,
+                             *([b for b, _x in keep] + [0] * (4 - len(keep))))
+            moved += 1
+            continue
+        moved += 1
+        if not keep:
+            rigid += 1
+            vb[o] = vb[o + 1] = vb[o + 2] = 0
+            vb[o + 3] -= n
+            struct.pack_into("<4h", vb, o + 4, 0, 0, 0, 0)
+            continue
+        tot = sum(x for _b, x in keep) or 1
+        q = [int(round(255.0 * x / tot)) for _b, x in keep]
+        while len(q) < 3:
+            q.append(0)
+        # The three stored bytes sum to 255 and the engine derives the fourth from them,
+        # so a vertex short of four bones puts the rounding shortfall on its first slot --
+        # `_pack_verts` does the same and the two have to agree.
+        if len(keep) < 4:
+            q[0] += 255 - sum(q[:3])
+        vb[o], vb[o + 1], vb[o + 2] = (max(0, min(255, x)) for x in q[:3])
+        vb[o + 3] -= n - len(keep)
+        struct.pack_into("<4h", vb, o + 4,
+                         *([b for b, _x in keep] + [0] * (4 - len(keep))))
+    mr.extra["verts"] = bytes(vb)
+    return moved, rigid
+
+
+def remove_bone(d, i):
+    """Drop bone `i` and renumber every index that named a bone above it.
+
+    Children reparent onto the removed bone's own parent and keep their world position,
+    which is what Blender's `armature.delete` does -- measured on 5.2, deleting the middle
+    of a three-bone chain leaves the child's armature-space head and tail unchanged and
+    clears its connection. Composing the removed bone's local transform into each child's
+    is that same operation in a format whose bind pose is parent-relative.
+
+    Nothing renumbers on its own: `emit` writes each `Rec.raw` verbatim, so an index left
+    alone names a different bone and the file still writes. `physicsbone` is the one
+    bone-shaped field deliberately untouched -- it indexes the sibling `.phy`, reaching 14
+    at most over 25 391 corpus bones in files whose `numbones` runs to 82.
+
+    Returns (name, [child names], vertex slots repointed, vertices left rigid, records
+    rebound onto the parent).
+    """
+    if not 0 <= i < len(d.bones):
+        raise Refused("no bone %d to remove: the file has %d" % (i, len(d.bones)))
+    if len(d.bones) == 1:
+        raise Refused("bone %r is the file's only one" % d.bones[i].name)
+    name = d.bones[i].name
+
+    for k, r in enumerate(d.bonecontrollers):
+        if struct.unpack_from("<i", r.raw, 0x00)[0] == i:
+            raise Refused("bone controller %d drives bone %r, and the engine resolves it "
+                          "by index with nothing to fall back on" % (k, name))
+    for r in d.ikchains:
+        links = r.extra.get("links") or b""
+        for j in range(len(links) // 28):
+            if struct.unpack_from("<i", links, j * 28)[0] == i:
+                raise Refused("IK chain %r link %d is bone %r" % (r.name, j, name))
+    for k, r in enumerate(d.springbones):
+        if i in struct.unpack_from("<2i", r.raw, 0x00):
+            raise Refused("spring bone chain %d is anchored to bone %r" % (k, name))
+
+    parent = struct.unpack_from("<i", d.bones[i].raw, 0x04)[0]
+    if parent < 0:
+        # Raised here rather than where the record is patched: the walk below mutates as it
+        # goes, and every other refusal in this function runs before anything is written.
+        bound = []
+        for k, r in enumerate(d.hitboxsets):
+            bound += ["hitbox %d.%d" % (k, j) for j, x in enumerate(r.kids)
+                      if struct.unpack_from("<i", x.raw, 0x00)[0] == i]
+        bound += ["attachment %r" % r.name for r in d.attachments
+                  if struct.unpack_from("<i", r.raw, 0x08)[0] == i]
+        bound += ["mouth %d" % k for k, r in enumerate(d.mouths)
+                  if struct.unpack_from("<i", r.raw, 0x00)[0] == i]
+        for bp in d.bodyparts:
+            for mr in bp.kids:
+                bound += ["eyeball %d of model %r" % (j, mr.name)
+                          for j, x in enumerate(mr.extra.get("eyes") or [])
+                          if struct.unpack_from("<i", x.raw, 0x04)[0] == i]
+                for key, stride, fields in (("clothcollide", 36, (0x00, 0x04)),
+                                            ("clothsphere", 20, (0x00,))):
+                    buf = mr.extra.get(key) or b""
+                    bound += ["%s %d of model %r" % (key, j, mr.name)
+                              for j in range(len(buf) // stride) for f in fields
+                              if struct.unpack_from("<i", buf, j * stride + f)[0] == i]
+        if bound:
+            raise Refused("bone %r is a root, so there is no parent to pass %d record(s) "
+                          "to: %s" % (name, len(bound), ", ".join(bound[:4])))
+
+    old = _skeleton(d)
+    tracks = []
+    for r in d.anims:
+        blk = r.extra.get("block")
+        tracks.append(W.read_tracks(_Block(blk, old.bones), _AnimHdr(r)) if blk else None)
+
+    gone = M.mat_from_quat_pos(struct.unpack_from("<4f", d.bones[i].raw, 0x2c),
+                               struct.unpack_from("<3f", d.bones[i].raw, 0x20))
+    kids = []
+    for r in d.bones:
+        if struct.unpack_from("<i", r.raw, 0x04)[0] != i:
+            continue
+        kids.append(r.name)
+        w = M.mat_mul(gone, M.mat_from_quat_pos(
+            struct.unpack_from("<4f", r.raw, 0x2c),
+            struct.unpack_from("<3f", r.raw, 0x20)))
+        struct.pack_into("<3f", r.raw, 0x20, w[0][3], w[1][3], w[2][3])
+        struct.pack_into("<4f", r.raw, 0x2c, *M.quat_from_mat(w))
+        struct.pack_into("<i", r.raw, 0x04, parent)
+
+    def ren(x):
+        return x - 1 if x > i else x
+
+    rebound = []
+
+    def patch(buf, at, what):
+        """A record that named the removed bone passes to its parent rather than keeping
+        an index that now names a different bone. Parents always precede their children,
+        so the parent's own index never renumbers."""
+        v = struct.unpack_from("<i", buf, at)[0]
+        if v > i:
+            struct.pack_into("<i", buf, at, v - 1)
+        elif v == i:
+            if parent < 0:
+                raise Refused("%s is bound to bone %r, which is a root: there is no "
+                              "parent to pass it to" % (what, name))
+            struct.pack_into("<i", buf, at, parent)
+            rebound.append(what)
+
+    for r in d.bones:
+        patch(r.raw, 0x04, "bone %r" % r.name)
+    for k, r in enumerate(d.bonecontrollers):
+        patch(r.raw, 0x00, "bone controller %d" % k)
+    for k, r in enumerate(d.hitboxsets):
+        for j, x in enumerate(r.kids):
+            patch(x.raw, 0x00, "hitbox %d.%d" % (k, j))
+    for r in d.attachments:
+        patch(r.raw, 0x08, "attachment %r" % r.name)
+    for k, r in enumerate(d.mouths):
+        patch(r.raw, 0x00, "mouth %d" % k)
+    for k, r in enumerate(d.springbones):
+        patch(r.raw, 0x00, "spring bone chain %d" % k)
+        patch(r.raw, 0x04, "spring bone chain %d end" % k)
+    for r in d.ikchains:
+        links = bytearray(r.extra.get("links") or b"")
+        for j in range(len(links) // 28):
+            patch(links, j * 28, "IK chain %r link %d" % (r.name, j))
+        r.extra["links"] = bytes(links)
+
+    moved = rigid = 0
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            for j, x in enumerate(mr.extra.get("eyes") or []):
+                patch(x.raw, 0x04, "eyeball %d of model %r" % (j, mr.name))
+            for key, stride, fields in (("clothcollide", 36, (0x00, 0x04)),
+                                        ("clothsphere", 20, (0x00,))):
+                buf = bytearray(mr.extra.get(key) or b"")
+                for j in range(len(buf) // stride):
+                    for f in fields:
+                        patch(buf, j * stride + f, "%s %d of model %r"
+                              % (key, j, mr.name))
+                mr.extra[key] = bytes(buf)
+            a, b = _renumber_verts(mr, i)
+            moved += a
+            rigid += b
+
+    del d.bones[i]
+    _stamp_posetobone(d)
+
+    new = _skeleton(d)
+    for r, t in zip(d.anims, tracks):
+        if t is None:
+            poses = r.extra.get("poses")
+            if poses:
+                for f in poses:
+                    del f[i]
+            continue
+        t.chan = dict(((ren(b), c), v) for (b, c), v in t.chan.items() if b != i)
+        t.weights = dict((ren(b), x) for b, x in t.weights.items() if b != i)
+        r.extra["block"] = W._anim_block(new, t)
+    return name, kids, moved, rigid, rebound
+
+
 def add_hitbox(d, boxes, name="default", at=None):
     """Append or extend a hitbox set from [(bone, group, bbmin, bbmax), ...].
 
