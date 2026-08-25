@@ -386,6 +386,7 @@ def from_bytes(b):
                                 for j in range(i(o + 0x10))]
         nf, blk = i(o + 0x0c), o + i(o + 0x30)
         r.extra["block"] = bytes(b[blk:blk + _block_len(b, blk, nb, nf)]) if nf > 0 else b""
+        r.extra["block_bones"] = nb
         if i(o + 0x38):
             # mstudioikrule_t has no measured stride, so the payload cannot be sized and
             # carried. No shipped file reaches this: all 4464 read ikruleindex 0.
@@ -949,40 +950,55 @@ def new(name, surfaceprop="flesh"):
     return d
 
 
+def _block_bones(blk):
+    """The bone count a carried block was encoded for, or None if it has no live channel.
+
+    Where the first RLE stream starts: every offset is struct-relative, so the lowest
+    `bone * 32 + offset` is where the `mstudioanim_t` array ends.  Over the 4445-model
+    corpus all 10989 animations carrying a live channel put it at exactly `numbones * 32`
+    bar 39, all in `move_and_ranged.mdl`, which sit 4 bytes past -- so this rounds down and
+    is a lower bound rather than the count itself.
+    """
+    n = len(blk) // M.ANIM_STRIDE
+    lo = None
+    for j in range(n):
+        o = j * M.ANIM_STRIDE
+        for x in struct.unpack_from("<7i", blk, o + 4):
+            if x and (lo is None or o + x < lo):
+                lo = o + x
+    return None if lo is None else lo // M.ANIM_STRIDE
+
+
 def _check_blocks(d):
     """A carried animation block must describe the bone list it is about to be written
     against.  `mstudioanim_t[numbones]` is sized off the header, so a block encoded for
     fewer bones hands the engine records read out of the RLE stream that follows -- six
     struct-relative offsets made of animation data, not a wrong bone.
 
-    What separates the two is where the first stream starts: a channel offset that points
-    into the record array can only mean the array is longer than the block was encoded
-    for.  Over the 4445-model corpus, all 10989 animations carrying a live channel put
-    their first stream at or after `numbones * 32` and none before it; 39 of them, all in
-    `move_and_ranged.mdl`, sit 4 bytes past it, so the test is an inequality and not an
-    equality.
+    Every site that writes `extra["block"]` stamps `extra["block_bones"]` beside it, so
+    this is one integer comparison per animation.  Deriving it from the offsets instead
+    costs 47% of a whole `emit`, and it only sees the block growing SHORT of the bone list:
+    a shrunk one still puts its stream past the end of the shorter array, and nothing in
+    the bytes says how many records were meant.  The scan is the fallback for a block some
+    caller assembled without the stamp.
     """
     nb = len(d.bones)
     for k, r in enumerate(d.anims):
         blk = r.extra.get("block") or b""
         if not blk:
             continue
-        if len(blk) < nb * M.ANIM_STRIDE:
-            raise Refused("animation %d %r carries %d bytes of channel block against %d "
-                          "bones, which is short of the mstudioanim_t array alone"
-                          % (k, r.name, len(blk), nb))
-        lo = None
-        for j in range(nb):
-            o = j * M.ANIM_STRIDE
-            for x in struct.unpack_from("<7i", blk, o + 4):
-                if x and (lo is None or o + x < lo):
-                    lo = o + x
-        if lo is not None and lo < nb * M.ANIM_STRIDE:
+        was = r.extra.get("block_bones")
+        if was is None:
+            was = _block_bones(blk)
+            if was is None or was >= nb:
+                continue
+        if was != nb:
             raise Refused("animation %d %r was encoded for %d bones and is being written "
-                          "against %d, so the engine reads its last %d mstudioanim_t out "
-                          "of the RLE stream"
-                          % (k, r.name, lo // M.ANIM_STRIDE, nb,
-                             nb - lo // M.ANIM_STRIDE))
+                          "against %d, so the engine reads %s"
+                          % (k, r.name, was, nb,
+                             "its last %d mstudioanim_t out of the RLE stream"
+                             % (nb - was) if nb > was else
+                             "%d records fewer than the block holds" % (was - nb)))
 
 
 def add_bone(d, name, parent=-1, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0),
@@ -1026,6 +1042,7 @@ def add_bone(d, name, parent=-1, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0),
             continue
         t.weights[i] = 1.0
         r.extra["block"] = W._anim_block(new, t)
+        r.extra["block_bones"] = len(d.bones)
     return i
 
 
@@ -1274,6 +1291,7 @@ def remove_bone(d, i):
         t.chan = dict(((ren(b), c), v) for (b, c), v in t.chan.items() if b != i)
         t.weights = dict((ren(b), x) for b, x in t.weights.items() if b != i)
         r.extra["block"] = W._anim_block(new, t)
+        r.extra["block_bones"] = len(d.bones)
     return name, kids, moved, rigid, rebound
 
 
@@ -1653,6 +1671,7 @@ def quantise(d):
         t.weights = dict((b.index, 1.0) for b in m.bones)
         t.chan = W.quantise(m, poses, scales)
         r.extra["block"] = W._anim_block(m, t)
+        r.extra["block_bones"] = len(d.bones)
         r.extra["poses"] = None
     # One scale set serves the whole file, so widening it for a new pose leaves every
     # animation already in it decoding against scales it was not encoded for.
@@ -1664,6 +1683,7 @@ def quantise(d):
             t = W.read_tracks(_Block(r.extra["block"], m.bones), _AnimHdr(r))
             W.rescale(t, old, scales)
             r.extra["block"] = W._anim_block(m, t)
+            r.extra["block_bones"] = len(d.bones)
     return len(pending)
 
 
