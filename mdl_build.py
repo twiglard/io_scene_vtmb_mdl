@@ -552,6 +552,7 @@ def emit(d, checksum=None, drop=False):
     if d.dropped and not drop:
         raise Refused("description drops %s"
                       % ", ".join("%s x%d" % (k, v) for k, v in sorted(d.dropped.items())))
+    _check_blocks(d)
     counts = model_vertex_counts(d)
     over = [c for c in counts if c[2] > MAXSTUDIOVERTS]
     if over:
@@ -948,13 +949,63 @@ def new(name, surfaceprop="flesh"):
     return d
 
 
+def _check_blocks(d):
+    """A carried animation block must describe the bone list it is about to be written
+    against.  `mstudioanim_t[numbones]` is sized off the header, so a block encoded for
+    fewer bones hands the engine records read out of the RLE stream that follows -- six
+    struct-relative offsets made of animation data, not a wrong bone.
+
+    What separates the two is where the first stream starts: a channel offset that points
+    into the record array can only mean the array is longer than the block was encoded
+    for.  Over the 4445-model corpus, all 10989 animations carrying a live channel put
+    their first stream at or after `numbones * 32` and none before it; 39 of them, all in
+    `move_and_ranged.mdl`, sit 4 bytes past it, so the test is an inequality and not an
+    equality.
+    """
+    nb = len(d.bones)
+    for k, r in enumerate(d.anims):
+        blk = r.extra.get("block") or b""
+        if not blk:
+            continue
+        if len(blk) < nb * M.ANIM_STRIDE:
+            raise Refused("animation %d %r carries %d bytes of channel block against %d "
+                          "bones, which is short of the mstudioanim_t array alone"
+                          % (k, r.name, len(blk), nb))
+        lo = None
+        for j in range(nb):
+            o = j * M.ANIM_STRIDE
+            for x in struct.unpack_from("<7i", blk, o + 4):
+                if x and (lo is None or o + x < lo):
+                    lo = o + x
+        if lo is not None and lo < nb * M.ANIM_STRIDE:
+            raise Refused("animation %d %r was encoded for %d bones and is being written "
+                          "against %d, so the engine reads its last %d mstudioanim_t out "
+                          "of the RLE stream"
+                          % (k, r.name, lo // M.ANIM_STRIDE, nb,
+                             nb - lo // M.ANIM_STRIDE))
+
+
 def add_bone(d, name, parent=-1, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0),
              flags=BONE_USED, surfaceprop="flesh"):
     """Append one bone, return its index.  A parent must already be in `d.bones`: the
     engine walks the array once in order, so a child emitted first reads a world matrix
-    that has not been computed."""
+    that has not been computed.
+
+    Every animation already in the file grows an entry for it, holding the bind pose.
+    `mstudioanim_t[numbones]` is sized off the header, so a block left at the old count
+    hands the engine a record read out of the RLE stream that follows: on andrei that is
+    seven offsets of 63822..64775 against the 0 a still bone carries, each one taken from
+    the record and landing about 66 KB past the end of the block.  The weight is 1.0
+    rather than `_anim_block`'s 0.0 default, which is what 54320 of 56376 shipped
+    channel-less records carry, and what all 158530 with a channel do.
+    """
     if parent >= len(d.bones):
         raise Refused("bone %r cites parent %d, not emitted yet" % (name, parent))
+    old = _skeleton(d)
+    tracks = []
+    for r in d.anims:
+        blk = r.extra.get("block")
+        tracks.append(W.read_tracks(_Block(blk, old.bones), _AnimHdr(r)) if blk else None)
     raw = bytearray(160)
     struct.pack_into("<i", raw, 0x04, parent)
     struct.pack_into("<6i", raw, 0x08, *([-1] * 6))
@@ -966,7 +1017,16 @@ def add_bone(d, name, parent=-1, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0),
     struct.pack_into("<i", raw, 0x94, -1)
     d.bones.append(Rec(raw, name, None, {"surfaceprop": surfaceprop}))
     _stamp_posetobone(d)
-    return len(d.bones) - 1
+    i = len(d.bones) - 1
+    new = _skeleton(d)
+    for r, t in zip(d.anims, tracks):
+        if t is None:
+            for f in r.extra.get("poses") or ():
+                f.append(None)
+            continue
+        t.weights[i] = 1.0
+        r.extra["block"] = W._anim_block(new, t)
+    return i
 
 
 def _stamp_posetobone(d):
