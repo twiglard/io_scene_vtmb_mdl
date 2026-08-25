@@ -49,6 +49,53 @@ def _rows(mat, scale):
     return [[mat[i][0], mat[i][1], mat[i][2], mat[i][3] / scale] for i in range(3)]
 
 
+def bone_map(m, arm_obj):
+    """{file bone name: armature bone name} for the file bones the armature still has.
+
+    Blender records nothing about a rename, and every reader here resolves a file bone by
+    name, so without a stash a renamed bone is indistinguishable from one deleted and one
+    added -- and `drop_missing_bones` would take it out of the file. The importer stamps
+    `vtmb_bone_name` on each pose bone, so the bone says which record it came from whatever
+    it is called now.
+
+    The stash is taken first and a Blender bone is claimed once, so a name freed by a rename
+    cannot be picked up by a second file bone. A bone with no stash -- one the user built,
+    or a scene older than the stamp -- resolves by its own name, which is what every export
+    before this did.
+    """
+    dbs = arm_obj.data.bones
+    stash = {}
+    for pb in arm_obj.pose.bones:
+        was = pb.get("vtmb_bone_name")
+        if was:
+            stash.setdefault(str(was), pb.name)
+    out, taken = {}, set()
+    for b in m.bones:
+        got = stash.get(b.name)
+        if got is not None and got in dbs and got not in taken:
+            out[b.name] = got
+            taken.add(got)
+    for b in m.bones:
+        if b.name not in out and b.name in dbs and b.name not in taken:
+            out[b.name] = b.name
+            taken.add(b.name)
+    return out
+
+
+def renamed_bones(m, arm_obj, bmap=None):
+    """{file bone index: the name Blender now gives it}, for the ones that differ.
+
+    A `.mdl` bone name is a string-table entry `emit` authors from `Rec.name`, so writing
+    one costs nothing. What it costs elsewhere is the include chain, whose only join is by
+    name: `Studio_BuildChainedModelBoneMaps` pairs two files' bones with `__strcmpi` and
+    leaves an unmatched entry at its -1 sentinel, so a bone renamed on one side of a chain
+    stops being driven by the other. The operator reports that where the file has includes.
+    """
+    bmap = bone_map(m, arm_obj) if bmap is None else bmap
+    return {k: bmap[b.name] for k, b in enumerate(m.bones)
+            if b.name in bmap and bmap[b.name] != b.name}
+
+
 def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False):
     """Local (pos, quat) per bone per frame, inverting everything the importer applied.
 
@@ -56,11 +103,12 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_key
     matrix_local factors cancel down the chain, so it is exactly the world matrix the
     importer built -- no reconstruction from matrix_basis needed.
     """
-    missing = [b.name for b in m.bones if b.name not in arm_obj.pose.bones]
+    bmap = bone_map(m, arm_obj)
+    missing = [b.name for b in m.bones if b.name not in bmap]
     if missing:
         raise ValueError("armature has no bone %s (and %d more)"
                          % (missing[0], len(missing) - 1))
-    pbs = [arm_obj.pose.bones[b.name] for b in m.bones]
+    pbs = [arm_obj.pose.bones[bmap[b.name]] for b in m.bones]
     scene = context.scene
     out = []
     for f in frames:
@@ -127,22 +175,23 @@ def read_bones(m, arm_obj, scale):
     has to stay consistent with.
     """
     dbs = arm_obj.data.bones
-    missing = [b.name for b in m.bones if b.name not in dbs]
+    bmap = bone_map(m, arm_obj)
+    missing = [b.name for b in m.bones if b.name not in bmap]
     if missing:
         raise ValueError("armature has no bone %s (and %d more)"
                          % (missing[0], len(missing) - 1))
     out = {}
     for k, b in enumerate(m.bones):
-        local = dbs[b.name].matrix_local
+        local = dbs[bmap[b.name]].matrix_local
         if b.parent >= 0:
-            local = dbs[m.bones[b.parent].name].matrix_local.inverted() @ local
+            local = dbs[bmap[m.bones[b.parent].name]].matrix_local.inverted() @ local
         pos, quat = to_file(local, scale)
-        flags = bone_flags(arm_obj, b.name)
+        flags = bone_flags(arm_obj, bmap[b.name])
         # A quaternion and its negation are one rotation, so the nearer sign wins or a bone
         # the importer flipped reads as moved.
         if sum(x * y for x, y in zip(quat, b.quat)) < 0:
             quat = tuple(-x for x in quat)
-        base = rest_baseline(arm_obj, b.name)
+        base = rest_baseline(arm_obj, bmap[b.name])
         if base is None:
             moved = moved_from_file(m, b, pos, quat)
         else:
@@ -162,7 +211,7 @@ def surplus_bones(m, arm_obj):
     rebuilder (roadmap item 10); naming it costs one pass and turns an invisible loss into
     a reported one.
     """
-    have = {b.name for b in m.bones}
+    have = set(bone_map(m, arm_obj).values())
     return [b.name for b in arm_obj.data.bones if b.name not in have]
 
 
@@ -195,8 +244,7 @@ def drop_missing_bones(d, m, arm_obj):
     renumbers everything above the bone it takes and nothing below. `Refused` is left to
     reach the operator, which reports it.
     """
-    dbs = arm_obj.data.bones
-    gone = [k for k, b in enumerate(m.bones) if b.name not in dbs]
+    gone = [k for k, b in enumerate(m.bones) if b.name not in bone_map(m, arm_obj)]
     out = []
     for k in reversed(gone):
         name, kids, slots, rigid, rebound = build_mod.remove_bone(d, k)
@@ -764,6 +812,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     removed = drop_missing_bones(d, m, arm_obj)
     if removed:
         m = _Reduced(m, d)
+    # After the removal, so an index is stated against the bone list that will be written.
+    # `m.bones` keeps the file's own names, which is what every reader here resolves
+    # through `bone_map`, so renaming the record does not move the scene out from under it.
+    renamed = renamed_bones(m, arm_obj)
+    for k, name in renamed.items():
+        d.bones[k].name = name
+    renamed = [(m.bones[k].name, name) for k, name in sorted(renamed.items())]
 
     ad = arm_obj.animation_data
     if actions and ad is None:
@@ -899,7 +954,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     return {"wrote": wrote, "added": added, "dropped": dropped, "bones": len(m.bones),
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
-            "vtx": vtx, "removed": removed,
+            "vtx": vtx, "removed": removed, "renamed": renamed,
+            "includes": [r.name for r in d.includes],
             "stale": stale_flavours(dest) if (revised or removed) else []}
 
 

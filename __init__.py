@@ -699,6 +699,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                "" if len(gone["rebound"]) == 1 else "s",
                                "s" if len(gone["rebound"]) == 1 else "",
                                ", ".join(gone["rebound"][:3])))))
+        renamed = r.get("renamed") or []
+        if renamed:
+            self.report({"INFO"},
+                        "%d bone%s renamed: %s"
+                        % (len(renamed), "" if len(renamed) == 1 else "s",
+                           ", ".join("%r is now %r" % (a, b) for a, b in renamed[:4])))
+            # The chain join is by name and nothing else -- an included file's bone that
+            # stops matching is left at its -1 sentinel and simply stops being driven.
+            if r.get("includes"):
+                self.report({"WARNING"},
+                            "this model chains to %s, and an animation chain is joined by "
+                            "bone name, so a renamed bone stops matching unless the same "
+                            "rename is made there" % ", ".join(r["includes"][:3]))
         surplus = r["scene"]["surplus"]
         if surplus:
             self.report({"WARNING"}, "%d bone%s of this armature %s not in %s and %s not "

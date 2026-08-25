@@ -171,6 +171,9 @@ def build_armature(context, m, name, scale):
         # rotscale bounds what can ever be written back to this bone.
         # Bit 1 is BONE_ROTATION_FROM_ROOT, which decides what a pose's local rotation even
         # means, so a scene-authored rewrite has to know it before it samples a frame.
+        # Blender keeps no record of a rename, and the export resolves every file bone by
+        # name, so without this a renamed bone reads as one deleted and one added.
+        pb["vtmb_bone_name"] = b.name
         pb["vtmb_bone_flags"] = b.flags
         pb["vtmb_rotscale"] = list(b.rotscale)
         pb["vtmb_posscale"] = list(b.posscale)
