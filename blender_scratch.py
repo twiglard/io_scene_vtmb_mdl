@@ -561,11 +561,18 @@ def fit_hull(mesh_objs, scale=1.0):
 
 
 def embedded_name(path):
-    """What goes in `studiohdr_t.name[128]`: the path from `models/` down."""
+    """What goes in `studiohdr_t.name[128]`: the path BELOW `models/`, forward-slashed.
+
+    Measured over the 4445-model corpus: the field is the file's own path relative to the
+    models directory on 4383 of them, and **no `models/` prefix** -- 0 of 4445 carry one.
+    Separators are forward slashes on every file that has one (4443; the two without are
+    top-level) and no name anywhere contains a backslash. Case comes off the source .qc
+    and is not the on-disk case on 1281 of the 4383, so nothing here folds it.
+    """
     stem = path[:-4] if path.lower().endswith(".mdl") else path
     slash = stem.replace("\\", "/")
     cut = slash.lower().rfind("/models/")
-    base = slash[cut + 1:] if cut >= 0 else "models/" + os.path.basename(stem)
+    base = slash[cut + len("/models/"):] if cut >= 0 else os.path.basename(stem)
     return base + ".mdl"
 
 

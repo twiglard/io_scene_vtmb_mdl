@@ -331,6 +331,25 @@ def mesh_objects(m, source):
     return out
 
 
+def renamed_models(m, source):
+    """{(bodypart, model): the name Blender now gives it} for the mesh datablocks renamed.
+
+    The import puts `mstudiomodel_t.name` on the datablock and stashes both what the file
+    said and what Blender actually assigned, because Blender caps a datablock name at 63
+    bytes and suffixes a duplicate: 3 of the corpus's 4567 model names are over 63 and 14
+    repeat inside one file. Comparing against what was assigned is therefore the only way
+    to tell a rename from Blender's own bookkeeping, and a datablock with no stash -- an
+    older scene, or a mesh the user built -- is left alone rather than guessed at.
+    """
+    out = {}
+    for key, obj in mesh_objects(m, source).items():
+        me = obj.data
+        was = me.get("vtmb_model_label")
+        if was is not None and me.name != was:
+            out[key] = me.name
+    return out
+
+
 def _per_vertex(me, count, get):
     """Every distinct per-loop value each vertex carries, as a list per vertex."""
     out = [[] for _ in range(count)]
@@ -826,7 +845,8 @@ def revise_vtx(source, dest, data, revised):
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
-                   root_motion="keep", mesh_fields=(), verify=True, add=(), drop=""):
+                   root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
+                   model_name="", hull=None):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -868,6 +888,23 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     for k, name in renamed.items():
         d.bones[k].name = name
     renamed = [(m.bones[k].name, name) for k, name in sorted(renamed.items())]
+
+    # Both names are `char name[128]` inline, so writing either moves nothing.
+    remodelled = renamed_models(m, source)
+    for (bi, mi), name in sorted(remodelled.items()):
+        build_mod.set_model_name(d, bi, mi, name)
+    if model_name and model_name != d.name:
+        d.name = model_name
+    else:
+        model_name = ""
+    # @180/@192 is the .qc's $bbox, and the per-sequence boxes at +0x1c/+0x28 are what the
+    # engine actually culls against -- a zero one draws and then vanishes as the camera
+    # turns. Neither follows an edit on its own: a donor keeps the boxes it shipped, which
+    # after a geometry change describe where the vertices used to be.
+    if hull is not None:
+        struct.pack_into("<3f", d.hdr, 180, *hull[0])
+        struct.pack_into("<3f", d.hdr, 192, *hull[1])
+        d.refit_boxes = True
 
     ad = arm_obj.animation_data
     if actions and ad is None:
@@ -1014,6 +1051,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
             "vtx": vtx, "removed": removed, "renamed": renamed,
+            "model_name": model_name, "hull": hull,
+            "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
+            "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],
             "stale": stale_flavours(dest) if (revised or removed) else []}
 

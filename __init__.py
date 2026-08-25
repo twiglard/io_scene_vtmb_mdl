@@ -393,6 +393,24 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "alongside others is refused rather than left with a hole. The action "
                     "stays in the blend; delete that too if you do not want it appended "
                     "back")
+    fit_hull: bpy.props.BoolProperty(
+        name="Refit the bounding boxes", default=False,
+        description="Recompute the movement hull from the mesh in the scene, and re-sweep "
+                    "every sequence's cull box over the animations being exported. Off "
+                    "keeps what the file shipped, which after a geometry change describes "
+                    "where the vertices used to be -- a model can then vanish as the "
+                    "camera turns, since the cull box is what the engine tests. A "
+                    "sequence whose animations you are not exporting cannot be swept and "
+                    "is left alone")
+    model_name: bpy.props.StringProperty(
+        name="Name in the file", default="",
+        description="What studiohdr_t.name says this model is. Blank takes it from where "
+                    "you are saving -- from this dialog only, so a script that does not "
+                    "set it keeps the donor's. That is the convention 4383 of the 4445 "
+                    "models follow: the path below models/, forward slashes, no models/ "
+                    "prefix. A copy that keeps its donor's name lies in the one message "
+                    "that matters when a .mdl and its .vtx stop pairing, since that "
+                    "error prints this field and not the path actually loaded")
     root_motion_in_keys: bpy.props.BoolProperty(
         name="Imported with root motion", default=True,
         description="This action's keys still carry the motion an import put into them, "
@@ -488,6 +506,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 else:
                     box.label(text="saved as %s" % os.path.basename(self.filepath),
                               icon="INFO")
+                box.prop(self, "fit_hull")
+                row = box.split(factor=SPLIT)
+                row.label(text="name in the file")
+                row.prop(self, "model_name",
+                         text="", placeholder=blender_scratch.embedded_name(self.filepath)
+                         if self.filepath else "")
                 extra = _surplus_bones(self, context, base)
                 if extra:
                     _pair(box, "bones not in the file", "%d, not written" % len(extra),
@@ -563,6 +587,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             box = _section(lay, "vtmb_rootmotion", "Root motion",
                            icon="ORIENTATION_GIMBAL")
             if box is not None:
+                # The one box in this dialog that asked for a choice without showing the
+                # state it is a choice about. `vtmb_root_motion` is per action and is
+                # exactly what the export arithmetic reads, so it is what gets shown.
+                arm = context.active_object
+                _pair(box, "this action's keys",
+                      "carry the travel" if act.get("vtmb_root_motion")
+                      else "do not carry it")
+                nmv = arm.get("vtmb_movement_anims")
+                if nmv is not None:
+                    _pair(box, "the file's animations",
+                          "%d carry a movement block" % nmv)
                 box.prop(self, "root_motion_in_keys")
                 box.prop(self, "root_motion", text="")
 
@@ -635,6 +670,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 root_motion_in_keys=self.root_motion_in_keys,
                 root_motion=self.root_motion,
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
+                # Derived only for a dialog, where the field is on screen with the
+                # derived value in it and the user can see and change it. A scripted call
+                # runs `execute` straight and gets `""`, which keeps the donor's name --
+                # otherwise every export to a new path would silently rewrite @12 and an
+                # otherwise-unedited file would stop coming back byte for byte.
+                model_name=(self.model_name or
+                            (blender_scratch.embedded_name(self.filepath)
+                             if self.options.is_invoke else "")),
+                hull=(blender_scratch.fit_hull(
+                    list(blender_export.mesh_objects(m, src).values()),
+                    float(obj.get("vtmb_scale", 1.0) or 1.0))
+                    if self.fit_hull else None),
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
         except mdl_build.Refused as exc:
@@ -705,6 +752,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                "" if len(gone["rebound"]) == 1 else "s",
                                "s" if len(gone["rebound"]) == 1 else "",
                                ", ".join(gone["rebound"][:3])))))
+        if r.get("boxes") is not None:
+            done, total = r["boxes"]
+            self.report({"INFO"} if done == total else {"WARNING"},
+                        "the hull was refitted to the scene and %d of %d sequence cull "
+                        "boxes re-swept%s" % (done, total, "" if done == total else
+                                              "; the rest keep the file's own, which "
+                                              "describe the geometry before this edit"))
+        for name, (bi, mi) in r.get("remodelled") or []:
+            self.report({"INFO"}, "model %d.%d is now named %r in the file"
+                        % (bi, mi, name))
+        if r.get("model_name"):
+            self.report({"INFO"}, "the file now calls itself %r" % r["model_name"])
         renamed = r.get("renamed") or []
         if renamed:
             self.report({"INFO"},
@@ -944,6 +1003,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         obj = context.active_object
         self.scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
         self.cdtexture = _scratch_cdtexture(obj)
+        # `extract` only where the import found travel for it to find. A file whose
+        # animations carry no mstudiomovement_t has nothing to extract, so extracting
+        # would invent blocks the donor never had; "none" leaves the keys as they came in.
+        # Seeded here rather than declared as a default, which cannot read the scene.
+        nmv = obj.get("vtmb_movement_anims")
+        if nmv is not None:
+            self.root_motion = "extract" if nmv else "none"
         return super().invoke(context, event)
 
     def draw(self, context):

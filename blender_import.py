@@ -139,7 +139,7 @@ def _display_lengths(m, rest, scale):
     return out
 
 
-def build_armature(context, m, name, scale):
+def build_armature(context, m, name, scale, root_motion=True):
     arm_data = bpy.data.armatures.new(name)
     arm_obj = bpy.data.objects.new(name, arm_data)
     context.collection.objects.link(arm_obj)
@@ -192,6 +192,12 @@ def build_armature(context, m, name, scale):
     # Per-model and not per-material, so nothing else in the scene can carry it back out.
     arm_obj["vtmb_cdtexture"] = list(m.material_paths)
     arm_obj["vtmb_sequences"] = sequence_stash(m)
+    # What the export dialogs seed their Root motion choice from. The option is the user's
+    # answer to "was the travel applied to the keys"; the count is the file's own answer to
+    # "is there any travel to apply", and a file with none has nothing for `extract` to
+    # find, so the scratch operator would otherwise invent blocks the donor never had.
+    arm_obj["vtmb_root_motion"] = bool(root_motion)
+    arm_obj["vtmb_movement_anims"] = sum(1 for a in m.anims if a.movements)
     return arm_obj
 
 
@@ -427,7 +433,16 @@ def build_meshes(context, m, arm_obj, name, scale, content):
         if not faces:
             continue
         verts = m.vertices(model)
-        me = bpy.data.meshes.new("%s_%s" % (name, model.name.rsplit(".", 1)[0]))
+        # The datablock takes `mstudiomodel_t.name` verbatim and the object keeps the
+        # disambiguating form, so the outliner stops showing one string twice and the
+        # inner row is the file's own value. Blender caps a datablock name at 63 bytes
+        # and suffixes a duplicate, and the corpus has 3 names over 63 (longest 69) and
+        # 14 records repeating a name inside one file -- so what it actually assigned is
+        # stashed beside what the file said, and only a difference between the two counts
+        # as a rename.
+        me = bpy.data.meshes.new(model.name or "%s_%d" % (name, gi))
+        me["vtmb_model_name"] = model.name
+        me["vtmb_model_label"] = me.name
         me.from_pydata([[c * scale for c in v_.pos] for v_ in verts], [],
                        [list(f[0]) for f in faces])
         me.update()
@@ -479,7 +494,8 @@ def build_meshes(context, m, arm_obj, name, scale, content):
             att = me.attributes.new("vtmb_numbones", "INT", "POINT")
             att.data.foreach_set("value", [v_.numbones for v_ in verts])
 
-        obj = bpy.data.objects.new(me.name, me)
+        obj = bpy.data.objects.new(
+            "%s_%s" % (name, (model.name or str(gi)).rsplit(".", 1)[0]), me)
         obj["vtmb_bodypart"] = bp.name
         obj["vtmb_model"] = model.name
         obj["vtmb_filetype"] = model.filetype
@@ -730,7 +746,7 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     if context.object and context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
 
-    arm_obj = build_armature(context, m, name, scale)
+    arm_obj = build_armature(context, m, name, scale, root_motion)
     # The exporter has to undo whatever the import did, and a .blend reopened months later
     # is the only record of which options produced it.
     arm_obj["vtmb_import"] = {
