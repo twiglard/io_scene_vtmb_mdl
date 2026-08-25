@@ -415,9 +415,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 "replacing whatever the file had. Use this when you changed where the "
                 "animation goes, not just how it looks"),
                ("none", "Skeleton moves, engine does not",
-                "Write no movement blocks. The motion stays in the keys, so the skeleton "
-                "itself walks away from the origin and snaps back when the sequence "
-                "loops, and the engine never advances the character")],
+                "Write no movement blocks and leave the motion in the keys, so the "
+                "skeleton itself walks away from the origin and snaps back when the "
+                "sequence loops. This is a real way to store an animation and 1344 of "
+                "the game's own use it -- lands, charges and swarms, where the travel "
+                "belongs to the animation rather than to the character"),
+               ("in_place", "Nothing moves",
+                "Write no movement blocks and take the net ground distance back out of "
+                "the keys, so neither the engine nor the skeleton advances. The bob and "
+                "sway stay, so a run cycle still runs -- on the spot")],
         default="keep")
     use_range: bpy.props.BoolProperty(
         name="Scene range", default=False,
@@ -892,9 +898,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 "The bob and sway stay in the keys. This is what a walk cycle wants, "
                 "and what an import with Root motion on needs putting back"),
                ("none", "Skeleton moves, engine does not",
-                "Write no movement blocks. The skeleton itself moves and snaps back "
-                "when the sequence loops, which is right only for something that really "
-                "does move in place")],
+                "Write no movement blocks and leave the motion in the keys, so the "
+                "skeleton itself moves and snaps back when the sequence loops. Right "
+                "where the travel belongs to the animation rather than to the character"),
+               ("in_place", "Nothing moves",
+                "Write no movement blocks and take the net ground distance back out of "
+                "the keys, so neither the engine nor the skeleton advances. The bob and "
+                "sway stay, so a run cycle still runs -- on the spot")],
         default="extract")
     chain: bpy.props.BoolProperty(
         name="Keep the animation chain", default=True,

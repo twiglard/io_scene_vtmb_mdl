@@ -468,16 +468,19 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
     rise -- in the keys, which is how a walk cycle is stored: the engine carries the
     entity, the skeleton stays put and still bobs. "none" leaves the whole path in the
     poses, which is right only for an animation that really does translate in model
-    space."""
+    space. "in_place" takes the same net displacement out and writes no block, so nothing
+    travels on either side."""
     moved = 0
     for act in _ordered(actions):
         poses = sample_action(context, arm_obj, act, d, scale, use_range)
         if not poses:
             raise Refused("action %r has no frames" % act.name)
         movements = ()
-        if root_motion == "extract":
-            movements, poses = write_mod.extract_root_motion(build_mod._skeleton(d), poses)
-            moved += bool(movements)
+        if root_motion in ("extract", "in_place"):
+            mvs, poses = write_mod.extract_root_motion(build_mod._skeleton(d), poses)
+            if root_motion == "extract":
+                movements = mvs
+                moved += bool(mvs)
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
         a = build_mod.add_animation(d, act.name, poses, fps, flags, movements)

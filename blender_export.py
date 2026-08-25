@@ -39,6 +39,22 @@ REST_EPS = 1e-6
 REST_POS_EPS = 1e-3
 REST_POS_REL = 1e-4
 REST_QUAT_EPS = 2e-3
+# A v2531 bone is a position and a quaternion; there is no scale field anywhere in
+# `mstudiobone_t`. So a scaled pose bone cannot be written, and a collapsed one is worse
+# than unwritable: `local_from_world` inverts a parent's matrix to take its children back
+# into its frame, and a singular matrix divides by zero in `mat_inverse` -- three frames
+# below where a user could see what caused it.
+#
+# Two tests, because the two need different bounds. Neither can be tight: file quaternions
+# are unit only to ~4.4e-5, the importer hands Blender the matrix rather than the channels,
+# and Blender back-solves a scale out of it. Measured over andrei, toreador, vv and
+# werewolf on an untouched import -- 48 000 samples over 40 frames each -- `pb.scale`
+# reaches 1.62e-04 off unit and the object-space `pb.matrix` reaches 4.0e-04, both worst on
+# `Bip01 R Thigh`. So this is set 60x above the drift and still far under any scale a user
+# would type.
+POSE_SCALE_EPS = 1e-2
+# A rotation has determinant 1, so this only has to separate collapsed from not.
+SINGULAR_DET = 1e-9
 SKIN_ATTR = "vtmb_skin"
 WEIGHT_ATTR = "vtmb_weight"
 COUNT_ATTR = "vtmb_numbones"
@@ -96,6 +112,34 @@ def renamed_bones(m, arm_obj, bmap=None):
             if b.name in bmap and bmap[b.name] != b.name}
 
 
+def _det3(w):
+    """Determinant of a 3x4's rotation part."""
+    return (w[0][0] * (w[1][1] * w[2][2] - w[1][2] * w[2][1])
+            - w[0][1] * (w[1][0] * w[2][2] - w[1][2] * w[2][0])
+            + w[0][2] * (w[1][0] * w[2][1] - w[1][1] * w[2][0]))
+
+
+def unwritable_scale(pbs, world, frame):
+    """Why this frame cannot be written, naming the bone, or None if it can.
+
+    Parents precede their children in the file, so a scale that came down the chain names
+    the bone it started on rather than the first descendant to notice it.
+    """
+    for pb, w in zip(pbs, world):
+        sc = tuple(pb.scale)
+        if any(abs(x - 1.0) > POSE_SCALE_EPS for x in sc):
+            return ("%r is scaled (%.4g, %.4g, %.4g) at frame %d. A v2531 bone holds a "
+                    "position and a rotation and has no scale field, so there is nowhere "
+                    "to write this: key the scale back to 1 and build the size into the "
+                    "geometry instead" % (pb.name, sc[0], sc[1], sc[2], frame))
+        if abs(_det3(w)) < SINGULAR_DET:
+            return ("%r has no volume at frame %d, so its pose matrix cannot be inverted "
+                    "and no child of it can be taken back into its frame. A constraint or "
+                    "a driver is the usual cause where the bone's own scale reads 1"
+                    % (pb.name, frame))
+    return None
+
+
 def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False):
     """Local (pos, quat) per bone per frame, inverting everything the importer applied.
 
@@ -114,6 +158,11 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_key
     for f in frames:
         scene.frame_set(f)
         world = [_rows(pb.matrix, scale) for pb in pbs]
+        bad = unwritable_scale(pbs, world, f)
+        if bad:
+            # `Refused` and not ValueError: both operators turn it into one clean line and
+            # no traceback, which is what a limit of the format deserves.
+            raise build_mod.Refused(bad)
         if root_motion_in_keys and anim is not None and anim.movements:
             off = mdl_mod.mat_inverse(mdl_mod.root_motion_matrix(anim, f))
             world = [mdl_mod.mat_mul(off, w) for w in world]
@@ -847,7 +896,17 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             movements = None
             if root_motion == "extract":
                 movements, poses = write_mod.extract_root_motion(m, poses)
+            elif root_motion == "in_place":
+                # No blocks and no net travel: the ramp `fit_movements` fits IS the net
+                # ground displacement, so subtracting it and throwing the block away is
+                # "extract" with nothing for the engine to carry. What the ramp does not
+                # account for stays in the keys -- the rise and sway of a run cycle, which
+                # an animation played in place should still have.
+                _mv, poses = write_mod.extract_root_motion(m, poses)
+                movements = []
             elif root_motion == "none":
+                # The travel stays on the skeleton, which is what 1344 of 10205 shipped
+                # animations do and the largest of the two travel-carrying groups.
                 movements = []
             edits[index] = {"poses": poses, "movements": movements,
                             "fps": fps if fps else action.get("vtmb_fps"),
