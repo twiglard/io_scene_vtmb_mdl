@@ -23,6 +23,7 @@ from . import mdl_build as build_mod
 from . import mdl_rebuild as rebuild_mod
 from . import mdl_write as write_mod
 from . import mesh_write as mesh_mod
+from . import paths as paths_mod
 from . import vtx_rebuild as vtxr_mod
 
 
@@ -846,7 +847,7 @@ def revise_vtx(source, dest, data, revised):
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
-                   model_name="", hull=None):
+                   model_name="", hull=None, cdtexture=None):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -905,6 +906,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         struct.pack_into("<3f", d.hdr, 180, *hull[0])
         struct.pack_into("<3f", d.hdr, 192, *hull[1])
         d.refit_boxes = True
+
+    # Compared normalised and written only where the lists differ, because normalising is
+    # not free: separators and repeats fold on 106 of 4445 models, which resolve the same
+    # either way but would stop coming back byte for byte if this rewrote them anyway.
+    cdtex = None
+    if cdtexture is not None:
+        want = paths_mod.cdtexture_list(cdtexture)
+        if paths_mod.engine_paths(want) != paths_mod.engine_paths(d.cdtextures):
+            cdtex = (list(d.cdtextures), build_mod.set_cdtextures(d, want))
 
     ad = arm_obj.animation_data
     if actions and ad is None:
@@ -1051,7 +1061,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
             "vtx": vtx, "removed": removed, "renamed": renamed,
-            "model_name": model_name, "hull": hull,
+            "model_name": model_name, "hull": hull, "cdtexture": cdtex,
             "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],

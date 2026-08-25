@@ -165,6 +165,14 @@ def _mesh_verts(base):
         return 0
 
 
+def _donor_cdtextures(base):
+    """The directory list the file being rewritten already carries."""
+    try:
+        return list(_cached_mdl(base).material_paths)
+    except Exception:
+        return []
+
+
 def _auto_name(op, context):
     """Which animation the active-action entry lands on, through the same resolver the
     write uses, so the dialog cannot name one slot while the write takes another."""
@@ -411,6 +419,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "prefix. A copy that keeps its donor's name lies in the one message "
                     "that matters when a .mdl and its .vtx stop pairing, since that "
                     "error prints this field and not the path actually loaded")
+    cdtexture: bpy.props.StringProperty(
+        name="Material dirs",
+        description="Where the engine looks for the .vmt files, under materials/. Each "
+                    "material name is tried in each of these in turn, and nothing binds "
+                    "a directory to a particular material. Several are separated by ;. "
+                    "The dialog starts this at what the armature was imported with, so "
+                    "editing it in the Object Data panel is what changes it; empty "
+                    "keeps the list the file already carries")
     root_motion_in_keys: bpy.props.BoolProperty(
         name="Imported with root motion", default=True,
         description="This action's keys still carry the motion an import put into them, "
@@ -481,6 +497,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         # A scripted run leaves `source` set, and operator properties persist, so without
         # this the next dialog silently rewrites whatever that script pinned.
         self.source = ""
+        # From the armature and not from the file: the import stamps the file's own list
+        # there, so they agree until the panel is used, and the panel is the edit this
+        # carries through. Empty with no stamp, which keeps the donor's.
+        self.cdtexture = ";".join(
+            blender_scratch.scene_cdtextures(context.active_object))
         base = _base_path(self, context)
         self.reading = os.path.basename(base) or "(none)"
         self.filepath = base or self.filepath
@@ -512,6 +533,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 row.prop(self, "model_name",
                          text="", placeholder=blender_scratch.embedded_name(self.filepath)
                          if self.filepath else "")
+                was = _donor_cdtextures(base)
+                box.prop(self, "cdtexture", placeholder=";".join(was))
+                dirs = paths.cdtexture_list(self.cdtexture) if self.cdtexture else []
+                if dirs and paths.engine_paths(dirs) != paths.engine_paths(was):
+                    _pair(box, "the file says",
+                          ";".join(was[:2]) + (" and %d more" % (len(was) - 2)
+                                               if len(was) > 2 else "")
+                          if was else "nothing", icon="ERROR")
                 extra = _surplus_bones(self, context, base)
                 if extra:
                     _pair(box, "bones not in the file", "%d, not written" % len(extra),
@@ -678,6 +707,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 model_name=(self.model_name or
                             (blender_scratch.embedded_name(self.filepath)
                              if self.options.is_invoke else "")),
+                cdtexture=self.cdtexture or None,
                 hull=(blender_scratch.fit_hull(
                     list(blender_export.mesh_objects(m, src).values()),
                     float(obj.get("vtmb_scale", 1.0) or 1.0))
@@ -764,6 +794,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         % (bi, mi, name))
         if r.get("model_name"):
             self.report({"INFO"}, "the file now calls itself %r" % r["model_name"])
+        if r.get("cdtexture"):
+            old, now = r["cdtexture"]
+            self.report({"INFO"}, "the material directories are now %s, where the file "
+                                  "had %s" % (", ".join(now), ", ".join(old) or "none"))
         renamed = r.get("renamed") or []
         if renamed:
             self.report({"INFO"},
