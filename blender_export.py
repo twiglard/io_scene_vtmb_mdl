@@ -256,23 +256,21 @@ def read_bones(m, arm_obj, scale):
 def surplus_bones(m, arm_obj):
     """Bones the armature has that the file does not, in armature order.
 
-    `read_bones` and `read_poses` both walk the file's bone list, so one added in Blender
-    is simply never visited and leaves no trace in the output. Writing it needs the
-    rebuilder (roadmap item 10); naming it costs one pass and turns an invisible loss into
-    a reported one.
+    `add_surplus_bones` writes these, so on the export path this comes back empty and a
+    name left in it is a bone that could not be placed. The export dialog calls it before
+    anything is written, where it is the list of bones the export is about to add.
     """
     have = set(bone_map(m, arm_obj).values())
     return [b.name for b in arm_obj.data.bones if b.name not in have]
 
 
-class _Reduced(object):
-    """`m` with the bone list a removal left behind.
+class _EditedBones(object):
+    """`m` with the bone list an add or a removal left behind.
 
-    Dropping a bone changes the file's bone list and nothing else a reader takes off `m`:
-    geometry, materials and animations are all still the donor's. So the bone list is
-    substituted and every other attribute delegates. `mdl_build._skeleton` is already what
-    hands that same list to `mdl_write`, and `blender_scratch` already passes it where an
-    `Mdl` is expected.
+    Either changes the file's bone list and nothing else a reader takes off `m`: geometry,
+    materials and animations are all still the donor's. So the bone list is substituted and
+    every other attribute delegates. `mdl_build._skeleton` is already what hands that same
+    list to `mdl_write`, and `blender_scratch` already passes it where an `Mdl` is expected.
     """
 
     def __init__(self, m, d):
@@ -301,6 +299,60 @@ def drop_missing_bones(d, m, arm_obj):
         out.append({"name": name, "children": kids, "slots": slots, "rigid": rigid,
                     "rebound": rebound})
     out.reverse()
+    return out
+
+
+def add_surplus_bones(d, m, arm_obj, scale):
+    """Append every armature bone the file does not have, parents before children.
+
+    The mirror of `drop_missing_bones`: Blender put the bone there and this is the file
+    catching up. `add_bone` appends, so nothing already in the file renumbers -- what it
+    must not do is emit a child ahead of its parent, because the engine walks the array
+    once in order and a child read first composes against a world matrix that has not been
+    computed. Armature order is neither hierarchy order nor stable, so a bone waits until
+    its parent has an index.
+
+    The rest transform is taken the way `read_bones` takes it, parent-local off Blender's
+    own `matrix_local`, so a bone whose parent is also new is placed against the parent
+    Blender shows rather than against anything the file holds.
+
+    A new bone has no `vtmb_bone_flags` to read, so it takes `BONE_USED` -- 62439 of 62702
+    corpus bones carry that bit, and a bone carrying no bit of the 0xfffc mask gets no bone
+    matrix, so anything skinned to it draws nothing.
+    """
+    dbs = arm_obj.data.bones
+    have = bone_map(m, arm_obj)
+    index = {}
+    for k, b in enumerate(m.bones):
+        arm_name = have.get(b.name)
+        if arm_name is not None:
+            index[arm_name] = k
+    todo, out = [b for b in dbs if b.name not in index], []
+    while todo:
+        left = []
+        for db in todo:
+            par = db.parent
+            if par is not None and par.name not in index:
+                left.append(db)
+                continue
+            local = db.matrix_local
+            if par is not None:
+                local = par.matrix_local.inverted() @ local
+            pos, quat = to_file(local, scale)
+            flags = bone_flags(arm_obj, db.name)
+            i = build_mod.add_bone(d, db.name,
+                                   index[par.name] if par is not None else -1,
+                                   pos, quat,
+                                   build_mod.BONE_USED if flags is None else flags)
+            index[db.name] = i
+            out.append({"name": db.name, "index": i,
+                        "parent": par.name if par is not None else None})
+        if len(left) == len(todo):
+            # Blender cannot hold a parent cycle, so this is a reader that stopped
+            # agreeing with `data.bones` rather than a scene the user can build.
+            raise ValueError("cannot place %s: no bone of it has a parent that resolves"
+                             % ", ".join(sorted(b.name for b in left)[:4]))
+        todo = left
     return out
 
 
@@ -881,7 +933,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     d = build_mod.from_bytes(bytes(m.d))
     removed = drop_missing_bones(d, m, arm_obj)
     if removed:
-        m = _Reduced(m, d)
+        m = _EditedBones(m, d)
+    # After the removal and before the rename: an index is stated against the bone list
+    # that will be written, and a bone added here has no stash, so its file name is its
+    # Blender name and `renamed_bones` has nothing to say about it.
+    added_bones = add_surplus_bones(d, m, arm_obj, scale)
+    if added_bones:
+        m = _EditedBones(m, d)
     # After the removal, so an index is stated against the bone list that will be written.
     # `m.bones` keeps the file's own names, which is what every reader here resolves
     # through `bone_map`, so renaming the record does not move the scene out from under it.
@@ -1049,23 +1107,25 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
-    # A bone removal moves no vertex and no triangle, so `revised` is empty -- and the .vtx
-    # still has to be rewritten, because every strip group's bone data is bound to the .mdl's
-    # numbering. `vtx_rebuild.revise` rebinds all of them off the model as written whether or
-    # not a cell was named, so an empty face map is the whole of what a removal needs.
+    # A bone removal or an append moves no vertex and no triangle, so `revised` is empty --
+    # and the .vtx still has to be rewritten, because every strip group's bone data is bound
+    # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
+    # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
+    # was named, so an empty face map is the whole of what either needs.
     vtx = (revise_vtx(source, dest, data, revised)
-           if (revised or removed) else None)
+           if (revised or removed or added_bones) else None)
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "dropped": dropped, "bones": len(m.bones),
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
-            "vtx": vtx, "removed": removed, "renamed": renamed,
+            "vtx": vtx, "removed": removed, "added_bones": added_bones,
+            "renamed": renamed,
             "model_name": model_name, "hull": hull, "cdtexture": cdtex,
             "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],
-            "stale": stale_flavours(dest) if (revised or removed) else []}
+            "stale": stale_flavours(dest) if (revised or removed or added_bones) else []}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

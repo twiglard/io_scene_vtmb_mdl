@@ -543,8 +543,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                           if was else "nothing", icon="ERROR")
                 extra = _surplus_bones(self, context, base)
                 if extra:
-                    _pair(box, "bones not in the file", "%d, not written" % len(extra),
-                          icon="ERROR")
+                    _pair(box, "bones not in the file",
+                          "%d, appended on export" % len(extra), icon="BONE_DATA")
                     box.label(text="    " + ", ".join(extra[:3])
                               + ("" if len(extra) <= 3 else " and %d more"
                                  % (len(extra) - 3)))
@@ -782,6 +782,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                "" if len(gone["rebound"]) == 1 else "s",
                                "s" if len(gone["rebound"]) == 1 else "",
                                ", ".join(gone["rebound"][:3])))))
+        for got in r.get("added_bones") or []:
+            self.report({"INFO"},
+                        "%r is in the armature and was not in the file, and is now bone "
+                        "%d%s. Every animation grew an entry for it holding the bind "
+                        "pose, and the chain joins by name, so an including model that "
+                        "has no bone of that name leaves it unmatched"
+                        % (got["name"], got["index"],
+                           "" if got["parent"] is None else
+                           " under %r" % got["parent"]))
         if r.get("boxes") is not None:
             done, total = r["boxes"]
             self.report({"INFO"} if done == total else {"WARNING"},
