@@ -236,7 +236,13 @@ def cursor_fields(b):
         s = a.i(276) + k * 764
         pair(s + 0x14, s + 0x18)
         pair(s + 0x2c4, s + 0x2c8)
-        out.append(s + 0x2c0)
+        # vampire.dll 103ea982 skips the melee tail unless numknockbacks >= 1, so
+        # +0x2c0 addresses a hit-volume table only there; the 7 props that reach it
+        # with none hold studiomdl's write cursor in both +0x2bc and +0x2c0.
+        if a.i(s + 0x2c4) > 0:
+            pair(s + 0x2bc, s + 0x2c0)
+        else:
+            out.append(s + 0x2c0)
         # 764 at +0x294 is the same write cursor as +0x18 and +0x298, not a count, and an
         # index with no readable count is worth less than no autolayers at all.
         if not 0 < a.i(s + 0x294) < 64:
@@ -414,6 +420,46 @@ def masked_sections(b):
             if s > 0 and n != "string run"]
 
 
+def _span(b, at, n):
+    """Bounded, so a stale offset compares unequal instead of raising."""
+    if at < 0 or n < 0 or at + n > len(b):
+        return None
+    return bytes(b[at:at + n])
+
+
+def melee(b):
+    """Each sequence's hit-volume and knockback records, szactivity words blanked.
+
+    A sequence is compared below as five scalars, so the whole melee tail rode on
+    `masked_sections` happening to size it.  BUGS §17 is a writer that kept the record
+    count at +0x2bc and wrote the offset at +0x2c0 as 0, which leaves the reader walking
+    count*24 bytes from the seqdesc's own first byte.  Both halves are stated here: the
+    count travels as itself and the offset as whatever it resolves to.  The offset word is
+    excluded -- like every other index in the file it is what a relayout moves.
+    """
+    m = S.Map(b)
+    out = []
+    for k in range(m.i(272)):
+        s = m.i(276) + k * 764
+        nkb = m.i(s + 0x2c4)
+        if nkb <= 0:
+            # vampire.dll 103ea982 jumps past the whole tail, so neither word addresses
+            # anything and the 7 props holding a write cursor in both are not a table.
+            out.append(None)
+            continue
+        nhv = m.i(s + 0x2bc)
+        hv = _span(b, s + m.i(s + 0x2c0), nhv * 24) if nhv > 0 else b""
+        kb = s + m.i(s + 0x2c8)
+        recs = []
+        for j in range(nkb):
+            rec = bytearray(_span(b, kb + j * 188, 188) or b"")
+            for t in range(16 if len(rec) == 188 else 0):
+                struct.pack_into("<i", rec, 0x78 + t * 4, 0)
+            recs.append(bytes(rec))
+        out.append((nhv, hv, tuple(recs)))
+    return out
+
+
 def verify(src, out, same_checksum=True):
     """Everything a reader can see must read back the same.
 
@@ -439,6 +485,7 @@ def verify(src, out, same_checksum=True):
     cmp("bones", [_bone(x) for x in a.bones], [_bone(x) for x in g.bones])
     cmp("sequences", [(s.label, s.activity, s.flags, s.groupsize, s.blends) for s in a.seqs],
                      [(s.label, s.activity, s.flags, s.groupsize, s.blends) for s in g.seqs])
+    cmp("melee tail", melee(src), melee(out))
     cmp("animdescs", [(x.name, x.fps, x.flags, x.numframes) for x in a.anims],
                      [(x.name, x.fps, x.flags, x.numframes) for x in g.anims])
     cmp("movements",
