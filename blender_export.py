@@ -166,6 +166,46 @@ def surplus_bones(m, arm_obj):
     return [b.name for b in arm_obj.data.bones if b.name not in have]
 
 
+class _Reduced(object):
+    """`m` with the bone list a removal left behind.
+
+    Dropping a bone changes the file's bone list and nothing else a reader takes off `m`:
+    geometry, materials and animations are all still the donor's. So the bone list is
+    substituted and every other attribute delegates. `mdl_build._skeleton` is already what
+    hands that same list to `mdl_write`, and `blender_scratch` already passes it where an
+    `Mdl` is expected.
+    """
+
+    def __init__(self, m, d):
+        self._m = m
+        self.bones = build_mod._skeleton(d).bones
+
+    def __getattr__(self, name):
+        return getattr(self._m, name)
+
+
+def drop_missing_bones(d, m, arm_obj):
+    """Take out of `d` every bone the armature no longer has, highest index first.
+
+    Blender performed the deletion and this is the file catching up, so nothing here decides
+    what a removal means -- `read_bones` takes each survivor's rest matrix against the file's
+    reparented chain afterwards, which is Blender's own geometry.
+
+    Descending, because an index is stated against the file as it was and `remove_bone`
+    renumbers everything above the bone it takes and nothing below. `Refused` is left to
+    reach the operator, which reports it.
+    """
+    dbs = arm_obj.data.bones
+    gone = [k for k, b in enumerate(m.bones) if b.name not in dbs]
+    out = []
+    for k in reversed(gone):
+        name, kids, slots, rigid, rebound = build_mod.remove_bone(d, k)
+        out.append({"name": name, "children": kids, "slots": slots, "rigid": rigid,
+                    "rebound": rebound})
+    out.reverse()
+    return out
+
+
 def mesh_objects(m, source):
     """{(bodypart index, model index): object} for the scene meshes belonging to `m`.
 
@@ -717,6 +757,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if bad:
             raise ValueError("the writer does not reproduce %s, so nothing was written: %s"
                              % (os.path.basename(source), "; ".join(bad)))
+    # Before the first reader: `read_poses` and `read_bones` both walk the FILE's bone list
+    # and refuse by name on one the armature does not have, so a bone deleted in Blender has
+    # to leave the description here or it never reaches the writer.
+    d = build_mod.from_bytes(bytes(m.d))
+    removed = drop_missing_bones(d, m, arm_obj)
+    if removed:
+        m = _Reduced(m, d)
+
     ad = arm_obj.animation_data
     if actions and ad is None:
         raise ValueError("%s has no animation data" % arm_obj.name)
@@ -773,7 +821,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if ad is not None and ad.action is not restore:
             ad.action = restore
 
-    d = build_mod.apply_anims(build_mod.from_bytes(bytes(m.d)), edits, source)
+    d = build_mod.apply_anims(d, edits, source)
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "stale": 0,
              "surplus": surplus_bones(m, arm_obj)}
@@ -840,13 +888,19 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
-    vtx = revise_vtx(source, dest, data, revised) if revised else None
+    # A bone removal moves no vertex and no triangle, so `revised` is empty -- and the .vtx
+    # still has to be rewritten, because every strip group's bone data is bound to the .mdl's
+    # numbering. `vtx_rebuild.revise` rebinds all of them off the model as written whether or
+    # not a cell was named, so an empty face map is the whole of what a removal needs.
+    vtx = (revise_vtx(source, dest, data, revised)
+           if (revised or removed) else None)
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "dropped": dropped, "bones": len(m.bones),
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
-            "vtx": vtx, "stale": stale_flavours(dest) if revised else []}
+            "vtx": vtx, "removed": removed,
+            "stale": stale_flavours(dest) if (revised or removed) else []}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

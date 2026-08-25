@@ -496,7 +496,12 @@ def build_meshes(context, m, arm_obj, name, scale, content):
                 obj.vertex_groups.new(name=b.name)
             groups = obj.vertex_groups
             for vi, v_ in enumerate(verts):
-                for bone, weight in zip(v_.bones, v_.weights):
+                # Sliced to numbones: `bones` and `weights` are always four long and the
+                # fourth weight is the shortfall 255 - sum(stored), so a vertex with none
+                # live reads as bone 0 at weight 1.0 and follows the root instead of
+                # nothing. 5716 shipped vertices over 13 models have numbones 0.
+                n_ = v_.numbones
+                for bone, weight in zip(v_.bones[:n_], v_.weights[:n_]):
                     if weight > 0.0 and 0 <= bone < len(m.bones):
                         groups[m.bones[bone].name].add([vi], weight, "REPLACE")
         obj.parent = arm_obj

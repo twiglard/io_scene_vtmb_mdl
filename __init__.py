@@ -683,6 +683,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name in r["stale"]:
             self.report({"WARNING"}, "%s beside the model still describes the old "
                                      "geometry; only .dx80.vtx is written" % name)
+        for gone in r.get("removed") or []:
+            self.report({"WARNING"},
+                        "%r is not in the armature and was removed from the file: "
+                        "%d child%s reparented onto its parent, %d vertex slot%s "
+                        "repointed, %d vertex%s left following nothing%s"
+                        % (gone["name"],
+                           len(gone["children"]),
+                           "" if len(gone["children"]) == 1 else "ren",
+                           gone["slots"], "" if gone["slots"] == 1 else "s",
+                           gone["rigid"], "" if gone["rigid"] == 1 else "es",
+                           ("" if not gone["rebound"] else
+                            ", and %d record%s that named it now name%s its parent: %s"
+                            % (len(gone["rebound"]),
+                               "" if len(gone["rebound"]) == 1 else "s",
+                               "s" if len(gone["rebound"]) == 1 else "",
+                               ", ".join(gone["rebound"][:3])))))
         surplus = r["scene"]["surplus"]
         if surplus:
             self.report({"WARNING"}, "%d bone%s of this armature %s not in %s and %s not "
