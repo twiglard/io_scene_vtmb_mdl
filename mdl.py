@@ -322,9 +322,10 @@ class Mdl:
         # same offset of that struct: a file carrying the animdesc bit and not this one
         # plays once and stops -- measured in game 2026-08-22 on ztest/zskel_loop.mdl.
         s.flags = struct.unpack_from("<i", d, off + 8)[0]
-        # The cull volume, and the one field a from-scratch writer cannot leave zero:
-        # zero here and the engine draws the model, then drops it the moment the camera
-        # turns. See plans/todo-vtmb-mdl-roadmap.md item 31.
+        # Mod_GetBounds (engine.dll 200b5970) only *widens* hull_min/hull_max with this,
+        # so a zero one does not stop the model drawing.  vampire.dll 10090c80 is the one
+        # place it is read alone, sizing an entity's collision hull, and substitutes 0.0
+        # per component where this box is the smaller.
         s.bbmin = struct.unpack_from("<3f", d, off + SEQ_BBMIN)
         s.bbmax = struct.unpack_from("<3f", d, off + SEQ_BBMIN + 12)
         gx, gy = struct.unpack_from("<ii", d, off + SEQ_GROUPSIZE)
