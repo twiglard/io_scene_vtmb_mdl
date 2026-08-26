@@ -1,15 +1,18 @@
-"""The armature's two path lists, in Properties > Object Data.
+"""The armature's two path lists, in Properties > Object Data, and the per-action fields
+in the Action editor's sidebar.
 
 They are the plain custom properties the rest of the addon already reads -- an import
-stamps both, a bone-set template writes `vtmb_includes` -- so this edits those keys rather
-than shadowing them in a PropertyGroup. Neither is reachable from a mesh or a material:
-the `.mdl` binds them to the model, not to anything the scene has one of per material.
+stamps them, a bone-set template writes `vtmb_includes` -- so this edits those keys rather
+than shadowing them in a PropertyGroup. The path lists are not reachable from a mesh or a
+material: the `.mdl` binds them to the model, not to anything the scene has one of per
+material.
 """
 
 import os
 
 import bpy
 
+from . import blender_export
 from . import blender_import
 from . import blender_scratch
 from . import paths as paths_mod
@@ -28,6 +31,71 @@ def _store(obj, key, value):
         obj[key] = out
     elif obj.get(key) is not None:
         del obj[key]
+
+
+MODE_ITEMS = (
+    ("unset", "Not set",
+     "Leave it to the export dialog, which falls back to the animation this action came "
+     "from: the file's own blocks where it had one, nothing where it did not"),
+    ("keep", "Engine carries the character, as the file has it",
+     "Reuse the movement blocks the file already has, unchanged. A from-scratch export "
+     "has no file to keep them from and fits them from the keys instead"),
+    ("extract", "Engine carries the character",
+     "Fit new movement blocks to the root bone's path in the scene, replacing whatever "
+     "the file had"),
+    ("none", "Skeleton moves, engine does not",
+     "Write no movement blocks and leave the motion in the keys, so the skeleton itself "
+     "walks away from the origin. 1344 of the game's own animations do this"),
+    ("in_place", "Nothing moves",
+     "Write no movement blocks and take the net ground distance back out of the keys. "
+     "The bob and sway stay, so a run cycle still runs -- on the spot"),
+)
+
+
+def _mode_get(action):
+    v = action.get(blender_export.MODE_ATTR)
+    for i, item in enumerate(MODE_ITEMS):
+        if item[0] == v:
+            return i
+    return 0
+
+
+def _mode_set(action, index):
+    if index <= 0:
+        if action.get(blender_export.MODE_ATTR) is not None:
+            del action[blender_export.MODE_ATTR]
+    else:
+        action[blender_export.MODE_ATTR] = MODE_ITEMS[index][0]
+
+
+def _loops_get(action):
+    return bool(int(action.get("vtmb_seq_flags") or 0) & 1)
+
+
+def _loops_set(action, value):
+    flags = int(action.get("vtmb_seq_flags") or 0)
+    action["vtmb_seq_flags"] = (flags | 1) if value else (flags & ~1)
+
+
+def _activity_get(action):
+    return str(action.get("vtmb_activity") or "")
+
+
+def _activity_set(action, value):
+    value = str(value).strip()
+    if value:
+        action["vtmb_activity"] = value
+    elif action.get("vtmb_activity") is not None:
+        del action["vtmb_activity"]
+
+
+def panel_action(context):
+    """The action a sidebar panel is about: the Action editor's, else the object's."""
+    act = getattr(context.space_data, "action", None)
+    if act is not None:
+        return act
+    ad = context.object.animation_data if context.object is not None else None
+    return ad.action if ad is not None else None
 
 
 def _append(obj, key, path):
@@ -215,8 +283,54 @@ class VTMB_PT_armature(bpy.types.Panel):
         lay.operator(VTMB_OT_check_paths.bl_idname, icon="VIEWZOOM")
 
 
+class VTMB_PT_action(bpy.types.Panel):
+    bl_label = "VTMB"
+    bl_space_type = "DOPESHEET_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "VTMB"
+
+    @classmethod
+    def poll(cls, context):
+        return panel_action(context) is not None
+
+    def draw(self, context):
+        act = panel_action(context)
+        lay = self.layout
+        lay.use_property_split = False
+
+        col = lay.column(align=True)
+        col.label(text=act.name, icon="ACTION")
+        col.prop(act, "vtmb_root_motion_choice", text="")
+        if act.get(blender_export.MODE_ATTR) is None:
+            col.label(text="    -> " + _fallback_line(act))
+
+        col = lay.column(align=True)
+        col.prop(act, "vtmb_loops")
+        col.prop(act, "vtmb_activity_text")
+
+        nmv = act.get("vtmb_movements")
+        if nmv is not None:
+            col = lay.column(align=True)
+            col.label(text="came from an animation with %d movement block%s"
+                           % (nmv, "" if nmv == 1 else "s"), icon="INFO")
+            col.label(text="keys %s the travel"
+                           % ("carry" if act.get("vtmb_root_motion") else "do not carry"))
+
+
+def _fallback_line(act):
+    """What Not set resolves to, so the field is never silently a guess."""
+    try:
+        mode = blender_export.root_motion_mode(act, blender_export.PER_ACTION)
+    except ValueError as exc:
+        return str(exc)
+    for item in MODE_ITEMS:
+        if item[0] == mode:
+            return item[1]
+    return mode
+
+
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
-           VTMB_PT_armature]
+           VTMB_PT_armature, VTMB_PT_action]
 
 _PROPS = (
     ("vtmb_cdtexture_text", CDTEXTURE, "Material dirs",
@@ -238,9 +352,27 @@ def register_props():
             name=name, description=desc,
             get=(lambda k: lambda self: _text(self, k))(key),
             set=(lambda k: lambda self, v: _store(self, k, v))(key)))
+    bpy.types.Action.vtmb_root_motion_choice = bpy.props.EnumProperty(
+        name="Root motion", items=MODE_ITEMS, get=_mode_get, set=_mode_set,
+        description="What a re-export does with this action's travel. Not set leaves it "
+                    "to the export dialog, which reads the animation this action came "
+                    "from -- a block in the file means the engine carries it")
+    bpy.types.Action.vtmb_loops = bpy.props.BoolProperty(
+        name="Loops", get=_loops_get, set=_loops_set,
+        description="Bit 0 of the sequence flags, which is what the engine reads to play "
+                    "this animation round again rather than holding its last frame. "
+                    "mstudioanimdesc_t has its own flags field and the engine does not "
+                    "read looping from it")
+    bpy.types.Action.vtmb_activity_text = bpy.props.StringProperty(
+        name="Activity", get=_activity_get, set=_activity_set,
+        description="The activity the sequence written for this action claims, e.g. "
+                    "ACT_IDLE. Empty takes whichever the export dialog offers")
 
 
 def unregister_props():
     for attr, _key, _name, _desc in _PROPS:
         if hasattr(bpy.types.Object, attr):
             delattr(bpy.types.Object, attr)
+    for attr in ("vtmb_root_motion_choice", "vtmb_loops", "vtmb_activity_text"):
+        if hasattr(bpy.types.Action, attr):
+            delattr(bpy.types.Action, attr)

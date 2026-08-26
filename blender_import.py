@@ -400,7 +400,12 @@ def build_meshes(context, m, arm_obj, name, scale, content):
     path, blob = content.companion(m, vtx_mod.SUFFIXES)
     if path is None:
         return [], "no .vtx for this .mdl on any content root, so no faces to import"
-    v = vtx_mod.Vtx(path, blob)
+    try:
+        v = vtx_mod.Vtx(path, blob)
+    except Exception as exc:
+        # The bones and the animations are in the .mdl and are readable, so a broken
+        # companion costs the geometry and not the import.
+        return [], "%s does not parse: %s: %s" % (path, type(exc).__name__, exc)
     if v.checksum != m.checksum:
         return [], ("checksum mismatch: .vtx %#x vs .mdl %#x -- they are not a pair"
                     % (v.checksum & 0xffffffff, m.checksum & 0xffffffff))
@@ -676,6 +681,9 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
         # it was ever put in -- a.movements alone does not say.
         action["vtmb_root_motion"] = in_keys
         action["vtmb_movements"] = len(a.movements)
+        # Per action rather than one choice for the whole export. On an animation with no
+        # block "keep" and "none" are the same write, so this reproduces the file.
+        action["vtmb_root_motion_mode"] = "keep" if a.movements else "none"
         made.append(action)
     # Leave the first action assigned and slotted. Blender 4.4+ actions hold channels
     # per slot, and an unslotted assignment shows an empty Action Editor.
@@ -769,7 +777,29 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
             % (len(missing), ", ".join(missing[:3]))
         warning = "%s; %s" % (warning, note) if warning else note
 
+    # Only family 0 is built into material slots -- `_material` reads m.skins[0] and there
+    # is nowhere in Blender for the others to go. Nothing is lost on a round trip, because
+    # no export path rewrites the skin table, but the alternate looks are not in the scene
+    # and the file gives no other sign of them.
+    arm_obj["vtmb_skin_families"] = len(m.skins)
+    alt = sum(1 for f in m.skins[1:] if f != m.skins[0]) if m.skins else 0
+    arm_obj["vtmb_skin_alt"] = alt
+    if alt:
+        note = ("%d of the file's %d skin families differ from the first, and only the "
+                "first is in the scene; a rebuild that regenerates the table from the "
+                "material slots flattens them all to it" % (alt, len(m.skins)))
+        warning = "%s; %s" % (warning, note) if warning else note
+
     packed = sum(len(v.index) for v in content.packs if v is not None)
+    clash = [x for v in content.packs if v is not None for x in v.collisions]
+    if clash:
+        # Two names differing only in case are one file on disk, so which of them the
+        # engine serves is not what this reader picked. Silence here would show up as a
+        # texture that resolves to the wrong image and nothing to read it off.
+        seen = ", ".join("%s %s" % (c[0], c[1]) for c in clash[:3])
+        note = ("%d name(s) in one archive differ only in case, so one hides the "
+                "other: %s" % (len(clash), seen))
+        warning = "%s; %s" % (warning, note) if warning else note
     mats = {mm for o in objs for mm in o.data.materials if mm}
     lit = sum(1 for mm in mats if mm.get("vtmb_texture"))
     if mats and not lit:

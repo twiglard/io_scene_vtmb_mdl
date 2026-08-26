@@ -40,12 +40,43 @@ VERSION = ".".join(str(x) for x in bl_info["version"])
 
 ACTIVE, ALL, NONE = "~active", "~all", "~none"
 SPLIT = 0.34
+ROOT_MOTION_LABELS = {"keep": "the file's own blocks",
+                      "extract": "the engine carries it",
+                      "none": "the skeleton moves",
+                      "in_place": "nothing moves"}
 
 
 def _pair(box, key, value, icon="NONE"):
     row = box.split(factor=SPLIT)
     row.label(text=key)
     row.label(text=value, icon=icon)
+
+
+def _mode_tally(actions):
+    """How the actions of a whole-scene write split across the four modes."""
+    got = {}
+    for act in actions:
+        mode = blender_export.root_motion_mode(
+            act, blender_export.PER_ACTION, donor=False, default="extract")
+        got[mode] = got.get(mode, 0) + 1
+    return ", ".join("%d %s" % (got[k], ROOT_MOTION_LABELS[k])
+                     for k in blender_export.ROOT_MOTION_MODES if k in got) or "no actions"
+
+
+def _report_unfitted(op, names):
+    """Actions asking the engine to carry them whose keys do not travel.
+
+    An import with Root motion off never puts the travel in the scene, so nothing can fit
+    a block from it and the animation loses the one it came with.
+    """
+    if not names:
+        return
+    op.report({"WARNING"},
+              "%d action%s ask the engine to carry the character, and their keys do not "
+              "travel, so no movement block was written: %s. That is what an import with "
+              "Root motion off leaves behind -- the travel never reached the scene"
+              % (len(names), "" if len(names) == 1 else "s", ", ".join(names[:3])
+                 + ("" if len(names) <= 3 else " and %d more" % (len(names) - 3))))
 
 
 def _section(lay, idname, title, icon="NONE"):
@@ -441,7 +472,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "the movement blocks in the file")
     root_motion: bpy.props.EnumProperty(
         name="Root motion",
-        items=[("keep", "Engine carries the character, as the file has it",
+        items=[("per_action", "Each action's own",
+                "Every action decides for itself, from the Root motion field in the "
+                "Action editor's sidebar. An import stamps that field to match the "
+                "animation it came from, so this reproduces the file; an action that "
+                "was never imported and was never set keeps the file's blocks. This is "
+                "what a character wants -- a walk cycle is carried by the engine while a "
+                "land or a charge travels on its own"),
+               ("keep", "Engine carries the character, as the file has it",
                 "Reuse the movement blocks the file already has, unchanged. Right "
                 "whenever you did not move the animation, only changed how it looks. "
                 "This is about the file's blocks; whether the keys in the scene still "
@@ -461,7 +499,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 "Write no movement blocks and take the net ground distance back out of "
                 "the keys, so neither the engine nor the skeleton advances. The bob and "
                 "sway stay, so a run cycle still runs -- on the spot")],
-        default="keep")
+        default="per_action")
     use_range: bpy.props.BoolProperty(
         name="Scene range", default=False,
         description="Write the scene's Start and End frames rather than the action's "
@@ -632,6 +670,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                           "%d carry a movement block" % nmv)
                 box.prop(self, "root_motion_in_keys")
                 box.prop(self, "root_motion", text="")
+                if self.root_motion == blender_export.PER_ACTION:
+                    try:
+                        _pair(box, "this action writes", ROOT_MOTION_LABELS[
+                            blender_export.root_motion_mode(act, self.root_motion)])
+                    except (ValueError, KeyError) as exc:
+                        box.label(text=str(exc), icon="ERROR")
 
         nverts = _mesh_verts(base)
         fields = _mesh_fields(self)
@@ -727,6 +771,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             return {"CANCELLED"}
         finally:
             context.scene.frame_set(frame)
+        _report_unfitted(self, r.get("unfitted"))
         mesh = r["mesh"]
         if mesh["missing"] and mesh["fields"]:
             self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "
@@ -1022,7 +1067,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     "own first and last keyframe")
     root_motion: bpy.props.EnumProperty(
         name="Root motion",
-        items=[("extract", "Engine carries the character",
+        items=[("per_action", "Each action's own",
+                "Every action decides for itself, from the Root motion field in the "
+                "Action editor's sidebar. There is no donor file here, so an action set "
+                "to keep the file's blocks has them fitted from its keys instead -- the "
+                "only way to say the engine carries this one when there is nothing to "
+                "keep. An action that was never imported and was never set is extracted"),
+               ("extract", "Engine carries the character",
                 "Put the ground distance the root covers into a movement block, so the "
                 "engine carries the character while the animation plays on the spot. "
                 "The bob and sway stay in the keys. This is what a walk cycle wants, "
@@ -1035,7 +1086,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 "Write no movement blocks and take the net ground distance back out of "
                 "the keys, so neither the engine nor the skeleton advances. The bob and "
                 "sway stay, so a run cycle still runs -- on the spot")],
-        default="extract")
+        default="per_action")
     chain: bpy.props.BoolProperty(
         name="Keep the animation chain", default=True,
         description="Write the included models the armature carries, so the engine reads "
@@ -1074,13 +1125,6 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         obj = context.active_object
         self.scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
         self.cdtexture = _scratch_cdtexture(obj)
-        # `extract` only where the import found travel for it to find. A file whose
-        # animations carry no mstudiomovement_t has nothing to extract, so extracting
-        # would invent blocks the donor never had; "none" leaves the keys as they came in.
-        # Seeded here rather than declared as a default, which cannot read the scene.
-        nmv = obj.get("vtmb_movement_anims")
-        if nmv is not None:
-            self.root_motion = "extract" if nmv else "none"
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -1133,6 +1177,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             row = box.row()
             row.label(text="Root motion")
             row.prop(self, "root_motion", text="")
+            # This operator writes every action, so one action's answer says nothing --
+            # what the setting means here is the split across all of them.
+            if self.root_motion == blender_export.PER_ACTION:
+                try:
+                    _pair(box, "which is", _mode_tally(actions))
+                except ValueError as exc:
+                    box.label(text=str(exc), icon="ERROR")
             box.prop(self, "chain")
             chain = blender_scratch.scene_includes(obj)
             if not chain:
@@ -1181,6 +1232,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "%s: %s -- traceback on the console"
                         % (type(exc).__name__, exc))
             return {"CANCELLED"}
+        _report_unfitted(self, r.get("unfitted"))
         if r["unskinned"]:
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
                                      "bone 0, which drags them wherever it goes"

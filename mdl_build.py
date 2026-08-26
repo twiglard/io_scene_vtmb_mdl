@@ -58,6 +58,15 @@ MAXSTUDIOVERTS = 20000
 # being refused.  Corpus max is 343.  Measured four ways in recon §45.3.
 MAXSTUDIOBONES = 350
 
+# 20, and in no header at all.  All three vampire.dll melee walkers clamp the count
+# themselves -- `if (numknockbacks >= 0x14) numknockbacks = 0x14` in
+# CBaseCombatCharacter__MeleeSwingStep_vtmb 0x10343020, ..IsMeleeSwingActive_vtmb 0x103451d0
+# and ..IsMeleeSwingOver_vtmb 0x10345330 -- and the two per-record entity arrays behind them
+# are sized for 20: six floats at entity[i*6 + 0x2b0] and five dwords at entity[i*5 + 0x32b].
+# Record 21 and up are written, pass every offline reader, and never run.  Corpus maximum is
+# 17 over 1587 records, so nothing shipped reaches it.  Recon §54.1.
+MAXSTUDIOKNOCKBACKS = 20
+
 # A bone carrying no bit of the 0xfffc used-by mask gets no bone matrix, so anything skinned
 # to it draws nothing.  0x10 is the corpus norm: 62439 of 62702 bones carry it.
 BONE_USED = 0x10
@@ -566,6 +575,15 @@ def emit(d, checksum=None, drop=False):
         raise Refused("armature carries %d bones against MAXSTUDIOBONES %d, so the game "
                       "indexes its per-bone arrays past the end"
                       % (len(d.bones), MAXSTUDIOBONES))
+    over_kb = [(k, r) for k, r in enumerate(d.seqs)
+               if len(r.extra.get("knockbacks") or []) > MAXSTUDIOKNOCKBACKS]
+    if over_kb:
+        k, r = over_kb[0]
+        raise Refused("sequence %r carries %d knockback records against "
+                      "MAXSTUDIOKNOCKBACKS %d, and every melee walk clamps at that, so the "
+                      "records past it are written and never run"
+                      % (r.name if r.name else k,
+                         len(r.extra["knockbacks"]), MAXSTUDIOKNOCKBACKS))
     counts = model_vertex_counts(d)
     over = [c for c in counts if c[2] > MAXSTUDIOVERTS]
     if over:
@@ -1193,7 +1211,10 @@ def remove_bone(d, i):
             if struct.unpack_from("<i", links, j * 28)[0] == i:
                 raise Refused("IK chain %r link %d is bone %r" % (r.name, j, name))
     for k, r in enumerate(d.springbones):
-        if i in struct.unpack_from("<2i", r.raw, 0x00):
+        # +0x00 is -1-bone when the sign is set (client.dll:0x100ac115); +0x04's -1 is the
+        # walk-to-the-leaf sentinel, not an encoded index, so it is compared raw.
+        v, e = struct.unpack_from("<2i", r.raw, 0x00)
+        if (v if v >= 0 else -1 - v) == i or e == i:
             raise Refused("spring bone chain %d is anchored to bone %r" % (k, name))
 
     parent = struct.unpack_from("<i", d.bones[i].raw, 0x04)[0]
@@ -1249,18 +1270,23 @@ def remove_bone(d, i):
 
     rebound = []
 
-    def patch(buf, at, what):
+    def patch(buf, at, what, signed=False):
         """A record that named the removed bone passes to its parent rather than keeping
         an index that now names a different bone. Parents always precede their children,
-        so the parent's own index never renumbers."""
+        so the parent's own index never renumbers.
+
+        `signed` is the spring bone's -1-bone form: decode, renumber, re-encode."""
         v = struct.unpack_from("<i", buf, at)[0]
+        neg = signed and v < 0
+        if neg:
+            v = -1 - v
         if v > i:
-            struct.pack_into("<i", buf, at, v - 1)
+            struct.pack_into("<i", buf, at, -v if neg else v - 1)
         elif v == i:
             if parent < 0:
                 raise Refused("%s is bound to bone %r, which is a root: there is no "
                               "parent to pass it to" % (what, name))
-            struct.pack_into("<i", buf, at, parent)
+            struct.pack_into("<i", buf, at, -1 - parent if neg else parent)
             rebound.append(what)
 
     for r in d.bones:
@@ -1275,13 +1301,22 @@ def remove_bone(d, i):
     for k, r in enumerate(d.mouths):
         patch(r.raw, 0x00, "mouth %d" % k)
     for k, r in enumerate(d.springbones):
-        patch(r.raw, 0x00, "spring bone chain %d" % k)
+        patch(r.raw, 0x00, "spring bone chain %d" % k, signed=True)
         patch(r.raw, 0x04, "spring bone chain %d end" % k)
     for r in d.ikchains:
         links = bytearray(r.extra.get("links") or b"")
         for j in range(len(links) // 28):
             patch(links, j * 28, "IK chain %r link %d" % (r.name, j))
         r.extra["links"] = bytes(links)
+    # mstudioknockback_t +0x08. The trail is drawn off this bone's world matrix, and
+    # Studio_ChainedBoneToLocal_vtmb (client.dll 0x1008dc70) hands the index back unchanged
+    # when the sequence is below hdr->numseq -- which every record reached through this
+    # file's own seqdesc array is -- so the number is this file's own numbering and
+    # renumbers with it. A record reached through an include belongs to the include's
+    # removal instead.
+    for k, r in enumerate(d.seqs):
+        for j, x in enumerate(r.extra.get("knockbacks") or []):
+            patch(x.raw, 0x08, "knockback %d of sequence %r" % (j, r.name if r.name else k))
 
     moved = rigid = 0
     for bi, bp in enumerate(d.bodyparts):

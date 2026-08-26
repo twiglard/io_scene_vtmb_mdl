@@ -59,6 +59,48 @@ SINGULAR_DET = 1e-9
 SKIN_ATTR = "vtmb_skin"
 WEIGHT_ATTR = "vtmb_weight"
 COUNT_ATTR = "vtmb_numbones"
+ROOT_MOTION_MODES = ("keep", "extract", "none", "in_place")
+PER_ACTION = "per_action"
+MODE_ATTR = "vtmb_root_motion_mode"
+
+
+def root_motion_mode(action, chosen, donor=True, default="keep"):
+    """Which of the four writes this action's travel takes.
+
+    `chosen` is the export dialog's setting and forces every action unless it is
+    `per_action`, which reads the action instead. An action with no stamp falls back to
+    the count the import stamps beside it -- `keep` where the animation it came from
+    carried a movement block, `none` where it did not, which reproduces the file -- and an
+    action that was never imported falls back to `default`.
+
+    A stamped `keep` means the movement blocks the file already has, so where there is no
+    donor animation behind the action -- the scratch export, and an append -- it becomes
+    `extract`: fitting blocks from the keys is the only way to say the engine carries this
+    one when there is nothing to keep.
+    """
+    # A forced mode is taken literally, `keep` included: only a stamp is reinterpreted,
+    # so a caller naming one of the four still gets exactly it.
+    if chosen != PER_ACTION:
+        return chosen
+    mode = action.get(MODE_ATTR)
+    if mode is None:
+        nmv = action.get("vtmb_movements")
+        mode = default if nmv is None else ("keep" if nmv else "none")
+    mode = str(mode)
+    if mode not in ROOT_MOTION_MODES:
+        raise ValueError("action %r carries %s %r, which is none of %s"
+                         % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)))
+    return "extract" if (mode == "keep" and not donor) else mode
+
+
+def lost_travel(action, movements):
+    """True where an action asked the engine to carry it and the keys did not travel.
+
+    `fit_movements` returns nothing for a path that does not move, so an action imported
+    with Root motion off -- the travel never reached the scene -- writes no block at all.
+    Worth a report rather than silence, since the animation it came from had one.
+    """
+    return not movements and bool(action.get("vtmb_movements"))
 
 
 def _rows(mat, scale):
@@ -1022,6 +1064,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     pointing below the insertion point, and `emit` requantises the animations already in
     the file when the new pose widens the file-wide `mstudiobone_t` scales.
 
+    `root_motion` is one of the four writes forced on every action, or `per_action`, which
+    reads each action's own stamp -- see `root_motion_mode`.
+
     `drop` is one animation of the file, by name, to remove. It is taken last, so every
     index above is one the caller stated against the file as it was; removing it takes the
     sequences it leaves with nothing to play, which is why the caller has to restamp
@@ -1094,7 +1139,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise ValueError("%s has no animation data" % arm_obj.name)
     restore = ad.action if ad else None
 
-    edits, wrote, pending = {}, [], []
+    edits, wrote, pending, unfitted = {}, [], [], []
     try:
         for index, action in sorted(actions.items()):
             if ad.action is not action:
@@ -1107,16 +1152,19 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             if not frames:
                 raise ValueError("%s: empty frame range" % action.name)
 
+            mode = root_motion_mode(action, root_motion)
             # "extract" wants the motion still in the poses, so it is only taken back out
             # when the donor's own blocks are the ones being kept.
             poses = read_poses(context, arm_obj, m, frames, scale, anim,
-                               root_motion_in_keys=(root_motion == "keep"
+                               root_motion_in_keys=(mode == "keep"
                                                     and root_motion_in_keys
                                                     and bool(action.get("vtmb_root_motion"))))
             movements = None
-            if root_motion == "extract":
+            if mode == "extract":
                 movements, poses = write_mod.extract_root_motion(m, poses)
-            elif root_motion == "in_place":
+                if lost_travel(action, movements):
+                    unfitted.append(action.name)
+            elif mode == "in_place":
                 # No blocks and no net travel: the ramp `fit_movements` fits IS the net
                 # ground displacement, so subtracting it and throwing the block away is
                 # "extract" with nothing for the engine to carry. What the ramp does not
@@ -1124,7 +1172,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                 # an animation played in place should still have.
                 _mv, poses = write_mod.extract_root_motion(m, poses)
                 movements = []
-            elif root_motion == "none":
+            elif mode == "none":
                 # The travel stays on the skeleton, which is what 1344 of 10205 shipped
                 # animations do and the largest of the two travel-carrying groups.
                 movements = []
@@ -1146,10 +1194,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             # No donor animation behind this one, so there is no root motion to take back
             # out and nothing for "keep" to keep: an appended animation either has the
             # blocks fitted here or has none.
+            mode = root_motion_mode(action, root_motion, donor=False, default="extract")
             poses = read_poses(context, arm_obj, m, frames, scale)
             movements = ()
-            if root_motion == "extract":
+            if mode == "extract":
                 movements, poses = write_mod.extract_root_motion(m, poses)
+                if lost_travel(action, movements):
+                    unfitted.append(action.name)
+            elif mode == "in_place":
+                _mv, poses = write_mod.extract_root_motion(m, poses)
             pending.append((action, poses, tuple(movements), len(frames)))
     finally:
         if ad is not None and ad.action is not restore:
@@ -1231,7 +1284,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
            if (revised or removed or added_bones) else None)
     with open(dest, "wb") as f:
         f.write(data)
-    return {"wrote": wrote, "added": added, "dropped": dropped, "bones": len(m.bones),
+    return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
+            "bones": len(m.bones),
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
             "vtx": vtx, "removed": removed, "added_bones": added_bones,
