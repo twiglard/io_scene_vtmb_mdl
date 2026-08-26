@@ -77,13 +77,13 @@ BONECONTROLLER_STRIDE = 24
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
 DEFAULTS = {
-    "hdr.unk144": (0.5, 0.5, 0.5),      # on 4416 of 4423 models
+    "hdr.unk144": (0.5, 0.5, 0.5),      # on 4438 of 4445 models
     # Lipsync blend-width clamp in seconds, @232 min and @236 max.  client.dll 0x100c3be0
     # clamps a phoneme's own duration into this pair whenever either phonemefilter ConVar
     # reads 0.0, so zero here shuts the window rather than meaning unset.  Four values over
     # the corpus -- (0,0) x3787, this x525, (0.08,0.10) x150, (0.08,0.105) x2.
     "hdr.phonemefilter": (0.065, 0.100),
-    "hdr.unhz": (0, 0, 1),              # on every model
+    "hdr.unhz": (0, 0, 1),              # ints, not floats; on 4438 of 4445 models
     "seqgroup": ("default", ""),        # on every model
 }
 
@@ -945,7 +945,7 @@ def new(name, surfaceprop="flesh"):
     """An empty description: header scalars, one sequence group, no records.
 
     The unnamed scalars take their corpus value rather than zero -- `unk144` is
-    (0.5, 0.5, 0.5) on 4416 of 4423 models and `unhz` is (0, 0, 1) on every one. The
+    (0.5, 0.5, 0.5) on 4438 of 4445 models and `unhz` is (0, 0, 1) on the same 4438. The
     phoneme filter is written for the same reason and a stronger one: it is a clamp, so
     leaving it zero does not mean "unset", it means every lipsync blend collapses to zero
     width.
@@ -1411,10 +1411,56 @@ def add_material(d, name, cdtexture=None):
     return len(d.textures) - 1
 
 
-def _pack_verts(verts):
+def _tangents(verts, tris):
+    """One `mstudiotangent_t` per vertex, off the mesh's own triangles.
+
+    The array is read: `R_AddVertexToMesh` StudioRender.dll:0x2c013ca3 copies all sixteen
+    bytes into the hardware vertex buffer for every vertex of every model, outside every
+    filetype and material branch. `w` is the bitangent handedness, which the corpus carries
+    negative on 3 814 304 of 5 815 551 records, so a constant 1.0 is wrong on two thirds of
+    them.
+    """
+    acc = [[0.0] * 6 for _ in verts]
+    for tri in tris:
+        try:
+            a, b, c = (verts[i] for i in tri)
+        except IndexError:
+            continue
+        e1 = [b[0][k] - a[0][k] for k in range(3)]
+        e2 = [c[0][k] - a[0][k] for k in range(3)]
+        du1, dv1 = b[2][0] - a[2][0], b[2][1] - a[2][1]
+        du2, dv2 = c[2][0] - a[2][0], c[2][1] - a[2][1]
+        det = du1 * dv2 - du2 * dv1
+        if not det:
+            continue
+        pu = [(e1[k] * dv2 - e2[k] * dv1) / det for k in range(3)]
+        pv = [(e2[k] * du1 - e1[k] * du2) / det for k in range(3)]
+        for i in tri:
+            if 0 <= i < len(acc):
+                r = acc[i]
+                for k in range(3):
+                    r[k] += pu[k]
+                    r[3 + k] += pv[k]
+    out = []
+    for v, r in zip(verts, acc):
+        n = _unit(v[1]) or (0.0, 0.0, 1.0)
+        d = n[0] * r[0] + n[1] * r[1] + n[2] * r[2]
+        t = _unit((r[0] - n[0] * d, r[1] - n[1] * d, r[2] - n[2] * d))
+        if t is None:
+            out.append(_perp(n) + (1.0,))
+            continue
+        cx = (n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2],
+              n[0] * t[1] - n[1] * t[0])
+        h = cx[0] * r[3] + cx[1] * r[4] + cx[2] * r[5]
+        out.append(t + (-1.0 if h < 0.0 else 1.0,))
+    return out
+
+
+def _pack_verts(verts, tris=()):
     """`mstudiovertex0_t[]` and its tangent array for one run of vertices."""
     vb, tb = bytearray(), bytearray()
-    for pos, nrm, uv, binding in verts:
+    tang = _tangents(verts, tris)
+    for i, (pos, nrm, uv, binding) in enumerate(verts):
         b = sorted(binding, key=lambda x: -x[1])[:4]
         tot = sum(w for _i, w in b) or 1.0
         q = [int(round(255 * w / tot)) for _i, w in b]
@@ -1428,8 +1474,7 @@ def _pack_verts(verts):
         vb += struct.pack("<4h", *([i for i, _w in b] + [0] * (4 - len(b))))
         vb += struct.pack("<3f", *pos) + struct.pack("<3f", *nrm)
         vb += struct.pack("<2f", *uv)
-        t = _perp(nrm)
-        tb += struct.pack("<4f", t[0], t[1], t[2], 1.0)
+        tb += struct.pack("<4f", *tang[i])
     return vb, tb
 
 
@@ -1447,7 +1492,7 @@ def add_model(d, meshes, bodypart="studio", model="model"):
     vb, tb, recs, face_lists, offset, radius = \
         bytearray(), bytearray(), [], [], 0, 0.0
     for material, verts, faces in meshes:
-        pvb, ptb = _pack_verts(verts)
+        pvb, ptb = _pack_verts(verts, faces)
         vb += pvb
         tb += ptb
         mraw = bytearray(60)
@@ -1562,7 +1607,7 @@ def replace_model(d, bi, mi, meshes, keep_center=True):
     old_tb = mr.extra.get("tangents") or b""
     vb, tb, offset, faces = bytearray(), bytearray(), 0, []
     for k, (material, verts, tris) in enumerate(meshes):
-        pvb, ptb = _pack_verts(verts)
+        pvb, ptb = _pack_verts(verts, tris)
         if old_ft == 0:
             _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was[k], len(verts))
         vb += pvb
@@ -1587,6 +1632,11 @@ def replace_model(d, bi, mi, meshes, keep_center=True):
     # bone field at all, so a quantised donor gains skinning here rather than losing it.
     struct.pack_into("<i", mr.raw, 0x9c, 0)
     return faces
+
+
+def _unit(v):
+    L = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+    return (v[0] / L, v[1] / L, v[2] / L) if L > 1e-12 else None
 
 
 def _perp(n):

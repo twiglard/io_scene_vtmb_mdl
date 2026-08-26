@@ -178,8 +178,12 @@ def check_vertices(m, verbose=True):
                 continue
             lens = [math.sqrt(sum(x * x for x in v.normal)) for v in vs]
             # A handful of degenerate verts carry a null normal; only a normal that is
-            # present but not unit would mean the layout is wrong.
+            # present but not unit would mean the layout is wrong.  The cap is what keeps
+            # a writer that zeroed every normal from passing on an empty worst_n: no
+            # shipped model record is over a third, the most being 116 of 446 in
+            # cellphone.mdl and 603 of 3791 in animatic_truckclean.mdl.
             null_n = sum(1 for x in lens if x == 0.0)
+            max_null = max(8, len(vs) // 3)
             worst_n = max([abs(x - 1.0) for x in lens if x > 0.0] or [0.0])
             # There are 4 bone slots but only 3 weights, so a vertex needing 4 bones
             # sums short of 255. A wrong layout would miss on nearly all of them.
@@ -187,10 +191,12 @@ def check_vertices(m, verbose=True):
             bad = [v for v in vs if any(b < 0 or b >= len(m.bones) for b in v.bones)]
             n += len(vs)
             if verbose:
-                print("  %d verts %r: worst||n|-1|=%.6f (%d null) "
+                print("  %d verts %r: worst||n|-1|=%.6f (%d null of %d allowed) "
                       "weights!=1 on %d out-of-range bones=%d"
-                      % (len(vs), model.name, worst_n, null_n, off_w, len(bad)))
-            ok &= worst_n < 1e-3 and off_w <= max(8, len(vs) // 10) and not bad
+                      % (len(vs), model.name, worst_n, null_n, max_null, off_w,
+                         len(bad)))
+            ok &= (worst_n < 1e-3 and null_n <= max_null
+                   and off_w <= max(8, len(vs) // 10) and not bad)
     if not n:
         why = ("filetype %s carries no vertex to grade"
                % sorted(ftypes) if ftypes else "no model with vertices")

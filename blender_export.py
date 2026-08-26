@@ -403,11 +403,29 @@ def renamed_models(m, source):
     return out
 
 
-def _per_vertex(me, count, get):
+def _per_vertex(me, count, get, skip=None):
     """Every distinct per-loop value each vertex carries, as a list per vertex."""
     out = [[] for _ in range(count)]
     for loop in me.loops:
+        if skip and loop.index in skip:
+            continue
         out[loop.vertex_index].append(get(loop))
+    return out
+
+
+def _dead_loops(me):
+    """Loops on a face with no area, whose corner normal is not a reading of anything.
+
+    Blender builds each corner's normal space from the face normal, and a face whose
+    corners coincide has none -- it falls back to (0, 0, 1), and the custom normal decoded
+    against that space comes back with every component perpendicular to it gone and its
+    length short of 1. Measured on `heather_3.mdl`: a face with all three corners at
+    (23.32, 1.721, 45.727) turns (0.07721, 0.10293, -0.99169) into (0, 0, -0.99168).
+    """
+    out = set()
+    for p in me.polygons:
+        if p.area == 0.0:
+            out.update(p.loop_indices)
     return out
 
 
@@ -436,17 +454,39 @@ def _one_normal(me, count, stash):
     Averaging the corners is only ever a fallback: the round trip through custom split
     normals is lossy, so a vertex still within NORMAL_EPS of the normal the importer
     stashed is written back exactly instead of being degraded by re-export.
+
+    An exactly-zero stash is kept unconditionally.  3021 vertices over 71 corpus files
+    carry one, Blender hands back (0, 0, 1) for them, and no average can be within
+    NORMAL_EPS of zero, so the test above would replace every one.
+
+    Corners on a face with no area are left out of the average, and a vertex that has no
+    other corner keeps its stash.  `_dead_loops` is what they are; five of `heather_3`'s
+    8388 vertices sit on nothing else, and averaging what Blender hands back for them
+    writes a normal 7.392 deg from the file's.
     """
-    per = _per_vertex(me, count, lambda l: tuple(me.corner_normals[l.index].vector))
+    def corner(l):
+        return tuple(me.corner_normals[l.index].vector)
+
+    dead = _dead_loops(me)
+    per = _per_vertex(me, count, corner, skip=dead)
+    every = _per_vertex(me, count, corner) if dead else per
     out, edited = [], 0
     for i, vs in enumerate(per):
+        if not vs and stash:
+            out.append(stash[i])
+            continue
+        # With no stash there is nothing better to hand back than what Blender says, bad
+        # normal space and all: a scratch model has no file normal to keep.
+        vs = vs or every[i]
         if not vs:
-            out.append(stash[i] if stash else None)
+            out.append(None)
             continue
         avg = [sum(v[c] for v in vs) / len(vs) for c in range(3)]
         n = math.sqrt(sum(x * x for x in avg)) or 1.0
         avg = tuple(x / n for x in avg)
-        if stash and max(abs(a - b) for a, b in zip(avg, stash[i])) <= NORMAL_EPS:
+        if stash and (stash[i] == (0.0, 0.0, 0.0)
+                      or max(abs(a - b) for a, b in zip(avg, stash[i]))
+                      <= NORMAL_EPS):
             out.append(stash[i])
         else:
             out.append(avg)
@@ -464,10 +504,30 @@ def _stashed(me, name, count, width=4, field="color"):
     return [tuple(flat[i * width:i * width + width]) for i in range(count)]
 
 
+def _skinning(weights, bones):
+    """What a record would skin by: its four stored weights against their bones, as a
+    multiset, with the unweighted slots left out.
+
+    Four, not the three `u8_weights` returns -- the fourth is the shortfall and pairing
+    three bytes against four bones drops slot 3 from the comparison entirely. Unweighted
+    slots are left out because their bone index is whatever studiomdl left there and no
+    reconstruction can produce it.
+    """
+    q = mesh_mod.u8_weights(weights)
+    q.append(255 - sum(q))
+    return sorted((x, bone) for x, bone in zip(q, bones) if x)
+
+
 def _one_skin(v, groups, bone_index, stash):
     """(weights, bones, count) for one vertex, keeping the file's slot order where it
     still describes the same skinning -- the order is not derivable, so losing it would
-    move bytes on a rewrite that changed nothing."""
+    move bytes on a rewrite that changed nothing.
+
+    A vertex the file binds to nothing keeps its stash outright. 5716 shipped vertices
+    over 13 models have numbones 0 and weight bytes (255, 0, 0); the importer makes no
+    vertex group for one, so an empty reconstruction is what an untouched vertex looks
+    like and there is no edit to honour.
+    """
     pairs = sorted(((g.weight, -bone_index[groups[g.group].name])
                     for g in v.groups if groups[g.group].name in bone_index),
                    reverse=True)[:4]
@@ -476,9 +536,9 @@ def _one_skin(v, groups, bone_index, stash):
     n = sum(1 for x in w if x > 0.0)
     if stash is not None:
         sw, sb, sn = stash
-        if sorted(zip(mesh_mod.u8_weights(sw), (int(x) for x in sb))) == \
-           sorted(zip(mesh_mod.u8_weights(w), b)):
-            return list(sw), [int(x) for x in sb], sn
+        sb = [int(x) for x in sb]
+        if (not pairs and not sn) or _skinning(sw, sb) == _skinning(w, b):
+            return list(sw), sb, sn
     return w, b, n
 
 
