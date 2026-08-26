@@ -1070,9 +1070,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         d.name = model_name
     else:
         model_name = ""
-    # @180/@192 is the .qc's $bbox, and the per-sequence boxes at +0x1c/+0x28 are what the
-    # engine actually culls against -- a zero one draws and then vanishes as the camera
-    # turns. Neither follows an edit on its own: a donor keeps the boxes it shipped, which
+    # @180/@192 is the .qc's $bbox, which Mod_GetBounds starts from and +0x1c/+0x28 only
+    # widen. GetRenderBounds reads that sequence box alone, so a zero one draws only while
+    # the entity origin is on screen, and costs the collision radius vampire.dll takes off
+    # the same floats. Neither follows an edit: a donor keeps the boxes it shipped, which
     # after a geometry change describe where the vertices used to be.
     if hull is not None:
         struct.pack_into("<3f", d.hdr, 180, *hull[0])

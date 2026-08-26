@@ -1857,10 +1857,12 @@ def _seq_anims(raw):
 
 
 def stamp_sequence_boxes(d, force=False):
-    """`mstudioseqdesc_t.bbmin`/`bbmax` @+0x1c/+0x28 -- the volume the engine culls the
-    model against, and zero there means it draws and then vanishes as soon as the camera
-    turns. The union over the sequence's blend animations of the skinned vertex sweep over
-    every frame (`utils/studiomdl/simplify.cpp:5276` and `:5349`).
+    """`mstudioseqdesc_t.bbmin`/`bbmax` @+0x1c/+0x28 -- the volume the engine widens the
+    model's own bounds with, which `GetRenderBounds` returns on its own, and which an
+    entity's collision radius is taken off, so zero there costs the radius and leaves the
+    model drawn only while its origin is on screen. The union over the sequence's blend
+    animations of the skinned vertex sweep over every frame
+    (`utils/studiomdl/simplify.cpp:5276` and `:5349`).
 
     Only a sequence whose box is still zero and whose every cited animation still holds its
     poses: one read out of a file keeps the box that file shipped, and one whose animation

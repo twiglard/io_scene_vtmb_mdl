@@ -406,10 +406,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         description="Recompute the movement hull from the mesh in the scene, and re-sweep "
                     "every sequence's cull box over the animations being exported. Off "
                     "keeps what the file shipped, which after a geometry change describes "
-                    "where the vertices used to be -- a model can then vanish as the "
-                    "camera turns, since the cull box is what the engine tests. A "
-                    "sequence whose animations you are not exporting cannot be swept and "
-                    "is left alone")
+                    "where the vertices used to be. The model's own bounds start from "
+                    "the header hull and are only widened by the playing sequence's box, "
+                    "but what gets drawn is bounded by that sequence box alone, so a zero "
+                    "one leaves the model visible only while its origin is on screen -- "
+                    "and costs the entity the collision radius taken off the same six "
+                    "floats. A sequence whose animations you are not exporting cannot be "
+                    "swept and is left alone")
     model_name: bpy.props.StringProperty(
         name="Name in the file", default="",
         description="What studiohdr_t.name says this model is. Blank takes it from where "

@@ -192,12 +192,9 @@ def build_armature(context, m, name, scale, root_motion=True):
     # Per-model and not per-material, so nothing else in the scene can carry it back out.
     arm_obj["vtmb_cdtexture"] = list(m.material_paths)
     arm_obj["vtmb_sequences"] = sequence_stash(m)
-    # What the export dialogs seed their Root motion choice from. The option is the user's
-    # answer to "was the travel applied to the keys"; the count is the file's own answer to
-    # "is there any travel to apply", and a file with none has nothing for `extract` to
-    # find, so the scratch operator would otherwise invent blocks the donor never had.
+    # The user's answer to "was the travel applied to the keys". The count that goes with
+    # it is stamped in import_mdl, once the imported actions are known.
     arm_obj["vtmb_root_motion"] = bool(root_motion)
-    arm_obj["vtmb_movement_anims"] = sum(1 for a in m.anims if a.movements)
     return arm_obj
 
 
@@ -764,6 +761,9 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
         wanted, missing = pick_animations(m, content, anim_filter, max_anims,
                                           with_chained)
         build_actions(m, arm_obj, wanted, scale, root_motion)
+    # Over what was imported, not over m.anims: a chained import's actions come mostly from
+    # included files, and the export dialogs seed Root motion from this count.
+    arm_obj["vtmb_movement_anims"] = sum(1 for _, a in wanted if a.movements)
     if missing:
         note = "%d chained model(s) not found on any content root: %s" \
             % (len(missing), ", ".join(missing[:3]))
