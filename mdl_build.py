@@ -2057,6 +2057,7 @@ def add_sequence(d, label, anim, activity=None, flags=0):
     struct.pack_into("<i", raw, 0x034, 1)
     struct.pack_into("<h", raw, 0x038, anim)
     struct.pack_into("<2i", raw, 0x23c, 1, 1)
+    struct.pack_into("<2i", raw, 0x244, -1, -1)
     struct.pack_into("<3f", raw, 0x264, 0.2, 0.2, 0.2)
     struct.pack_into("<i", raw, 0x2b8, -1)
     struct.pack_into("<f", raw, 0x2cc, FLT_MIN)
