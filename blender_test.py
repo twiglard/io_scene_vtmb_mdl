@@ -2,11 +2,16 @@
 """Headless acceptance test for the Blender half.
 
     blender --background --factory-startup --python blender_test.py -- X.mdl
+    blender --background --factory-startup --python blender_test.py -- X.mdl \
+        --expect-comparisons N
 
 Passes when, after import, each pose bone's armature-space matrix equals the matrix the
 file decodes to for that frame. That is checked through Blender's own dependency graph,
 so it exercises the bone hierarchy, roll, and the pose composition -- none of which the
 plain-Python selfcheck touches.
+
+--expect-comparisons fails the run unless it made exactly N comparisons. Every reading
+here folds into a maximum, and a maximum over nothing reads as no error.
 """
 
 import os
@@ -21,6 +26,25 @@ ADDON = "io_scene_vtmb_mdl"
 # Blender evaluates poses in float32; the rest pose alone already differs by ~8e-6.
 ROT_TOL = 3e-4
 POS_TOL = 5e-3
+
+
+class Tally(object):
+    """Every comparison the run makes, by the kind of thing compared.
+
+    Each count is a pair of matrices held against each other once, not a scalar element:
+    `pose` and `export` are one bone at one frame, `rest` is one bone, `skin` is one
+    vertex group against the armature's bone names.
+    """
+
+    def __init__(self):
+        self.pose = self.rest = self.export = self.skin = 0
+
+    @property
+    def n(self):
+        return self.pose + self.rest + self.export + self.skin
+
+
+TALLY = Tally()
 
 
 def pos_bound(rot, radius):
@@ -77,15 +101,21 @@ def worst_pose_error(mod, arm, m, anim, frames, src=None, root_motion=True):
             worst_rot, worst_pos = max(worst_rot, rot), max(worst_pos, pos)
             worst_excess = max(worst_excess, excess)
             n += 1
+            TALLY.pose += 1
     # float("-inf") <= 0.0 would let a comparison over no bone at all read as a pass.
     if not n:
         return float("inf"), float("inf"), "nothing compared", float("inf")
     return worst_rot, worst_pos, at, worst_excess
 
 
-def check_chained(mod, arm, m, content):
+def check_chained(mod, arm, m, content, meshes=()):
     """The chain is what a character model's animations actually live in, so an import
-    that resolves none of it silently looks like a model with four animations."""
+    that resolves none of it silently looks like a model with four animations.
+
+    `meshes` is what makes this the mesh-and-chain case: the chain is joined by bone name
+    across files, and a skinned mesh names its bones the same way, so a chained import that
+    reordered or dropped a bone leaves a vertex group pointing at nothing.
+    """
     pairs, missing = mod.blender_import.pick_animations(m, content, "", 0, True)
     chained = [(src, a) for src, a in pairs if src is not m]
     print("  chain: %d animations over %d files, %d unresolved"
@@ -96,6 +126,15 @@ def check_chained(mod, arm, m, content):
         print("  unresolved: %s" % ", ".join(missing[:3]))
     if not chained:
         return True
+    have = {b.name for b in arm.pose.bones}
+    for o in meshes:
+        stray = [g.name for g in o.vertex_groups if g.name not in have]
+        TALLY.skin += len(o.vertex_groups)
+        print("  mesh %r: %d verts over %d vertex groups, %d naming no bone"
+              % (o.name, len(o.data.vertices), len(o.vertex_groups), len(stray)))
+        if stray:
+            print("  chained import left %r skinned to %s" % (o.name, ", ".join(stray[:4])))
+            return False
     src, anim = chained[0]
     act = bpy.data.actions.get(mod.blender_import.action_name(m, src, anim))
     if act is None:
@@ -140,6 +179,7 @@ def check_export(mod, arm, m, anim, path):
             if dq > wr:
                 wr, where = dq, "%s frame %d" % (b.name, f)
             wp = max(wp, dp)
+            TALLY.export += 1
     print("  export round trip: %d frames, rotation %.7f, translation %.7f units  (%s)"
           % (anim.numframes, wr, wp, where))
     print("  file %d -> %d bytes, %d movement blocks kept"
@@ -194,6 +234,11 @@ def check_root_motion(mod, path, m):
 
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    # Ahead of the loop below, which takes every remaining word for a model path.
+    expect = None
+    if "--expect-comparisons" in argv:
+        i = argv.index("--expect-comparisons")
+        expect, argv = int(argv[i + 1]), argv[:i] + argv[i + 2:]
     if not argv:
         sys.exit("usage: ... -- X.mdl")
     ok = True
@@ -239,8 +284,10 @@ def main():
                              for i in range(3) for j in range(3)))
             wp = max(wp, max(abs(rest[b.index][i][3] - got[i][3])
                              for i in range(3)))
+            TALLY.rest += 1
         print("  rest matrix_local vs file: rotation %.7f, translation %.7f"
               % (wr, wp))
+        ok &= wr < ROT_TOL and wp < POS_TOL
 
         if m.anims and acts:
             anim = m.anims[0]
@@ -268,10 +315,16 @@ def main():
             prefs = bpy.context.preferences.addons[ADDON].preferences
             ok &= check_chained(mod, arm, m, mod.blender_import.Content(
                 mod.paths.roots(path, prefs.game_root,
-                                mod.paths.split_list(prefs.mods))))
+                                mod.paths.split_list(prefs.mods))), meshes)
 
         # Last: it reloads factory settings, which takes the scene above with it.
         ok &= check_root_motion(mod, path, m)
+    print("\n%d comparisons over %d model(s): %d posed bone matrices, %d rest matrices, "
+          "%d written bone poses, %d vertex groups"
+          % (TALLY.n, len(argv), TALLY.pose, TALLY.rest, TALLY.export, TALLY.skin))
+    if expect is not None and TALLY.n != expect:
+        print("   FAIL %d comparisons, expected exactly %d" % (TALLY.n, expect))
+        ok = False
     print("\nVERDICT: %s" % ("PASS" if ok else "FAIL"))
     sys.exit(0 if ok else 1)
 
