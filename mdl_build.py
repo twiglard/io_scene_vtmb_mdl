@@ -35,12 +35,14 @@ import sys
 try:
     from . import mdl as M
     from . import mdl_write as W
+    from . import normal_table as NT
     from . import relocs as R
     from . import sections as S
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import mdl as M
     import mdl_write as W
+    import normal_table as NT
     import relocs as R
     import sections as S
 
@@ -1436,14 +1438,117 @@ def add_material(d, name, cdtexture=None):
     existing entry is never replaced and never reordered. `None` leaves a populated list
     alone and seeds an empty one with `models/`, which only `new()` can produce -- 4442 of
     the 4445 shipped models are not `models/`, so that default is a marker and not a guess.
+
+    The new texture is appended to every skin family rather than the table being rebuilt as
+    one. 201 shipped models carry more than one family, and each is a whole row of
+    `numskinref` shorts, so rebuilding would drop every family but the first. Rebuilding is
+    only correct where there is nothing to lose, which is a table with no rows at all.
     """
     if cdtexture is not None:
         add_cdtexture(d, cdtexture)
     elif not d.cdtextures:
         set_cdtextures(d, "models/")
     d.textures.append(Rec(bytearray(20), name))
-    d.skin = [list(range(len(d.textures)))]
-    return len(d.textures) - 1
+    ref = len(d.textures) - 1
+    if d.skin:
+        for row in d.skin:
+            row.append(ref)
+    else:
+        d.skin = [list(range(len(d.textures)))]
+    return ref
+
+
+# The largest position delta the 8-byte record can spell: 255/255 * g_flexPositionDeltaScale.
+MAX_VERTANIM1_DELTA = M.FLEX_POSITION_DELTA_SCALE
+# 32767, from the signed short the reader sign-extends at 0x2c0509a8 and 0x2c050af0.
+MAXSTUDIOFLEXVERTS = 32767
+
+
+def _flex_records(records, vertanimtype):
+    """[(mesh-local index, delta, ndelta)] as the payload bytes of `vertanimtype`.
+
+    The direction of each delta goes to the nearest `g_normalOffsetTable` entry and its
+    length to a byte -- x8.0 for the position in the 8-byte form, x2.0 for the normal in
+    both, which is the FADD ST0,ST0 the reader does. The 20-byte form keeps the position
+    delta as raw floats and is the only way past 8.0 units.
+    """
+    out = bytearray()
+    for index, delta, ndelta in records:
+        nl = (ndelta[0] ** 2 + ndelta[1] ** 2 + ndelta[2] ** 2) ** 0.5
+        if nl > 0.0:
+            no = NT.encode(1, ndelta)
+            ns = min(255, int(round(nl / M.FLEX_NORMAL_DELTA_SCALE * 255.0)))
+        else:
+            no, ns = 0, 0
+        if vertanimtype:
+            dl = (delta[0] ** 2 + delta[1] ** 2 + delta[2] ** 2) ** 0.5
+            if dl > 0.0:
+                do = NT.encode(1, delta)
+                ds = min(255, int(round(dl / M.FLEX_POSITION_DELTA_SCALE * 255.0)))
+            else:
+                do, ds = 0, 0
+            out += M._VERTANIM1.pack(index, do, no, ds, ns)
+        else:
+            out += M._VERTANIM0.pack(index, 0, delta[0], delta[1], delta[2], no, ns, 0)
+    return bytes(out)
+
+
+def flexdesc_index(d, name):
+    """The `mstudioflexdesc_t` slot holding `name`, appended if the file has none."""
+    for i, r in enumerate(d.flexdescs):
+        if r.name == name:
+            return i
+    d.flexdescs.append(Rec(bytearray(4), name))
+    return len(d.flexdescs) - 1
+
+
+def add_flex(d, bi, mi, k, name, records, target=(0.0, 0.0, 0.0, 0.0)):
+    """One `mstudioflex_t` on mesh `k`, its payload encoded from `records`.
+
+    `records` is [(mesh-local index, position delta, normal delta), ...], the deltas at
+    flex weight 1 in the file's own units. The form is chosen by what the deltas need:
+    the 8-byte one unless some position delta is longer than 8.0 units, which only
+    mingxiao_transformation reaches among the shipped models.
+
+    A key must lie in [0, mesh->numvertices) -- the reader adds it to the mesh's first
+    vertex with nothing bounding it -- so a caller that renumbered the mesh must rebuild
+    these rather than carry them.
+    """
+    mr = d.bodyparts[bi].kids[mi]
+    if not 0 <= k < len(mr.kids):
+        raise Refused("bodypart %d model %d has no mesh %d" % (bi, mi, k))
+    mesh = mr.kids[k]
+    numvertices = struct.unpack_from("<i", mesh.raw, 0x08)[0]
+    if len(records) > MAXSTUDIOFLEXVERTS:
+        raise Refused("flex %r carries %d vertices; mstudioflex_t.numverts is read as a "
+                      "signed short, so %d is the ceiling"
+                      % (name, len(records), MAXSTUDIOFLEXVERTS))
+    for index, _delta, _ndelta in records:
+        if not 0 <= index < numvertices:
+            raise Refused("flex %r names mesh-local vertex %d, outside [0, %d)"
+                          % (name, index, numvertices))
+    vertanimtype = 1
+    for _index, delta, _ndelta in records:
+        if max(abs(c) for c in delta) > MAX_VERTANIM1_DELTA or                 (delta[0] ** 2 + delta[1] ** 2 + delta[2] ** 2) ** 0.5 >                 MAX_VERTANIM1_DELTA:
+            vertanimtype = 0
+            break
+    raw = bytearray(32)
+    struct.pack_into("<i", raw, 0x00, flexdesc_index(d, name))
+    struct.pack_into("<4f", raw, 0x04, *target)
+    struct.pack_into("<i", raw, 0x14, len(records))
+    struct.pack_into("<i", raw, 0x1c, vertanimtype)
+    mesh.kids.append(Rec(raw, None, None,
+                         {"payload": _flex_records(records, vertanimtype)}))
+    return len(mesh.kids) - 1
+
+
+def clear_flexes(d, bi, mi):
+    """Drop every flex of one model. Returns how many went."""
+    n = 0
+    for mesh in d.bodyparts[bi].kids[mi].kids:
+        n += len(mesh.kids)
+        mesh.kids = []
+    return n
 
 
 def _tangents(verts, tris):
@@ -1690,13 +1795,18 @@ class _Bones(object):
 
 class _Block(object):
     """A carried animation block addressed on its own, so `read_tracks` can decode one
-    without the file it came out of.  `base` is 0 because the block starts at byte 0."""
+    without the file it came out of.  `base` is 0 because the block starts at byte 0, which
+    is also why the borrowed decode cache is good for one block only: reuse a `_Block` and
+    every block after the first would read the first one's channels."""
 
     extract = M.Mdl.extract
+    channel = M.Mdl.channel
+    anim_channels = M.Mdl.anim_channels
 
     def __init__(self, data, bones):
         self.d = data
         self.bones = bones
+        self._chan, self._chan_base, self._chan_table = {}, None, []
 
 
 class _AnimHdr(object):

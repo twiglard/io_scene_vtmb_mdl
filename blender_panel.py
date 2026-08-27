@@ -317,6 +317,59 @@ class VTMB_PT_action(bpy.types.Panel):
                            % ("carry" if act.get("vtmb_root_motion") else "do not carry"))
 
 
+SPRING_FIELDS = (
+    ("vtmb_spring_gravity", "Gravity", "3 on 202 of the corpus's 600 records, 0 on 187, "
+     "1 on 168. Subtracted as gravity*dt from each node's z every substep"),
+    ("vtmb_spring_damping", "Damping", "0.9 on 351 of 600. Velocity kept from one Verlet "
+     "step to the next, so 1.0 never settles and 0.0 is dead weight"),
+    ("vtmb_spring_exp", "Spring", "0.3 on 326 of 600. The solver takes pow(10.0, -this), "
+     "so 0.0 is the stiffest setting and larger is slacker"),
+    ("vtmb_spring_maxangle", "Max angle", "Degrees, 30 on 259 of 600. How far a node may "
+     "leave the pose the animation put it in"),
+)
+
+
+class VTMB_PT_bone(bpy.types.Panel):
+    bl_label = "VTMB spring bone"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "bone"
+
+    @classmethod
+    def poll(cls, context):
+        pb = _spring_bone(context)
+        return pb is not None and pb.get("vtmb_spring_index") is not None
+
+    def draw(self, context):
+        pb = _spring_bone(context)
+        lay = self.layout
+        lay.use_property_split = True
+
+        col = lay.column(align=True)
+        col.label(text="chain %d" % int(pb["vtmb_spring_index"]), icon="PHYSICS")
+        end = pb.get("vtmb_spring_end")
+        col.label(text="ends at %s" % (end if end else "the first-child chain"))
+        if pb.get("vtmb_spring_disabled"):
+            col.label(text="starts switched off, and cannot be named back on",
+                      icon="ERROR")
+
+        col = lay.column(align=True)
+        for key, name, _desc in SPRING_FIELDS:
+            if pb.get(key) is not None:
+                col.prop(pb, '["%s"]' % key, text=name)
+
+        col = lay.column(align=True)
+        col.label(text="bc_override 1 retunes these live, without a re-export", icon="INFO")
+
+
+def _spring_bone(context):
+    """The pose bone behind the Bone tab's active bone, or None."""
+    obj, bone = context.object, context.bone
+    if obj is None or bone is None or obj.type != "ARMATURE":
+        return None
+    return obj.pose.bones.get(bone.name)
+
+
 def _fallback_line(act):
     """What Not set resolves to, so the field is never silently a guess."""
     try:
@@ -330,7 +383,7 @@ def _fallback_line(act):
 
 
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
-           VTMB_PT_armature, VTMB_PT_action]
+           VTMB_PT_armature, VTMB_PT_action, VTMB_PT_bone]
 
 _PROPS = (
     ("vtmb_cdtexture_text", CDTEXTURE, "Material dirs",

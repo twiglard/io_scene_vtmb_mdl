@@ -54,14 +54,14 @@ def read_tracks(m, a):
     if a.numframes <= 0:
         return t
     d = m.d
-    for b in m.bones:
+    for b, ch in zip(m.bones, m.anim_channels(a)):
         o = a.base + b.index * M.ANIM_STRIDE
         t.weights[b.index] = struct.unpack_from("<f", d, o)[0]
-        offs = struct.unpack_from("<7i", d, o + 4)
         for c in range(M.NUM_CHANNELS):
-            if offs[c]:
-                t.chan[(b.index, c)] = [m.extract(o + offs[c], f)
-                                        for f in range(a.numframes)]
+            if ch[c] is not None:
+                # Copied: anim_channels hands back the decode cache's own lists, which
+                # local_pose keeps reading until the animation moves on.
+                t.chan[(b.index, c)] = list(ch[c])
     return t
 
 

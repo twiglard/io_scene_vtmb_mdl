@@ -23,7 +23,8 @@ bl_info = {
 
 from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write,
                normal_table, paths,
-               relocs, sections, tth, vpk, vtx, vtx_rebuild, vtx_write, bone_templates,
+               relocs, sections, tth, vmt_write, vpk, vtx, vtx_rebuild, vtx_write,
+               bone_templates,
                blender_import, blender_export, blender_scratch, blender_templates,
                blender_panel)
 
@@ -61,6 +62,156 @@ def _mode_tally(actions):
         got[mode] = got.get(mode, 0) + 1
     return ", ".join("%d %s" % (got[k], ROOT_MOTION_LABELS[k])
                      for k in blender_export.ROOT_MOTION_MODES if k in got) or "no actions"
+
+
+def _write_vmts(context, arm_obj, dest, names, enabled):
+    """The `.vmt` for each material the export just added, and what to say about it.
+
+    The directory is the first the armature carries, because a name resolves against the
+    whole list as a cross product and the first is the only one a writer can pick without
+    guessing. With no directory at all there is nowhere to put the file and the operator
+    says so instead of inventing `models/`.
+    """
+    dirs = blender_scratch.scene_cdtextures(arm_obj)
+    where = os.path.join(paths.content_root(dest) or os.path.dirname(dest),
+                         paths.MATERIALS_DIR)
+    rel = [os.path.join(dirs[0] if dirs else "", n + ".vmt") for n in names]
+    if not dirs:
+        return "; no material directory, so nothing says where their .vmt go"
+    if not enabled:
+        return "; write %s to finish them" % ", ".join(
+            (paths.MATERIALS_DIR + "/" + r).replace("\\", "/") for r in rel)
+    wrote, kept = [], []
+    for name, r in zip(names, rel):
+        path = os.path.join(where, r)
+        text = vmt_write.vmt_text(vmt_write.texture_path(dirs[0], name))
+        (wrote if vmt_write.write_vmt(path, text) else kept).append(r)
+    out = ""
+    if wrote:
+        out += "; wrote %d .vmt under %s" % (len(wrote), where)
+    if kept:
+        out += "; %d .vmt already existed and were left alone" % len(kept)
+    return out
+
+
+def _base_image(mat):
+    """The image a `$basetexture` means: the one feeding Base Color, else the only one.
+
+    Two image textures with neither wired to Base Color are not ranked -- a `.vmt` names
+    one basetexture and nothing in the material says which of them it is.
+    """
+    tree = getattr(mat, "node_tree", None)
+    if tree is None:
+        return None
+    have = [n for n in tree.nodes if n.type == "TEX_IMAGE" and n.image]
+    if not have:
+        return None
+    for node in tree.nodes:
+        sock = node.inputs.get("Base Color") if hasattr(node, "inputs") else None
+        for link in (sock.links if sock is not None else ()):
+            if link.from_node in have:
+                return link.from_node.image
+    return have[0].image if len(have) == 1 else None
+
+
+def _image_rgba(img):
+    """(w, h, top-down RGBA bytes) for an image with pixels, else None.
+
+    `Image.pixels` is bottom-up, and on a byte buffer it is the file's own bytes over 255
+    with no colour transform -- 0 of 48 channels move over a round trip through it. A
+    float buffer holds scene-linear instead, so it takes the sRGB transfer function that
+    a .tth's bytes are encoded with.
+    """
+    w, h = int(img.size[0]), int(img.size[1])
+    if not (img.has_data and w > 0 and h > 0):
+        return None
+    ch = int(img.channels)
+    if ch not in (1, 3, 4):
+        return None
+    try:
+        import numpy as np
+
+        a = np.empty(w * h * ch, dtype=np.float32)
+        img.pixels.foreach_get(a)
+        a = a.reshape(h, w, ch)[::-1]
+        out = np.ones((h, w, 4), dtype=np.float32)
+        if ch == 1:
+            out[:, :, 0] = out[:, :, 1] = out[:, :, 2] = a[:, :, 0]
+        else:
+            out[:, :, :3] = a[:, :, :3]
+            if ch == 4:
+                out[:, :, 3] = a[:, :, 3]
+        if img.is_float and not img.colorspace_settings.is_data:
+            rgb = out[:, :, :3]
+            out[:, :, :3] = np.where(
+                rgb <= 0.0031308, rgb * 12.92,
+                1.055 * np.power(np.maximum(rgb, 0.0031308), 1.0 / 2.4) - 0.055)
+        return w, h, (np.clip(out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).tobytes()
+    except (ImportError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _write_tths(context, arm_obj, dest, names, enabled, fmt="auto"):
+    """The `.tth`/`.ttz` pair for each material the export just added.
+
+    Same directory and same stem as the `.vmt` beside it, because that file's
+    `$basetexture` names exactly this path and nothing else in the `.mdl` says where an
+    image is. The pixels come from the material's own Image Texture node.
+    """
+    dirs = blender_scratch.scene_cdtextures(arm_obj)
+    if not dirs:
+        return ""
+    where = os.path.join(paths.content_root(dest) or os.path.dirname(dest),
+                         paths.MATERIALS_DIR)
+    got, blank = [], []
+    for name in names:
+        mat = bpy.data.materials.get(name)
+        img = _base_image(mat) if mat is not None else None
+        px = _image_rgba(img) if img is not None else None
+        if px is None:
+            blank.append(name)
+        else:
+            got.append((name, px))
+    if not enabled:
+        return ("; %d of them carr%s an image, which \"Write .tth/.ttz\" writes beside "
+                "the .vmt" % (len(got), "ies" if len(got) == 1 else "y")) if got else ""
+    wrote, kept = [], []
+    for name, (w, h, rgba) in got:
+        stem = os.path.join(where, dirs[0], name)
+        want = {"auto": None, "dxt1": tth.DXT1, "dxt5": tth.DXT5,
+                "bgra": tth.BGRA8888}[fmt]
+        (wrote if tth.write_pair(stem, w, h, rgba, fmt=want) else kept).append(name)
+    out = ""
+    if wrote:
+        out += "; wrote %d .tth/.ttz under %s" % (len(wrote), where)
+    if kept:
+        out += "; %d pair%s already existed and %s left alone" % (
+            len(kept), "" if len(kept) == 1 else "s",
+            "was" if len(kept) == 1 else "were")
+    if blank:
+        out += ("; %d material%s named no image this export could read pixels from: %s"
+                % (len(blank), "" if len(blank) == 1 else "s", ", ".join(blank[:3])))
+    return out
+
+
+def _report_unkeepable(op, names):
+    """Actions appended under "the file's own blocks", which an appended one has none of.
+
+    Forced, not stamped: `per_action` turns a stored "keep" into "extract" wherever there
+    is no donor animation behind the action, so this is only reachable by naming `keep` in
+    the dialog, and the travel the source file carried is then written nowhere.
+    """
+    if not names:
+        return
+    op.report({"WARNING"},
+              "%d action%s appended as %s new animation%s under \"the file's own "
+              "blocks\", and a file has none for an animation it does not have, so the "
+              "root motion stayed in the keys: %s. \"Each action's own\" or \"the "
+              "engine carries it\" fits one from the keys instead"
+              % (len(names), "" if len(names) == 1 else "s",
+                 "a" if len(names) == 1 else "", "" if len(names) == 1 else "s",
+                 ", ".join(names[:3])
+                 + ("" if len(names) <= 3 else " and %d more" % (len(names) - 3))))
 
 
 def _report_unfitted(op, names):
@@ -325,6 +476,13 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         description="Read the geometry: vertices, UVs, vertex groups and materials. "
                     "Faces come from the .vtx file beside the .mdl. Off leaves the "
                     "armature and its animations alone")
+    with_flexes: bpy.props.BoolProperty(
+        name="Flexes as shape keys", default=True,
+        description="Build one shape key per flex the model names -- the facial morphs "
+                    "195 of the shipped models carry. Position deltas only: a shape key "
+                    "holds coordinates, so the normal delta each flex record also "
+                    "carries stays in the file and out of the scene. Off leaves the "
+                    "mesh with no shape keys at all")
     with_anims: bpy.props.BoolProperty(
         name="Animations", default=True,
         description="Import animations as actions")
@@ -355,6 +513,9 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         lay.use_property_split = True
         lay.use_property_decorate = False
         lay.prop(self, "with_mesh")
+        sub = lay.column()
+        sub.enabled = self.with_mesh
+        sub.prop(self, "with_flexes")
         lay.prop(self, "with_anims")
         col = lay.column()
         col.enabled = self.with_anims
@@ -370,7 +531,7 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
             r = blender_import.import_mdl(
                 context, self.filepath, anim_filter=self.anim_filter,
                 max_anims=self.max_anims,
-                with_mesh=self.with_mesh,
+                with_mesh=self.with_mesh, with_flexes=self.with_flexes,
                 with_anims=self.with_anims, with_chained=self.with_chained,
                 game_root=game_root, mods=mods, extra_roots=extract,
                 root_motion=self.root_motion)
@@ -432,6 +593,49 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "alongside others is refused rather than left with a hole. The action "
                     "stays in the blend; delete that too if you do not want it appended "
                     "back")
+    write_vmt: bpy.props.BoolProperty(
+        name="Write .vmt for new materials", default=False,
+        description="A material slot the file has no texture record for gets one, and "
+                    "with this also a materials/<dir>/<name>.vmt beside the model, so it "
+                    "resolves to something rather than the purple checkerboard. The .mdl "
+                    "carries only a name and a directory list, so without the .vmt "
+                    "nothing says which image the material means. An existing .vmt is "
+                    "never overwritten")
+    write_tth: bpy.props.BoolProperty(
+        name="Write .tth/.ttz for new materials", default=False,
+        description="The image on that material's Image Texture node, written as the "
+                    ".tth/.ttz pair the .vmt's $basetexture names, so the material draws "
+                    "that image and not the purple checkerboard. A full mip chain, in "
+                    "whichever format the box below names. A material with no Image "
+                    "Texture, or with several and "
+                    "none of them feeding Base Color, is named in the report and skipped. "
+                    "Neither half of an existing pair is overwritten. Nothing looks for "
+                    "the image at all unless a .vmt is there too")
+    write_flexes: bpy.props.BoolProperty(
+        name="Shape keys as flexes", default=False,
+        description="Rewrite each model's flexes from its shape keys -- the way to get a "
+                    "facial morph authored in Blender into the file. Off carries the "
+                    "file's own flex records through untouched, which is what makes an "
+                    "unedited face model come back byte for byte. On, the scene's morph "
+                    "is written entire and not as a patch: a shape key holds coordinates, "
+                    "so the normal delta each flex record also carries is recomputed from "
+                    "the morphed geometry and whatever the file said is gone. A model "
+                    "whose vertex numbering the scene cannot reproduce is named in the "
+                    "report and left alone, since the vertanim key is an index into the "
+                    "mesh and nothing bounds it")
+    tth_format: bpy.props.EnumProperty(
+        name="Texture format", default="auto",
+        items=[("auto", "Automatic",
+                "DXT5 where the image uses alpha at all, DXT1 where it does not"),
+               ("dxt1", "DXT1", "0.5 bytes a texel and no alpha"),
+               ("dxt5", "DXT5", "1 byte a texel, alpha to about 1/16 of a step"),
+               ("bgra", "BGRA8888 (uncompressed)",
+                "4 bytes a texel and no compression loss -- 16 of the 83 shipped normal "
+                "maps carry it")],
+        description="What format the .tth/.ttz pair stores. The corpus is DXT5 x51, "
+                    "BGRA8888 x16, DXT1 x13 and BGR888 x3 over the 83 normal maps that "
+                    "decode, so compressed is the shipped norm and uncompressed is 4x to "
+                    "8x the size")
     fit_hull: bpy.props.BoolProperty(
         name="Refit the bounding boxes", default=False,
         description="Recompute the movement hull from the mesh in the scene, and re-sweep "
@@ -568,6 +772,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 else:
                     box.label(text="saved as %s" % os.path.basename(self.filepath),
                               icon="INFO")
+                box.prop(self, "write_flexes")
                 box.prop(self, "fit_hull")
                 row = box.split(factor=SPLIT)
                 row.label(text="name in the file")
@@ -576,6 +781,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                          if self.filepath else "")
                 was = _donor_cdtextures(base)
                 box.prop(self, "cdtexture", placeholder=";".join(was))
+                box.prop(self, "write_vmt")
+                box.prop(self, "write_tth")
+                row = box.column()
+                row.enabled = self.write_tth
+                row.prop(self, "tth_format")
                 dirs = paths.cdtexture_list(self.cdtexture) if self.cdtexture else []
                 if dirs and paths.engine_paths(dirs) != paths.engine_paths(was):
                     _pair(box, "the file says",
@@ -746,6 +956,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 root_motion_in_keys=self.root_motion_in_keys,
                 root_motion=self.root_motion,
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
+                write_flexes=self.write_flexes,
                 # Derived only for a dialog, where the field is on screen with the
                 # derived value in it and the user can see and change it. A scripted call
                 # runs `execute` straight and gets `""`, which keeps the donor's name --
@@ -772,6 +983,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         finally:
             context.scene.frame_set(frame)
         _report_unfitted(self, r.get("unfitted"))
+        _report_unkeepable(self, r.get("unkeepable"))
         mesh = r["mesh"]
         if mesh["missing"] and mesh["fields"]:
             self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "
@@ -949,6 +1161,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             extra += ("; the scene moved %d bones, renamed %d materials and changed %d "
                       "sequence fields"
                       % (scene["bones"], scene["materials"], scene["sequences"]))
+        if scene["springs"]:
+            extra += "; retuned %d spring bone fields" % scene["springs"]
+        if scene["added_materials"]:
+            extra += ("; added %d material%s: %s"
+                      % (len(scene["added_materials"]),
+                         "" if len(scene["added_materials"]) == 1 else "s",
+                         ", ".join(scene["added_materials"])))
+            extra += _write_vmts(context, obj, self.filepath,
+                                 scene["added_materials"], self.write_vmt)
+            extra += _write_tths(context, obj, self.filepath,
+                                 scene["added_materials"], self.write_tth,
+                                 self.tth_format)
         self.report({"INFO"}, "wrote %d of %d animations over %d bones, %d -> %d bytes: "
                               "%s%s" % (len(r["wrote"]), r["anims"], r["bones"], r["was"],
                                         r["bytes"], what, extra))
@@ -1233,6 +1457,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                         % (type(exc).__name__, exc))
             return {"CANCELLED"}
         _report_unfitted(self, r.get("unfitted"))
+        _report_unkeepable(self, r.get("unkeepable"))
         if r["unskinned"]:
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
                                      "bone 0, which drags them wherever it goes"

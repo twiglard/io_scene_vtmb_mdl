@@ -471,7 +471,7 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
     space. "in_place" takes the same net displacement out and writes no block, so nothing
     travels on either side. "per_action" reads each action's own stamp instead, where a
     stored "keep" becomes "extract" -- there is no donor file here to keep blocks from."""
-    moved, unfitted = 0, []
+    moved, unfitted, unkeepable = 0, [], []
     for act in _ordered(actions):
         poses = sample_action(context, arm_obj, act, d, scale, use_range)
         if not poses:
@@ -486,12 +486,15 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
                 moved += bool(mvs)
                 if export_mod.lost_travel(act, mvs):
                     unfitted.append(act.name)
+        elif mode == "keep" and export_mod.lost_travel(act, movements):
+            # Only a forced "keep" reaches this: a stamped one became "extract" above.
+            unkeepable.append(act.name)
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
         a = build_mod.add_animation(d, act.name, poses, fps, flags, movements)
         build_mod.add_sequence(d, act.name, a, act.get("vtmb_activity", activity),
                                int(act.get("vtmb_seq_flags", 0)))
-    return len(actions), moved, unfitted
+    return len(actions), moved, unfitted, unkeepable
 
 
 def scene_cdtextures(arm_obj):
@@ -531,9 +534,9 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     faces, unskinned, kept, crowded = add_meshes(d, mesh_objs, bone_index, scale)
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
-    _n, moved, unfitted = add_actions(context, arm_obj, d, actions, scale, use_range,
-                                      activity, root_motion)
-    return d, faces, unskinned, kept, moved, crowded, unfitted
+    _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
+                                                  use_range, activity, root_motion)
+    return d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable
 
 
 def _set_hull(d, lo, hi):
@@ -595,11 +598,12 @@ def write(d, faces, path, checksum):
 
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
-    d, faces, unskinned, kept, moved, crowded, unfitted = build(
+    d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable = build(
         context, arm_obj, mesh_objs, actions, embedded_name(path), **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "with_root_motion": moved, "unfitted": unfitted,
+            "unkeepable": unkeepable,
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),
             "anims": len(d.anims), "seqs": len(d.seqs),
             "includes": len(d.includes),

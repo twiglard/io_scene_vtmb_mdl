@@ -691,6 +691,114 @@ def rebuild_cell(d, obj, bi, mi, bone_index):
     return faces, unskinned, kept
 
 
+def _vertex_normals(me, coords):
+    """Per-vertex normals off `coords`, area-weighted over the mesh's own triangles.
+
+    The file's own normals are not the base here: what a flex record adds is the CHANGE
+    a morph makes, so both sides have to be computed the same way for the difference to
+    mean anything.
+    """
+    acc = [[0.0, 0.0, 0.0] for _ in range(len(me.vertices))]
+    for tri in me.loop_triangles:
+        a, b, c = (coords[i] for i in tri.vertices)
+        u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        # Not normalised: the cross product's length is twice the triangle's area, which
+        # is the weight studiomdl and Blender both use.
+        n = (u[1] * v[2] - u[2] * v[1],
+             u[2] * v[0] - u[0] * v[2],
+             u[0] * v[1] - u[1] * v[0])
+        for i in tri.vertices:
+            acc[i][0] += n[0]
+            acc[i][1] += n[1]
+            acc[i][2] += n[2]
+    out = []
+    for n in acc:
+        L = (n[0] ** 2 + n[1] ** 2 + n[2] ** 2) ** 0.5
+        out.append((n[0] / L, n[1] / L, n[2] / L) if L else (0.0, 0.0, 0.0))
+    return out
+
+
+# A record whose two magnitude bytes both round to zero says nothing and still costs 8
+# bytes, so the step each byte spells is what decides whether a vertex is in the flex at
+# all: 8.0/255 = 0.0314 units of position, 2.0/255 = 0.00784 of normal.
+FLEX_POS_STEP = build_mod.M.FLEX_POSITION_DELTA_SCALE / 255.0
+FLEX_NRM_STEP = build_mod.M.FLEX_NORMAL_DELTA_SCALE / 255.0
+
+
+def shape_key_flexes(d, obj, bi, mi, scale=1.0):
+    """Rebuild one model's flexes from its shape keys. (keys, records, skipped, why).
+
+    The vertanim key is mesh-local and the reader adds it to the mesh's own first vertex,
+    so the file's partition has to be recoverable before a key can be written at all --
+    `original_runs` is what recovers it, and its members are in file order, member k of
+    run r being mesh r's vertex k. A vertex the edit added is in no run and its delta is
+    counted as skipped rather than guessed at.
+
+    The file's own flexes go first. A shape key holds coordinates only, so what is
+    written is the scene's morph entire and not a patch on what the file said -- the
+    normal delta is recomputed from the morphed geometry, and the file's own is gone.
+    """
+    from . import blender_scratch as scratch_mod
+    me = obj.data
+    keys = me.shape_keys
+    if keys is None or len(keys.key_blocks) < 2:
+        return 0, 0, 0, None
+    runs = scratch_mod.original_runs(obj, me)
+    if runs is None:
+        why = []
+        scratch_mod.original_runs(obj, me, why)
+        return 0, 0, 0, (why[0] if why else "the file's partition was not recoverable")
+    me.calc_loop_triangles()
+    local = {}
+    for k, (_slot, members) in enumerate(runs):
+        for j, vi in enumerate(members):
+            local[vi] = (k, j)
+
+    blocks = list(keys.key_blocks)
+    base = [tuple(v.co) for v in blocks[0].data]
+    base_n = _vertex_normals(me, base)
+    build_mod.clear_flexes(d, bi, mi)
+    targets = obj.get("vtmb_flex_targets") or []
+    names = list(obj.get("vtmb_flex_names") or [])
+    nkeys = nrec = skipped = 0
+    for bk, kb in enumerate(blocks[1:]):
+        co = [tuple(v.co) for v in kb.data]
+        moved = [i for i in range(len(co))
+                 if max(abs(co[i][c] - base[i][c]) for c in range(3)) > 1e-6]
+        if not moved:
+            continue
+        morph_n = _vertex_normals(me, co)
+        per_mesh = {}
+        for vi in moved:
+            delta = tuple((co[vi][c] - base[vi][c]) / scale for c in range(3))
+            ndelta = tuple(morph_n[vi][c] - base_n[vi][c] for c in range(3))
+            if sum(c * c for c in delta) ** 0.5 < FLEX_POS_STEP / 2.0 and                     sum(c * c for c in ndelta) ** 0.5 < FLEX_NRM_STEP / 2.0:
+                continue
+            at = local.get(vi)
+            if at is None:
+                skipped += 1
+                continue
+            k, j = at
+            per_mesh.setdefault(k, []).append((j, delta, ndelta))
+        if not per_mesh:
+            continue
+        # The target the file carried, matched by the name the import assigned rather
+        # than by position: a key renamed or reordered in Blender must not take another
+        # flex's numbers.
+        t = (0.0, 0.0, 0.0, 0.0)
+        if kb.name in names:
+            at = names.index(kb.name)
+            if at < len(targets):
+                t = tuple(float(c) for c in targets[at])
+        nkeys += 1
+        for k in sorted(per_mesh):
+            recs = sorted(per_mesh[k])
+            build_mod.add_flex(d, bi, mi, k, kb.name, recs, t)
+            nrec += len(recs)
+    return nkeys, nrec, skipped, None
+
+
 def read_meshes(m, source, fields):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not, the fields the file cannot carry, and the objects holding a vertex
@@ -900,6 +1008,68 @@ def read_materials(m, source):
     return out
 
 
+def new_materials(m, source):
+    """Blender material slot names on this file's meshes that no file mesh maps to.
+
+    `obj["vtmb_meshes"]` records the slot each file mesh landed in, so a slot outside that
+    set is one the scene added. Whether anything then references the record is a separate
+    question and not one this has to answer: 648 shipped models carry an
+    `mstudiotexture_t` no strip group reaches, so an unused record is legal.
+    """
+    out, seen = [], set()
+    for (_bi, _mi), obj in sorted(mesh_objects(m, source).items()):
+        stash = obj.get("vtmb_meshes")
+        if not stash:
+            continue
+        used = {int(x[0]) for x in stash}
+        for slot, mat in enumerate(obj.data.materials):
+            if mat is None or slot in used or mat.name in seen:
+                continue
+            seen.add(mat.name)
+            out.append(mat.name)
+    return out
+
+
+def apply_springbones(d, m, arm_obj):
+    """Retuned spring-bone floats out of the pose bones, back into the 28-byte records.
+
+    Matched on the record ordinal the import stamped rather than on the bone, because a
+    chain is identified by its ordinal everywhere the engine touches it -- the disable
+    mask is `1 << recordIndex` -- and two records may name one start bone. A record whose
+    ordinal no pose bone claims is carried verbatim.
+
+    Comparison is against the packed float32, not the Python float, so a value the user
+    never touched cannot rewrite the bytes it came from.
+    """
+    stamped = {}
+    for pb in arm_obj.pose.bones:
+        k = pb.get("vtmb_spring_index")
+        if k is not None:
+            stamped.setdefault(int(k), pb)
+    names = {b.name: b.index for b in m.bones}
+    changed = 0
+    for k, r in enumerate(d.springbones):
+        pb = stamped.get(k)
+        if pb is None:
+            continue
+        end = pb.get("vtmb_spring_end")
+        want = names.get(end, -1) if end else -1
+        if struct.unpack_from("<i", r.raw, 0x04)[0] != want:
+            struct.pack_into("<i", r.raw, 0x04, want)
+            changed += 1
+        for at, key in ((0x08, "vtmb_spring_unk08"), (0x0c, "vtmb_spring_gravity"),
+                        (0x10, "vtmb_spring_damping"), (0x14, "vtmb_spring_exp"),
+                        (0x18, "vtmb_spring_maxangle")):
+            v = pb.get(key)
+            if v is None:
+                continue
+            packed = struct.pack("<f", float(v))
+            if bytes(r.raw[at:at + 4]) != packed:
+                r.raw[at:at + 4] = packed
+                changed += 1
+    return changed
+
+
 def apply_sequences(d, arm_obj, anim_names):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
@@ -1055,7 +1225,7 @@ def revise_vtx(source, dest, data, revised):
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
-                   model_name="", hull=None, cdtexture=None):
+                   model_name="", hull=None, cdtexture=None, write_flexes=False):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -1139,7 +1309,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise ValueError("%s has no animation data" % arm_obj.name)
     restore = ad.action if ad else None
 
-    edits, wrote, pending, unfitted = {}, [], [], []
+    edits, wrote, pending, unfitted, unkeepable = {}, [], [], [], []
     try:
         for index, action in sorted(actions.items()):
             if ad.action is not action:
@@ -1203,6 +1373,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                     unfitted.append(action.name)
             elif mode == "in_place":
                 _mv, poses = write_mod.extract_root_motion(m, poses)
+            elif mode == "keep" and lost_travel(action, movements):
+                # Only a forced "keep" reaches this: a stamped one became "extract" above.
+                unkeepable.append(action.name)
             pending.append((action, poses, tuple(movements), len(frames)))
     finally:
         if ad is not None and ad.action is not restore:
@@ -1210,8 +1383,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     d = build_mod.apply_anims(d, edits, source)
 
-    scene = {"bones": 0, "materials": 0, "sequences": 0, "stale": 0,
-             "surplus": surplus_bones(m, arm_obj)}
+    scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0, "stale": 0,
+             "added_materials": [], "surplus": surplus_bones(m, arm_obj)}
     poses = read_bones(m, arm_obj, scale)
     if poses:
         build_mod.set_bone_poses(d, poses)
@@ -1223,6 +1396,17 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
             d.textures[ref].name = name
             scene["materials"] += 1
+    # After the rename loop, so a slot renamed onto an existing texture is a rename and
+    # not an addition. `cdtexture` has already been applied to d.cdtextures above, so None
+    # here leaves the list the scene asked for alone.
+    have = {t.name for t in d.textures}
+    for name in new_materials(m, source):
+        if name in have:
+            continue
+        build_mod.add_material(d, name, None)
+        have.add(name)
+        scene["added_materials"].append(name)
+    scene["springs"] = apply_springbones(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     scene["sequences"] = apply_sequences(d, arm_obj, [r.name for r in d.anims])
@@ -1247,7 +1431,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
-            "unskinned": 0, "renumbered": 0, "crowded": []}
+            "unskinned": 0, "renumbered": 0, "crowded": [],
+            "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": []}
     revised = {}
     if mesh_fields:
         cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
@@ -1272,6 +1457,21 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             mesh["unskinned"] += unskinned
             mesh["renumbered"] += 0 if kept else 1
 
+    if write_flexes:
+        # After the geometry, because add_flex bounds every key against the mesh's
+        # numvertices as written and a rebuild has just changed it.
+        found = mesh_objects(m, source)
+        for (bi, mi, _bp, _mo) in mesh_mod.models_of(m):
+            obj = found.get((bi, mi))
+            if obj is None:
+                continue
+            k, r, skipped, why = shape_key_flexes(d, obj, bi, mi)
+            mesh["flexes"] += k
+            mesh["flex_records"] += r
+            mesh["flex_skipped"] += skipped
+            if why:
+                mesh["flex_refused"].append((obj.name, why))
+
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
@@ -1285,7 +1485,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
-            "bones": len(m.bones),
+            "unkeepable": unkeepable, "bones": len(m.bones),
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
             "vtx": vtx, "removed": removed, "added_bones": added_bones,

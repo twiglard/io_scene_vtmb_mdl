@@ -165,6 +165,11 @@ def build_armature(context, m, name, scale, root_motion=True):
     bpy.ops.object.mode_set(mode="OBJECT")
 
     dbs = arm_obj.data.bones
+    # Keyed on the record ordinal, not on the bone: two records may name one start bone,
+    # and the disable mask is `1 << recordIndex`, so the ordinal is what identifies a chain.
+    springs = {}
+    for s in m.springbones:
+        springs.setdefault(s.bone, s)
     for b in m.bones:
         pb = arm_obj.pose.bones[b.name]
         pb.rotation_mode = "QUATERNION"
@@ -184,6 +189,20 @@ def build_armature(context, m, name, scale, root_motion=True):
         if b.parent >= 0:
             local = dbs[m.bones[b.parent].name].matrix_local.inverted() @ local
         pb["vtmb_rest_local"] = [f for row in local for f in row]
+        sb = springs.get(b.index)
+        if sb is not None:
+            # The five floats are what the eight bc_* ConVars override at runtime; writing
+            # them here is the same retune made permanent. unk08 is read by nothing in the
+            # whole install and is carried so an untouched export stays byte-identical.
+            pb["vtmb_spring_index"] = sb.index
+            pb["vtmb_spring_end"] = (m.bones[sb.endbone].name
+                                     if 0 <= sb.endbone < len(m.bones) else "")
+            pb["vtmb_spring_disabled"] = bool(sb.disabled)
+            pb["vtmb_spring_unk08"] = sb.unk08
+            pb["vtmb_spring_gravity"] = sb.gravity
+            pb["vtmb_spring_damping"] = sb.damping
+            pb["vtmb_spring_exp"] = sb.springexp
+            pb["vtmb_spring_maxangle"] = sb.maxangledeg
 
     arm_obj["vtmb_scale"] = scale
     arm_obj["vtmb_checksum"] = m.checksum
@@ -396,7 +415,61 @@ def _material(m, index, content):
     return mat
 
 
-def build_meshes(context, m, arm_obj, name, scale, content):
+def build_shape_keys(obj, model, scale):
+    """One shape key per flexdesc the model's meshes name. (keys, records, dropped).
+
+    `mstudioflex_t` is per mesh and the vertanim key is mesh-local, so a morph that
+    crosses two meshes of one model is two flex records naming one flexdesc, and both
+    land in the same key here -- the Blender vertex is `mesh.vertexoffset + index`,
+    which is exactly what `R_StudioFlexVerts` indexes.
+
+    Position deltas only. A shape key holds coordinates and nothing else, so the normal
+    delta each record also carries has nowhere to go; the count is stashed on the object
+    and the caller reports it rather than dropping it in silence.
+    """
+    flexes = [(mesh, f) for mesh in model.meshes for f in mesh.flexes]
+    if not flexes:
+        return 0, 0, 0
+    order, targets = [], {}
+    for _mesh, f in flexes:
+        if f.flexdesc not in targets:
+            order.append(f.flexdesc)
+            targets[f.flexdesc] = f.target
+    nverts = len(obj.data.vertices)
+    obj.shape_key_add(name="Basis", from_mix=False)
+    nrec = dropped = 0
+    for fd in order:
+        nm = None
+        for _mesh, f in flexes:
+            if f.flexdesc == fd:
+                nm = f.name
+                break
+        kb = obj.shape_key_add(name=nm or "flex_%d" % fd, from_mix=False)
+        kb.slider_min, kb.slider_max = 0.0, 1.0
+        data = kb.data
+        for mesh, f in flexes:
+            if f.flexdesc != fd:
+                continue
+            for v in f.verts:
+                nrec += 1
+                d = mdl_mod.flex_delta(v, f.vertanimtype)
+                vi = mesh.vertexoffset + v.index
+                if d is None or not 0 <= vi < nverts:
+                    dropped += 1
+                    continue
+                co = data[vi].co
+                co[0] += d[0][0] * scale
+                co[1] += d[0][1] * scale
+                co[2] += d[0][2] * scale
+    # -11.0 .. 11.0 over the corpus, read by nothing this addon writes, and there is no
+    # Blender field for it -- kept so a rebuild can put back what the file said.
+    obj["vtmb_flex_targets"] = [[float(c) for c in targets[fd]] for fd in order]
+    obj["vtmb_flex_names"] = [obj.data.shape_keys.key_blocks[i + 1].name
+                              for i in range(len(order))]
+    return len(order), nrec, dropped
+
+
+def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
     path, blob = content.companion(m, vtx_mod.SUFFIXES)
     if path is None:
         return [], "no .vtx for this .mdl on any content root, so no faces to import"
@@ -430,6 +503,7 @@ def build_meshes(context, m, arm_obj, name, scale, content):
                         mesh.material))
 
     objs = []
+    nkeys = nflexrec = nflexdrop = 0
     for gi, (bp, model) in enumerate(models):
         faces = faces_by_model.get(gi)
         if not faces:
@@ -525,10 +599,25 @@ def build_meshes(context, m, arm_obj, name, scale, content):
                 for bone, weight in zip(v_.bones[:n_], v_.weights[:n_]):
                     if weight > 0.0 and 0 <= bone < len(m.bones):
                         groups[m.bones[bone].name].add([vi], weight, "REPLACE")
+        if with_flexes:
+            k, r, dropped = build_shape_keys(obj, model, scale)
+            nkeys += k
+            nflexrec += r
+            nflexdrop += dropped
+
         obj.parent = arm_obj
         obj.modifiers.new(name="Armature", type="ARMATURE").object = arm_obj
         objs.append(obj)
-    return objs, None
+    note = None
+    if nflexrec:
+        # A shape key is coordinates only, so every record's normal delta stays in the
+        # file and out of the scene. Said once per import rather than not at all.
+        note = ("%d shape key(s) from %d flex vertex delta(s); the normal delta each "
+                "record also carries has no Blender field and is not in the scene"
+                % (nkeys, nflexrec))
+        if nflexdrop:
+            note += ", and %d record(s) named a vertex or a direction this file does "                     "not hold" % nflexdrop
+    return objs, note
 
 
 def _bind_slot(arm_obj, action):
@@ -743,7 +832,7 @@ def pick_animations(m, content, anim_filter, max_anims, with_chained):
 def import_mdl(context, path, anim_filter="", max_anims=0,
                scale=1.0, with_mesh=True, with_anims=True, with_chained=True,
                game_root="", mods=(), extra_roots=(), use_packs=True,
-               root_motion=True):
+               root_motion=True, with_flexes=True):
     m = mdl_mod.Mdl(path)
     roots = paths_mod.roots(path, game_root, mods, extra_roots)
     content = Content(roots, use_packs)
@@ -757,12 +846,13 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     arm_obj["vtmb_import"] = {
         "addon_version": _addon_version(), "scale": scale,
         "with_mesh": with_mesh, "with_anims": with_anims, "with_chained": with_chained,
+        "with_flexes": with_flexes,
         "use_packs": use_packs, "root_motion": root_motion, "anim_filter": anim_filter,
         "max_anims": max_anims, "game_root": game_root, "mods": list(mods),
         "extra_roots": list(extra_roots),
     }
     objs, warning = ([], None) if not with_mesh else \
-        build_meshes(context, m, arm_obj, name, scale, content)
+        build_meshes(context, m, arm_obj, name, scale, content, with_flexes)
 
     wanted, missing = [], []
     if with_anims:

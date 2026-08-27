@@ -27,14 +27,17 @@ HDR_NUMTEXTURES = 292
 HDR_NUMCDTEXTURES = 300
 HDR_NUMSKINREF = 308
 HDR_NUMBODYPARTS = 320
+HDR_NUMFLEXDESC = 344
 HDR_NUMHITBOXSETS = 256
 HDR_NUMINCLUDEMODELS = 404
+HDR_NUMSPRINGBONES = 396
 
 # Measured, not from Valve: the record is 116 bytes with the name offset at +0, and no
 # other stride parses the corpus. The 24 trailing -1s are the pose-parameter remap.
 INCLUDE_STRIDE = 116
 
 HITBOXSET_STRIDE = 12
+SPRINGBONE_STRIDE = 28
 BBOX_STRIDE = 32
 
 BONE_STRIDE = 160
@@ -63,6 +66,18 @@ TEXTURE_STRIDE = 20
 BODYPART_STRIDE = 16
 MODEL_STRIDE = 224
 MESH_STRIDE = 60
+MESH_NUMFLEXES = 0x10
+
+FLEX_STRIDE = 32
+# mstudioflex_t.vertanimtype at +0x1c picks the payload record: 1 -> 8 bytes, 0 -> 20.
+VERTANIM_STRIDE = {0: 20, 1: 8}
+# g_flexPositionDeltaScale, StudioRender.dll 0x2c06c4fc, read only at 0x2c050bc7. The 8-byte
+# form's position byte is multiplied by it, so 188/255*8 = 5.898 units is all it reaches.
+FLEX_POSITION_DELTA_SCALE = 8.0
+# FADD ST0,ST0 at 0x2c050a4a and 0x2c050b90 -- the normal term is one term doubled, not two.
+FLEX_NORMAL_DELTA_SCALE = 2.0
+_VERTANIM0 = struct.Struct("<hh3fHBB")
+_VERTANIM1 = struct.Struct("<hHHBB")
 
 VERTEX_STRIDE = {0: 44, 1: 12, 2: 8}
 # What a packed position scalar is multiplied by before the model's own quant_scale.
@@ -75,6 +90,41 @@ _VERT0 = struct.Struct("<4B4h8f")
 # Tabulated rather than divided, and kept as the same expressions so the bits do not move.
 _W255 = [i / 255.0 for i in range(256)]
 _W4TH = [(255 - s) / 255.0 for s in range(766)]
+
+
+def flex_delta(v, vertanimtype):
+    """One vertanim record as (position delta, normal delta), at flex weight 1.
+
+    `CStudioRender_R_StudioFlexVerts` StudioRender.dll 0x2c050860, the only reader:
+
+        position                 +=      w * (delta_scale/255) * 8.0 * table[delta_offset]
+        normal and tangentS.xyz  +=  2 * w * (ndelta_scale/255)     * table[ndelta_offset]
+
+    with the 20-byte form carrying the position delta as raw floats instead. Returns None
+    for a direction the table does not hold -- an offset that is not a multiple of 12, or
+    one past the last entry. Nothing in the binary bounds either ushort.
+    """
+    nd = NT.decode(1, v.ndelta_offset)
+    if nd is None:
+        return None
+    ns = FLEX_NORMAL_DELTA_SCALE * v.ndelta_scale / 255.0
+    ndelta = (nd[0] * ns, nd[1] * ns, nd[2] * ns)
+    if vertanimtype == 0:
+        return v.delta, ndelta
+    pd = NT.decode(1, v.delta_offset)
+    if pd is None:
+        return None
+    ps = v.delta_scale / 255.0 * FLEX_POSITION_DELTA_SCALE
+    return (pd[0] * ps, pd[1] * ps, pd[2] * ps), ndelta
+
+
+def flex_pack(v, vertanimtype):
+    """A VertAnim back to its record bytes. The inverse of `Mdl._read_vertanim`."""
+    if vertanimtype:
+        return _VERTANIM1.pack(v.index, v.delta_offset, v.ndelta_offset,
+                               v.delta_scale, v.ndelta_scale)
+    return _VERTANIM0.pack(v.index, 0, v.delta[0], v.delta[1], v.delta[2],
+                           v.ndelta_offset, v.ndelta_scale, 0)
 
 
 def anim_position(a, frame):
@@ -213,7 +263,23 @@ class Seq:
 
 class Mesh:
     __slots__ = ("index", "material", "numvertices", "vertexoffset", "materialtype",
-                 "materialparam")
+                 "materialparam", "flexes")
+
+
+class Flex:
+    """One morph target's contribution to one mesh. `flexdesc` names it globally."""
+    __slots__ = ("index", "flexdesc", "name", "target", "vertanimtype", "verts")
+
+
+class VertAnim:
+    """One vertex's delta inside a flex. `index` is MESH-LOCAL and signed.
+
+    The direction fields are unscaled byte offsets into `g_normalOffsetTable`, the same
+    encoding as `mstudiovertex1_t.norm`, so they go through `normal_table` filetype 1.
+    `delta` is the raw Vector of the 20-byte form and None in the 8-byte one.
+    """
+    __slots__ = ("index", "delta", "delta_offset", "delta_scale",
+                 "ndelta_offset", "ndelta_scale")
 
 
 class Model:
@@ -223,6 +289,11 @@ class Model:
 
 class BodyPart:
     __slots__ = ("index", "name", "base", "models")
+
+
+class SpringBone:
+    __slots__ = ("index", "bone", "endbone", "disabled", "unk08", "gravity",
+                 "damping", "springexp", "maxangledeg")
 
 
 class HitboxSet:
@@ -272,9 +343,11 @@ class Mdl:
         self.seqs = [self._read_seq(seqindex + i * SEQDESC_STRIDE, i)
                      for i in range(numseq)]
         self._read_materials()
+        self._read_flexdescs()
         self._read_bodyparts()
         self._read_hitboxsets()
         self._read_includes()
+        self._read_springbones()
 
     def _cstr(self, off):
         end = self.d.find(b"\x00", off)
@@ -384,8 +457,54 @@ class Mdl:
             e.material, _, e.numvertices, e.vertexoffset = \
                 struct.unpack_from("<4i", d, eo)
             e.materialtype, e.materialparam = struct.unpack_from("<2i", d, eo + 24)
+            e.flexes = self._read_flexes(eo)
             m.meshes.append(e)
         return m
+
+    def _read_flexdescs(self):
+        n, idx = struct.unpack_from("<ii", self.d, HDR_NUMFLEXDESC)
+        self.flexdescs = [self._cstr(idx + i * 4
+                                     + struct.unpack_from("<i", self.d, idx + i * 4)[0])
+                          for i in range(n)]
+
+    def _read_flexes(self, mesh_off):
+        """Every mstudioflex_t of one mesh, payload decoded."""
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, mesh_off + MESH_NUMFLEXES)
+        out = []
+        for r in range(n):
+            off = mesh_off + idx + r * FLEX_STRIDE
+            f = Flex()
+            f.index = r
+            f.flexdesc = struct.unpack_from("<i", d, off)[0]
+            f.name = (self.flexdescs[f.flexdesc]
+                      if 0 <= f.flexdesc < len(self.flexdescs) else None)
+            f.target = struct.unpack_from("<4f", d, off + 4)
+            numverts, vertindex = struct.unpack_from("<ii", d, off + 0x14)
+            # The reader loops on the low short of both numverts and vertanimtype, so the
+            # high half of each is unreachable and this reads what the engine reads.
+            numverts &= 0xFFFF
+            f.vertanimtype = 1 if (struct.unpack_from("<i", d, off + 0x1c)[0] & 0xFFFF) else 0
+            base = off + vertindex
+            f.verts = [self._read_vertanim(base, k, f.vertanimtype)
+                       for k in range(numverts)]
+            out.append(f)
+        return out
+
+    def _read_vertanim(self, base, k, vertanimtype):
+        v = VertAnim()
+        if vertanimtype:
+            at = base + k * 8
+            (v.index, v.delta_offset, v.ndelta_offset,
+             v.delta_scale, v.ndelta_scale) = _VERTANIM1.unpack_from(self.d, at)
+            v.delta = None
+        else:
+            at = base + k * 20
+            (v.index, _pad, dx, dy, dz, v.ndelta_offset,
+             v.ndelta_scale, _pad2) = _VERTANIM0.unpack_from(self.d, at)
+            v.delta = (dx, dy, dz)
+            v.delta_offset = v.delta_scale = None
+        return v
 
     def _read_hitboxsets(self):
         d = self.d
@@ -416,6 +535,25 @@ class Mdl:
             off = idx + i * INCLUDE_STRIDE
             self.includes.append(
                 self._cstr(off + struct.unpack_from("<i", d, off)[0]))
+
+    def _read_springbones(self):
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMSPRINGBONES)
+        self.springbones = []
+        for i in range(n):
+            off = idx + i * SPRINGBONE_STRIDE
+            s = SpringBone()
+            s.index = i
+            bone, s.endbone = struct.unpack_from("<ii", d, off)
+            # A negative start bone carries the index as -1-bone and separately makes
+            # CBaseAnimating::SetModel set m_nPhysicsChainDisableMask, so the chain also
+            # starts switched off and LookupPhysicsChain can never match it by name.
+            # 0 of the corpus's 600 records use it.
+            s.disabled = bone < 0
+            s.bone = -1 - bone if bone < 0 else bone
+            (s.unk08, s.gravity, s.damping, s.springexp,
+             s.maxangledeg) = struct.unpack_from("<5f", d, off + 8)
+            self.springbones.append(s)
 
     def vertices(self, model):
         """Decoded vertices for one model, in model.vertexbase order."""
