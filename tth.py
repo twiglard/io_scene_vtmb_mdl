@@ -11,8 +11,12 @@ raw zlib. Concatenating them reproduces the .vtf the engine would otherwise ship
 
 dst is an offset into the reconstructed VTF, src into the .ttz. The .ttz is deflated with
 a flush at every mip boundary, so src lets a caller inflate one mip without the rest.
+
+`encode` and `build_vtf` are the write half. plans/tth-encode.py is the check that drives
+them over the shipped corpus; it imports them from here rather than carrying a second copy.
 """
 
+import os
 import struct
 import sys
 import zlib
@@ -215,6 +219,142 @@ def decode(w, h, fmt, data):
     return out
 
 
+def _q565(c):
+    """An 8-bit RGB triple as the 565 word, rounded rather than truncated."""
+    r = min(31, (c[0] * 31 + 127) // 255)
+    g = min(63, (c[1] * 63 + 127) // 255)
+    b = min(31, (c[2] * 31 + 127) // 255)
+    return (r << 11) | (g << 5) | b
+
+
+def _axis(px):
+    """The block's principal colour axis, by power iteration on its covariance.
+
+    A bounding-box diagonal is the cheaper choice and is wrong on the blocks that matter:
+    a smooth gradient across one corner of the box gives a diagonal at 45 degrees to the
+    colours actually present, and the two interpolated palette entries then sit off the
+    line every pixel is on.
+    """
+    n = len(px)
+    mean = [sum(p[c] for p in px) / n for c in range(3)]
+    cov = [[0.0] * 3 for _ in range(3)]
+    for p in px:
+        d = [p[c] - mean[c] for c in range(3)]
+        for i in range(3):
+            for j in range(3):
+                cov[i][j] += d[i] * d[j]
+    v = [1.0, 1.0, 1.0]
+    for _ in range(8):
+        v = [sum(cov[i][j] * v[j] for j in range(3)) for i in range(3)]
+        L = max(abs(c) for c in v)
+        if L < 1e-12:
+            return mean, (1.0, 0.0, 0.0)
+        v = [c / L for c in v]
+    L = sum(c * c for c in v) ** 0.5
+    return mean, tuple(c / L for c in v)
+
+
+def _fit_endpoints(px):
+    """Two RGB endpoints spanning the block, refined against the 1/3 and 2/3 palette.
+
+    The projection extremes alone put both endpoints on real pixels, which is right for
+    the two ends and wrong for everything between: the four palette entries are at 0,
+    1/3, 2/3 and 1 of the segment, so the least-squares refit below is what places them.
+    """
+    mean, ax = _axis(px)
+    ts = [sum((p[c] - mean[c]) * ax[c] for c in range(3)) for p in px]
+    lo, hi = min(ts), max(ts)
+    a = [mean[c] + lo * ax[c] for c in range(3)]
+    b = [mean[c] + hi * ax[c] for c in range(3)]
+    for _ in range(2):
+        # w is each pixel's position on the segment, so the normal equations below are
+        # the ordinary least-squares fit of a line through the four palette weights.
+        ws = []
+        for p in px:
+            den = sum((b[c] - a[c]) ** 2 for c in range(3))
+            t = 0.0 if den < 1e-12 else                 sum((p[c] - a[c]) * (b[c] - a[c]) for c in range(3)) / den
+            ws.append(min(1.0, max(0.0, round(t * 3.0) / 3.0)))
+        s0 = sum((1.0 - w) ** 2 for w in ws)
+        s1 = sum(w * w for w in ws)
+        s01 = sum(w * (1.0 - w) for w in ws)
+        det = s0 * s1 - s01 * s01
+        if abs(det) < 1e-9:
+            break
+        for c in range(3):
+            t0 = sum((1.0 - w) * p[c] for w, p in zip(ws, px))
+            t1 = sum(w * p[c] for w, p in zip(ws, px))
+            a[c] = (t0 * s1 - t1 * s01) / det
+            b[c] = (t1 * s0 - t0 * s01) / det
+    clamp = lambda v: int(min(255, max(0, round(v))))                    # noqa: E731
+    return tuple(clamp(x) for x in a), tuple(clamp(x) for x in b)
+
+
+def _bc1_block(px):
+    """One 8-byte BC1 block from 16 RGB triples, always in the four-colour mode.
+
+    c0 <= c1 is the three-colour mode, whose fourth entry is transparent black, so the
+    words are ordered rather than emitted as fitted -- a swap costs the selectors their
+    0<->1 and 2<->3 pairing and nothing else.
+    """
+    a, b = _fit_endpoints(px)
+    c0, c1 = _q565(a), _q565(b)
+    if c0 < c1:
+        c0, c1 = c1, c0
+    pal = _bc_colors(c0, c1, False) if c0 > c1 else (_c565(c0),) * 4
+    idx = 0
+    for i, p in enumerate(px):
+        best, at = None, 0
+        for k in range(4 if c0 > c1 else 1):
+            e = sum((p[c] - pal[k][c]) ** 2 for c in range(3))
+            if best is None or e < best:
+                best, at = e, k
+        idx |= at << (2 * i)
+    return struct.pack("<HHI", c0, c1, idx)
+
+
+def _bc3_alpha(av):
+    """One 8-byte BC3 alpha block from 16 alpha bytes, always in the eight-value mode."""
+    a0, a1 = max(av), min(av)
+    if a0 == a1:
+        return struct.pack("<BB", a0, a1) + b"\0" * 6
+    tbl = [a0, a1] + [((6 - i) * a0 + (1 + i) * a1) // 7 for i in range(6)]
+    bits = 0
+    for i, a in enumerate(av):
+        best, at = None, 0
+        for k, t in enumerate(tbl):
+            e = (a - t) ** 2
+            if best is None or e < best:
+                best, at = e, k
+        bits |= at << (3 * i)
+    return struct.pack("<BB", a0, a1) + bits.to_bytes(6, "little")
+
+
+def _block_pixels(w, h, rgba, bx, by):
+    """The 16 RGBA tuples of one block, edge-replicated where the image runs out."""
+    out = []
+    for py in range(4):
+        y = min(h - 1, by * 4 + py)
+        for px_ in range(4):
+            x = min(w - 1, bx * 4 + px_)
+            o = (y * w + x) * 4
+            out.append(tuple(rgba[o:o + 4]))
+    return out
+
+
+def compress(w, h, fmt, rgba):
+    """Top-down RGBA8888 to DXT1 or DXT5 blocks. The inverse of `decode`."""
+    if fmt not in (DXT1, DXT5):
+        raise ValueError("compress writes DXT1 and DXT5, not format %d" % fmt)
+    out = bytearray()
+    for by in range(max(1, (h + 3) // 4)):
+        for bx in range(max(1, (w + 3) // 4)):
+            px = _block_pixels(w, h, rgba, bx, by)
+            if fmt == DXT5:
+                out += _bc3_alpha([p[3] for p in px])
+            out += _bc1_block([p[:3] for p in px])
+    return bytes(out)
+
+
 def to_tga(w, h, rgba):
     """Bottom-up 32-bit BGRA, the layout the SDK's own extraction uses."""
     hdr = struct.pack("<3B2HB4H2B", 0, 0, 2, 0, 0, 0, 0, 0, w, h, 32, 8)
@@ -226,6 +366,182 @@ def to_tga(w, h, rgba):
             row[2::4], row[1::4], row[0::4], row[3::4])
         rows.append(bytes(bgra))
     return hdr + b"".join(rows)
+
+
+VERSION = 1
+HEADER = struct.Struct("<4sHBBI")
+ENTRY = struct.Struct("<II")
+
+ENVMAP = 0x4000
+# 23 is UVWQ8888, 11 files under gamedata/materials. Kept out of PIXEL_BYTES so that
+# level_bytes still raises for it and top_mip cannot hand back undecodable bytes.
+EXTRA_PIXEL_BYTES = {23: 4}
+DEFAULT_INLINED = 3
+
+
+def encode_level_bytes(w, h, fmt):
+    if fmt in EXTRA_PIXEL_BYTES:
+        return w * h * EXTRA_PIXEL_BYTES[fmt]
+    return level_bytes(w, h, fmt)
+
+
+def mip_chain(width, height, fmt, mipcount, frames, faces):
+    """(level, w, h, bytes) per mip, smallest level first -- the order a VTF stores."""
+    out = []
+    for k in range(mipcount - 1, -1, -1):
+        w, h = max(1, width >> k), max(1, height >> k)
+        out.append((k, w, h, encode_level_bytes(w, h, fmt) * frames * faces))
+    return out
+
+
+def vtf_geometry(vtf):
+    """(header_size, width, height, fmt, mipcount, frames, faces) off a complete .vtf."""
+    if vtf[:4] != VTF_MAGIC:
+        raise ValueError("not a .vtf: magic %r" % vtf[:4])
+    header_size, = struct.unpack_from("<I", vtf, 12)
+    width, height, flags = struct.unpack_from("<HHI", vtf, 16)
+    frames, = struct.unpack_from("<H", vtf, 24)
+    fmt, = struct.unpack_from("<I", vtf, 52)
+    return (header_size, width, height, fmt, vtf[56], max(1, frames),
+            7 if flags & ENVMAP else 1)
+
+
+def mip_offsets(vtf, nmips=None, control=None):
+    """The dst column: nmips+1 ascending offsets, the last being len(vtf).
+
+    `nmips` overrides the VTF header's own mip count, which 36 shipped pairs disagree
+    with -- gimblesign.tth says 1 and stores 9.
+    """
+    header_size, width, height, fmt, mipcount, frames, faces = vtf_geometry(vtf)
+    if control == "mipcount":
+        nmips = None
+    if control == "faces":
+        faces = 1
+    sizes = mip_chain(width, height, fmt, nmips or mipcount, frames, faces)
+    total = sum(n for _, _, _, n in sizes)
+    start = len(vtf) - total
+    if start < header_size:
+        raise ValueError("a %d-byte mip chain does not fit under a %d-byte file with a "
+                         "%d-byte header" % (total, len(vtf), header_size))
+    dst, o = [], start
+    for _, _, _, n in sizes:
+        dst.append(o)
+        o += n
+    dst.append(len(vtf))
+    return dst, start - header_size
+
+
+def encode(vtf, inlined=None, level=9, nmips=None, control=None):
+    """(tth, ttz) from a complete .vtf, cut so that `inlined` mips stay in the .tth.
+
+    A full flush precedes every mip after the first compressed one, so each src offset
+    begins a stream a raw inflate can pick up alone.  Troika cut theirs with a SYNC flush
+    instead: over 64027 shipped entries 15760 inflate alone and 45036 only with the
+    earlier output as the window, so src there is a seek point and not an entry point.
+    """
+    dst, _ = mip_offsets(vtf, nmips, control)
+    nmips = len(dst) - 1
+    if inlined is None:
+        inlined = min(DEFAULT_INLINED, max(0, nmips - 1))
+    if not 0 <= inlined <= nmips:
+        raise ValueError("inlined %d outside 0..%d" % (inlined, nmips))
+    blob = dst[inlined]
+    src = [0] * (nmips + 1)
+    co = zlib.compressobj(level)
+    out = bytearray()
+    for i in range(inlined, nmips):
+        if i > inlined:
+            out += co.flush(zlib.Z_FULL_FLUSH)
+        src[i] = len(out)
+        out += co.compress(vtf[dst[i]:dst[i + 1]])
+    out += co.flush()
+    src[nmips] = len(out)
+    tth = bytearray(HEADER.pack(MAGIC, VERSION, nmips, inlined, blob))
+    for i in range(nmips + 1):
+        tth += ENTRY.pack(dst[i], src[i])
+    tth += vtf[:blob]
+    return bytes(tth), bytes(out)
+
+
+BGRA8888 = 12
+VTF_HEADER = struct.Struct("<4sIIIHHIHH4x3f4xfIBiBBx")
+
+
+def _halve(w, h, rgba):
+    nw, nh = max(1, w // 2), max(1, h // 2)
+    out = bytearray(nw * nh * 4)
+    for y in range(nh):
+        r0, r1 = min(2 * y, h - 1) * w, min(2 * y + 1, h - 1) * w
+        for x in range(nw):
+            c0, c1 = min(2 * x, w - 1), min(2 * x + 1, w - 1)
+            o = (y * nw + x) * 4
+            for c in range(4):
+                out[o + c] = (rgba[(r0 + c0) * 4 + c] + rgba[(r0 + c1) * 4 + c]
+                              + rgba[(r1 + c0) * 4 + c] + rgba[(r1 + c1) * 4 + c]) // 4
+    return nw, nh, bytes(out)
+
+
+def _bgra(rgba):
+    b = bytearray(rgba)
+    b[0::4], b[2::4] = rgba[2::4], rgba[0::4]
+    return bytes(b)
+
+
+def pick_format(rgba):
+    """DXT5 where the image uses alpha at all, DXT1 where it does not.
+
+    DXT1 has no alpha in the four-colour mode this writes, and the three-colour one
+    spells only fully transparent, so anything between is DXT5's to carry.
+    """
+    return DXT5 if any(a != 255 for a in rgba[3::4]) else DXT1
+
+
+def build_vtf(w, h, rgba, flags=0, fmt=None):
+    """A complete VTF 7.1 from top-down RGBA. `fmt` None picks DXT1 or DXT5 by the alpha.
+
+    No low-resolution thumbnail: lowResImageFormat -1 with a 0x0 extent is what 47
+    shipped pairs carry.
+    """
+    if len(rgba) != w * h * 4:
+        raise ValueError("%dx%d needs %d bytes, got %d" % (w, h, w * h * 4, len(rgba)))
+    if fmt is None:
+        fmt = pick_format(rgba)
+    if fmt not in (DXT1, DXT5, BGRA8888):
+        raise ValueError("build_vtf writes DXT1, DXT5 or BGRA8888, not format %d" % fmt)
+    chain = [(w, h, rgba)]
+    cw, ch, cur = w, h, rgba
+    while cw > 1 or ch > 1:
+        cw, ch, cur = _halve(cw, ch, cur)
+        chain.append((cw, ch, cur))
+    n = len(chain)
+    px = len(rgba) // 4
+    refl = tuple(sum(rgba[c::4]) / (255.0 * px) for c in range(3))
+    head = VTF_HEADER.pack(VTF_MAGIC, 7, 1, VTF_HEADER.size, w, h, flags, 1, 0,
+                           refl[0], refl[1], refl[2], 1.0, fmt, n, -1, 0, 0)
+    body = [(_bgra(c[2]) if fmt == BGRA8888 else compress(c[0], c[1], fmt, c[2]))
+            for c in reversed(chain)]
+    return head + b"".join(body)
+
+
+def write_pair(stem, w, h, rgba, flags=0, overwrite=False, fmt=None):
+    """The `.tth` and `.ttz` at `stem`, from top-down RGBA. True if they were written.
+
+    Either half already on disk stops both: the pair is one .vtf cut in two, and a fresh
+    .tth beside a stale .ttz reconstructs a file that is neither. A texture under the game
+    tree may be Troika's, so nothing is replaced unless `overwrite`.
+    """
+    if not overwrite and (os.path.exists(stem + ".tth")
+                          or os.path.exists(stem + ".ttz")):
+        return False
+    head, rest = encode(build_vtf(w, h, rgba, flags, fmt))
+    parent = os.path.dirname(stem)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    with open(stem + ".tth", "wb") as f:
+        f.write(head)
+    with open(stem + ".ttz", "wb") as f:
+        f.write(rest)
+    return True
 
 
 def _cli(argv):
