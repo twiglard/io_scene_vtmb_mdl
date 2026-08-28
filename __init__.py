@@ -867,9 +867,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             box = _section(lay, "vtmb_rootmotion", "Root motion",
                            icon="ORIENTATION_GIMBAL")
             if box is not None:
-                # The one box in this dialog that asked for a choice without showing the
-                # state it is a choice about. `vtmb_root_motion` is per action and is
-                # exactly what the export arithmetic reads, so it is what gets shown.
+                # The mode is the action's own, edited in Object Data > VTMB animations.
+                # `root_motion` survives as a property a scripted caller can still force.
                 arm = context.active_object
                 _pair(box, "this action's keys",
                       "carry the travel" if act.get("vtmb_root_motion")
@@ -879,13 +878,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     _pair(box, "the file's animations",
                           "%d carry a movement block" % nmv)
                 box.prop(self, "root_motion_in_keys")
-                box.prop(self, "root_motion", text="")
-                if self.root_motion == blender_export.PER_ACTION:
-                    try:
-                        _pair(box, "this action writes", ROOT_MOTION_LABELS[
-                            blender_export.root_motion_mode(act, self.root_motion)])
-                    except (ValueError, KeyError) as exc:
-                        box.label(text=str(exc), icon="ERROR")
+                try:
+                    _pair(box, "this action writes", ROOT_MOTION_LABELS[
+                        blender_export.root_motion_mode(act, self.root_motion)])
+                except (ValueError, KeyError) as exc:
+                    box.label(text=str(exc), icon="ERROR")
+                if self.root_motion != blender_export.PER_ACTION:
+                    box.label(text="forced by the caller, not by the action",
+                              icon="INFO")
+                else:
+                    box.label(text="set it in Object Data > VTMB animations",
+                              icon="ACTION")
 
         nverts = _mesh_verts(base)
         fields = _mesh_fields(self)
@@ -1398,16 +1401,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 box.label(text="    and %d more" % (len(actions) - 4))
             box.prop(self, "use_range")
             box.prop(self, "activity")
-            row = box.row()
-            row.label(text="Root motion")
-            row.prop(self, "root_motion", text="")
             # This operator writes every action, so one action's answer says nothing --
-            # what the setting means here is the split across all of them.
+            # what is reported is the split across all of them.
+            try:
+                _pair(box, "root motion", _mode_tally(actions)
+                      if self.root_motion == blender_export.PER_ACTION
+                      else "%s, forced by the caller"
+                           % ROOT_MOTION_LABELS[self.root_motion])
+            except (ValueError, KeyError) as exc:
+                box.label(text=str(exc), icon="ERROR")
             if self.root_motion == blender_export.PER_ACTION:
-                try:
-                    _pair(box, "which is", _mode_tally(actions))
-                except ValueError as exc:
-                    box.label(text=str(exc), icon="ERROR")
+                box.label(text="set it in Object Data > VTMB animations", icon="ACTION")
             box.prop(self, "chain")
             chain = blender_scratch.scene_includes(obj)
             if not chain:

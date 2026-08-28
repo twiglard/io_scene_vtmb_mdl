@@ -15,6 +15,7 @@ import bpy
 from . import blender_export
 from . import blender_import
 from . import blender_scratch
+from . import mdl as mdl_mod
 from . import paths as paths_mod
 
 INCLUDES = "vtmb_includes"
@@ -283,6 +284,133 @@ class VTMB_PT_armature(bpy.types.Panel):
         lay.operator(VTMB_OT_check_paths.bl_idname, icon="VIEWZOOM")
 
 
+def draw_action_fields(lay, act):
+    """The three per-action fields, wherever they are hosted.
+
+    Two panels draw them -- the Action editor's sidebar, which is about the action on
+    screen, and the Object Data tab's list, which is about the model's whole set -- and
+    `operator-check.py` reads the `.prop(act, ...)` calls out of this one function, so a
+    field added here is a field both hosts get and the check counts.
+    """
+    col = lay.column(align=True)
+    col.prop(act, "vtmb_root_motion_choice", text="")
+    if act.get(blender_export.MODE_ATTR) is None:
+        col.label(text="    -> " + _fallback_line(act))
+
+    col = lay.column(align=True)
+    col.prop(act, "vtmb_loops")
+    col.prop(act, "vtmb_activity_text")
+
+    nmv = act.get("vtmb_movements")
+    if nmv is not None:
+        col = lay.column(align=True)
+        col.label(text="came from an animation with %d movement block%s"
+                       % (nmv, "" if nmv == 1 else "s"), icon="INFO")
+        col.label(text="keys %s the travel"
+                       % ("carry" if act.get("vtmb_root_motion") else "do not carry"))
+
+
+# `keep` and `extract` differ only after the comma in MODE_ITEMS, so a truncation of
+# those labels cannot tell them apart in one list column.
+SHORT_MODES = {
+    "keep": "engine carries, as the file has it",
+    "extract": "engine carries, fitted to the keys",
+    "none": "skeleton moves",
+    "in_place": "nothing moves",
+}
+
+
+def _mode_label(act):
+    """The short name of the mode this action writes, stamped or fallen back to."""
+    try:
+        mode = blender_export.root_motion_mode(act, blender_export.PER_ACTION)
+    except ValueError:
+        return "bad value"
+    return SHORT_MODES.get(mode, mode)
+
+
+def listed_action(obj):
+    """The action `VTMB_PT_actions` is editing, or None.
+
+    The index is into all of `bpy.data.actions` rather than into the filtered view, which
+    is what `template_list` stores, so deleting an action leaves it past the end. It is
+    an RNA property and not a key, so `obj.get` does not see it.
+    """
+    if obj is None:
+        return None
+    acts = bpy.data.actions
+    i = int(getattr(obj, "vtmb_action_index", 0))
+    return acts[i] if 0 <= i < len(acts) else None
+
+
+class VTMB_UL_actions(bpy.types.UIList):
+    """Every action in the blend that could be this model's, and the mode each writes.
+
+    An action the importer stamped for another model is dropped; one with no stamp is
+    kept, because that is what an action authored in the scene looks like and dropping it
+    would hide exactly the ones a user made.
+    """
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "name", text="", emboss=False, icon="ACTION")
+        sub = row.row()
+        sub.alignment = "RIGHT"
+        # Dimmed where the mode is the import's fallback and not a stamp, so the list
+        # never shows a derived value looking like a decision someone made.
+        sub.active = item.get(blender_export.MODE_ATTR) is not None
+        sub.label(text=_mode_label(item))
+
+    def filter_items(self, context, data, propname):
+        acts = getattr(data, propname)
+        obj = context.object
+        src = (obj.get("vtmb_source") or "") if obj is not None else ""
+        bit = self.bitflag_filter_item
+        flt = [bit] * len(acts)
+        for i, a in enumerate(acts):
+            own = a.get("vtmb_source")
+            if src and own is not None and own != src:
+                flt[i] = 0
+        helper = bpy.types.UI_UL_list
+        if self.filter_name:
+            named = helper.filter_items_by_name(self.filter_name, bit, acts, "name")
+            flt = [f & n for f, n in zip(flt, named)]
+        order = []
+        if self.use_filter_sort_alpha:
+            order = helper.sort_items_by_name(acts, "name")
+        return flt, order
+
+
+class VTMB_PT_actions(bpy.types.Panel):
+    bl_label = "VTMB animations"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        obj = context.object
+        lay = self.layout
+        lay.use_property_split = False
+        lay.template_list("VTMB_UL_actions", "", bpy.data, "actions",
+                          obj, "vtmb_action_index", rows=6)
+        act = listed_action(obj)
+        if act is None:
+            lay.label(text="the blend holds no action", icon="INFO")
+            return
+        draw_action_fields(lay, act)
+        ad = obj.animation_data
+        if ad is None or ad.action is not act:
+            lay.label(text="not the assigned action -- an export with target Active "
+                           "writes %s" % (ad.action.name if ad and ad.action
+                                          else "nothing"), icon="INFO")
+
+
 class VTMB_PT_action(bpy.types.Panel):
     bl_label = "VTMB"
     bl_space_type = "DOPESHEET_EDITOR"
@@ -297,24 +425,102 @@ class VTMB_PT_action(bpy.types.Panel):
         act = panel_action(context)
         lay = self.layout
         lay.use_property_split = False
+        lay.label(text=act.name, icon="ACTION")
+        draw_action_fields(lay, act)
 
-        col = lay.column(align=True)
-        col.label(text=act.name, icon="ACTION")
-        col.prop(act, "vtmb_root_motion_choice", text="")
-        if act.get(blender_export.MODE_ATTR) is None:
-            col.label(text="    -> " + _fallback_line(act))
 
-        col = lay.column(align=True)
-        col.prop(act, "vtmb_loops")
-        col.prop(act, "vtmb_activity_text")
+FLAGS_ATTR = "vtmb_bone_flags"
 
-        nmv = act.get("vtmb_movements")
-        if nmv is not None:
+# Not Valve's BONE_ALWAYS_PROCEDURAL, which is 0x4; here 0x1 equals proctype != 0
+# exactly. ref/2531/studio-verified.h:814-842.
+BONE_ALWAYS_PROCEDURAL = 0x1
+USED_BY_MASK = 0xFFFC
+
+
+def _bone_flags(pb):
+    f = pb.get(FLAGS_ATTR) if pb is not None else None
+    return None if f is None else int(f)
+
+
+def _from_root_get(pb):
+    f = _bone_flags(pb)
+    return bool(f is not None and f & mdl_mod.BONE_ROTATION_FROM_ROOT)
+
+
+def _from_root_set(pb, value):
+    f = _bone_flags(pb)
+    if f is None:
+        return
+    bit = mdl_mod.BONE_ROTATION_FROM_ROOT
+    pb[FLAGS_ATTR] = (f | bit) if value else (f & ~bit)
+
+
+def _root_bones(arm_obj):
+    """Every parentless bone. The export fits movement blocks from bone 0's path and
+    nothing checks that bone 0 is the only root, so a second one is worth naming."""
+    return [b.name for b in arm_obj.data.bones if b.parent is None]
+
+
+class VTMB_PT_bone_flags(bpy.types.Panel):
+    bl_label = "VTMB bone"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "bone"
+
+    @classmethod
+    def poll(cls, context):
+        pb = _spring_bone(context)
+        return pb is not None and (pb.get(FLAGS_ATTR) is not None
+                                   or pb.get("vtmb_bone_name") is not None)
+
+    def draw(self, context):
+        pb = _spring_bone(context)
+        obj = context.object
+        lay = self.layout
+        lay.use_property_split = False
+
+        name = pb.get("vtmb_bone_name")
+        if name and name != pb.name:
+            _bone_pair(lay, "named in the file", str(name))
+
+        roots = _root_bones(obj)
+        if pb.name in roots:
             col = lay.column(align=True)
-            col.label(text="came from an animation with %d movement block%s"
-                           % (nmv, "" if nmv == 1 else "s"), icon="INFO")
-            col.label(text="keys %s the travel"
-                           % ("carry" if act.get("vtmb_root_motion") else "do not carry"))
+            col.label(text="no parent -- root motion is fitted from this bone's path",
+                      icon="ORIENTATION_GIMBAL")
+            if len(roots) > 1:
+                col.label(text="%d bones have no parent, and only the first is read: %s"
+                               % (len(roots), ", ".join(roots[:3])), icon="ERROR")
+
+        f = _bone_flags(pb)
+        col = lay.column(align=True)
+        if f is None:
+            col.label(text="no flags stashed -- an export keeps the file's own",
+                      icon="INFO")
+            return
+        col.prop(pb, '["%s"]' % FLAGS_ATTR, text="flags")
+        col.prop(pb, "vtmb_from_root")
+        if not f & USED_BY_MASK:
+            col.label(text="no bit of the 0xfffc used-by mask: this bone gets no matrix "
+                           "and anything skinned to it draws nothing", icon="ERROR")
+        if f & BONE_ALWAYS_PROCEDURAL:
+            col.label(text="always procedural, so the file carries a proctype record "
+                           "this addon neither reads nor writes", icon="INFO")
+
+        g = pb.get("vtmb_hitgroup")
+        col = lay.column(align=True)
+        if g is None:
+            col.label(text="hit group by name, from the bone's own name", icon="INFO")
+        else:
+            col.prop(pb, '["vtmb_hitgroup"]', text="Hit group")
+            col.label(text="stashed on the pose bone; only a scratch export reads it, "
+                           "and it reads the armature's bone", icon="ERROR")
+
+
+def _bone_pair(lay, key, value):
+    row = lay.row()
+    row.label(text=key)
+    row.label(text=value)
 
 
 SPRING_FIELDS = (
@@ -364,7 +570,7 @@ class VTMB_PT_bone(bpy.types.Panel):
 
 def _spring_bone(context):
     """The pose bone behind the Bone tab's active bone, or None."""
-    obj, bone = context.object, context.bone
+    obj, bone = context.object, getattr(context, "bone", None)
     if obj is None or bone is None or obj.type != "ARMATURE":
         return None
     return obj.pose.bones.get(bone.name)
@@ -383,7 +589,9 @@ def _fallback_line(act):
 
 
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
-           VTMB_PT_armature, VTMB_PT_action, VTMB_PT_bone]
+           VTMB_UL_actions,
+           VTMB_PT_armature, VTMB_PT_actions, VTMB_PT_action,
+           VTMB_PT_bone_flags, VTMB_PT_bone]
 
 _PROPS = (
     ("vtmb_cdtexture_text", CDTEXTURE, "Material dirs",
@@ -405,11 +613,24 @@ def register_props():
             name=name, description=desc,
             get=(lambda k: lambda self: _text(self, k))(key),
             set=(lambda k: lambda self, v: _store(self, k, v))(key)))
+    bpy.types.Object.vtmb_action_index = bpy.props.IntProperty(
+        name="Action", default=0, min=0,
+        description="Which of the blend's actions the VTMB animations list is on. It "
+                    "indexes bpy.data.actions and not the filtered view, which is what "
+                    "template_list stores")
     bpy.types.Action.vtmb_root_motion_choice = bpy.props.EnumProperty(
         name="Root motion", items=MODE_ITEMS, get=_mode_get, set=_mode_set,
         description="What a re-export does with this action's travel. Not set leaves it "
                     "to the export dialog, which reads the animation this action came "
                     "from -- a block in the file means the engine carries it")
+    bpy.types.PoseBone.vtmb_from_root = bpy.props.BoolProperty(
+        name="Rotation from root", get=_from_root_get, set=_from_root_set,
+        description="Bit 0x2 of the bone flags. The engine composes this bone's world "
+                    "rotation from the root's rather than from its parent's, so its "
+                    "translation still follows the chain while its orientation does "
+                    "not. 525 bones over 4268 shipped models carry it and every one is "
+                    "named <bip> Spine1 -- but 251 of 776 Spine1s do not, so this is "
+                    "the flag and never the name. Off where no flags are stashed")
     bpy.types.Action.vtmb_loops = bpy.props.BoolProperty(
         name="Loops", get=_loops_get, set=_loops_set,
         description="Bit 0 of the sequence flags, which is what the engine reads to play "
@@ -426,6 +647,10 @@ def unregister_props():
     for attr, _key, _name, _desc in _PROPS:
         if hasattr(bpy.types.Object, attr):
             delattr(bpy.types.Object, attr)
+    if hasattr(bpy.types.Object, "vtmb_action_index"):
+        del bpy.types.Object.vtmb_action_index
     for attr in ("vtmb_root_motion_choice", "vtmb_loops", "vtmb_activity_text"):
         if hasattr(bpy.types.Action, attr):
             delattr(bpy.types.Action, attr)
+    if hasattr(bpy.types.PoseBone, "vtmb_from_root"):
+        del bpy.types.PoseBone.vtmb_from_root
