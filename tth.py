@@ -26,12 +26,14 @@ VTF_MAGIC = b"VTF\0"
 
 DXT1, DXT3, DXT5 = 13, 14, 15
 BLOCK_BYTES = {DXT1: 8, DXT3: 16, DXT5: 16}
-PIXEL_BYTES = {0: 4, 1: 4, 2: 3, 3: 3, 4: 2, 5: 1, 6: 2, 8: 1, 11: 4, 12: 4, 16: 2}
+PIXEL_BYTES = {0: 4, 1: 4, 2: 3, 3: 3, 4: 2, 5: 1, 6: 2, 8: 1, 11: 4, 12: 4, 16: 4,
+               22: 2, 23: 4}
 FOURCC = {DXT1: b"DXT1", DXT3: b"DXT3", DXT5: b"DXT5"}
 
 FORMAT_NAMES = {0: "RGBA8888", 1: "ABGR8888", 2: "RGB888", 3: "BGR888", 4: "RGB565",
                 5: "I8", 6: "IA88", 8: "A8", 11: "ARGB8888", 12: "BGRA8888",
-                13: "DXT1", 14: "DXT3", 15: "DXT5", 16: "UV88"}
+                13: "DXT1", 14: "DXT3", 15: "DXT5", 16: "BGRX8888",
+                22: "UV88", 23: "UVWQ8888"}
 
 
 def inflate(ttz):
@@ -210,10 +212,16 @@ def decode(w, h, fmt, data):
             out[p:p + 4] = bytes((s[2], s[1], s[0], s[3]))
         elif fmt == 0:
             out[p:p + 4] = s
-        elif fmt == 3:
+        elif fmt in (3, 16):
+            # 16 is BGRX8888, imageloader.h:45 -- its fourth byte is undefined padding.
             out[p:p + 4] = bytes((s[2], s[1], s[0], 255))
         elif fmt == 2:
             out[p:p + 4] = bytes((s[0], s[1], s[2], 255))
+        elif fmt == 23:
+            # vtex writes U and V as (char)(source - 127), a literal 127 into W and a
+            # copied alpha into Q, so only the first two invert, and modularly: source
+            # 255 stores as -128.  W is 127 on all 1460224 pixels of the 11 shipped files.
+            out[p:p + 4] = bytes(((s[0] + 127) & 0xFF, (s[1] + 127) & 0xFF, s[2], s[3]))
         else:
             raise ValueError("cannot decode format %d" % fmt)
     return out
@@ -373,16 +381,7 @@ HEADER = struct.Struct("<4sHBBI")
 ENTRY = struct.Struct("<II")
 
 ENVMAP = 0x4000
-# 23 is UVWQ8888, 11 files under gamedata/materials. Kept out of PIXEL_BYTES so that
-# level_bytes still raises for it and top_mip cannot hand back undecodable bytes.
-EXTRA_PIXEL_BYTES = {23: 4}
 DEFAULT_INLINED = 3
-
-
-def encode_level_bytes(w, h, fmt):
-    if fmt in EXTRA_PIXEL_BYTES:
-        return w * h * EXTRA_PIXEL_BYTES[fmt]
-    return level_bytes(w, h, fmt)
 
 
 def mip_chain(width, height, fmt, mipcount, frames, faces):
@@ -390,7 +389,7 @@ def mip_chain(width, height, fmt, mipcount, frames, faces):
     out = []
     for k in range(mipcount - 1, -1, -1):
         w, h = max(1, width >> k), max(1, height >> k)
-        out.append((k, w, h, encode_level_bytes(w, h, fmt) * frames * faces))
+        out.append((k, w, h, level_bytes(w, h, fmt) * frames * faces))
     return out
 
 

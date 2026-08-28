@@ -248,20 +248,15 @@ def missing_paths(content, includes=(), cdtextures=(), material_names=()):
     return {"includes": gone, "materials": bad}
 
 
-def _vmt_basetexture(path, blob=None):
+def _vmt(path, blob, *keys):
+    """`paths.vmt_value` over a .vmt that may still be on disk rather than in a pack."""
     if blob is None:
         try:
             with open(path, "rb") as f:
                 blob = f.read()
         except OSError:
             return None
-    # Odd-indexed pieces of a split on '"' are the quoted tokens, so the value is the
-    # token after the key -- not text[key:].split('"')[1], which is the gap between.
-    tokens = blob.decode("latin1").split('"')[1::2]
-    for i, tok in enumerate(tokens[:-1]):
-        if tok.strip().lower() == "$basetexture":
-            return tokens[i + 1].strip()
-    return None
+    return paths_mod.vmt_value(blob, *keys)
 
 
 def _load_file(path):
@@ -339,7 +334,9 @@ def _find_image(content, search_paths, name):
     for stem in paths_mod.material_stems(name, search_paths):
         vmt, blob = content.find(stem + ".vmt")
         if vmt:
-            base = _vmt_basetexture(vmt, blob)
+            # $dudvmap is what a Refract names instead: five shipped models carry a
+            # material whose .vmt has no $basetexture and no texture of its own name.
+            base = _vmt(vmt, blob, "$basetexture", "$dudvmap")
             if base:
                 img = _image(content, paths_mod.MATERIALS_DIR + "/"
                              + base.replace("\\", "/").strip("/"))
@@ -904,6 +901,13 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
         else:
             why = "searched %d root(s) and %d packed files" % (len(roots), packed)
         note = "%d material(s), none textured: %s" % (len(mats), why)
+        warning = "%s; %s" % (warning, note) if warning else note
+    elif mats and lit < len(mats):
+        # A model that is mostly textured has no all-white tell, so the one material the
+        # reader could not resolve leaves nothing behind to notice.
+        dark = sorted(mm.name for mm in mats if not mm.get("vtmb_texture"))
+        note = ("%d of %d material(s) untextured: %s"
+                % (len(dark), len(mats), ", ".join(dark[:3])))
         warning = "%s; %s" % (warning, note) if warning else note
 
     return {

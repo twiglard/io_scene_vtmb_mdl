@@ -6,6 +6,9 @@ the roots list is the caller's to state; only the candidates can be discovered.
 """
 
 import os
+import re
+
+_VMT_TOKEN = re.compile(r'"([^"]*)"|(\S+)')
 
 MODELS_DIR = "models"
 MATERIALS_DIR = "materials"
@@ -132,3 +135,33 @@ def material_stems(name, search_paths=()):
            for p in (search_paths or [])]
     out.append(MATERIALS_DIR + "/" + name)
     return out
+
+
+def vmt_value(blob, *keys):
+    """The value a .vmt assigns to the first of `keys` it carries, or None.
+
+    A // outside a quoted string ends the line. Four shipped files comment one
+    "$basetexture" out above the live one, so scanning the quoted tokens alone returns the
+    dead value -- gio_spirit.mdl draws gio_spirit.tth where its .vmt says giospiritbody.
+    The key is not always quoted: every $dudvmap in the corpus is bare, and that same scan
+    sees the values and none of the names.
+    """
+    toks = []
+    for line in blob.decode("latin1").splitlines():
+        q = False
+        for i, ch in enumerate(line):
+            if ch == '"':
+                q = not q
+            elif ch == "/" and not q and line[i:i + 2] == "//":
+                line = line[:i]
+                break
+        for m in _VMT_TOKEN.finditer(line):
+            t = m.group(1) if m.group(1) is not None else m.group(2)
+            if t not in ("{", "}"):
+                toks.append(t)
+    for key in keys:
+        k = key.lower()
+        for i in range(len(toks) - 1):
+            if toks[i].strip().lower() == k:
+                return toks[i + 1].strip()
+    return None
