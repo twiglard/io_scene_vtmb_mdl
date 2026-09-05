@@ -533,8 +533,9 @@ class VTMB_PT_bone_flags(bpy.types.Panel):
             col.label(text="hit group by name, from the bone's own name", icon="INFO")
         else:
             col.prop(pb, '["vtmb_hitgroup"]', text="Hit group")
-            col.label(text="stashed on the pose bone; only a scratch export reads it, "
-                           "and it reads the armature's bone", icon="ERROR")
+            col.label(text="stashed on the pose bone, where a scratch export reads it. "
+                           "Nothing else does -- a re-export carries the file's own",
+                      icon="INFO")
 
 
 def _bone_pair(lay, key, value):

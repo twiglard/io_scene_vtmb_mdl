@@ -368,7 +368,7 @@ def _hitgroup_of(name):
     generic. Not derivable from a file, so this is the corpus convention over 14333
     shipped boxes -- pelvis 0 on 372 of 372, bare Spine 3 on 512 of 514, Spine1 2 on 501
     of 508, neck and head 1, the limbs 4/5 and 6/7 on 98.9%. A `vtmb_hitgroup` on the
-    Blender bone wins over it."""
+    pose bone wins over it."""
     n = " %s " % name.lower().replace("_", " ")
     if "pelvis" in n:
         return 0
@@ -384,6 +384,19 @@ def _hitgroup_of(name):
     if "clavicle" in n:
         return 2
     return 0
+
+
+def _hitgroup_prop(arm_obj, bname):
+    """The explicit hit group stamped on a bone, or None to let the name decide.
+
+    `Bone` and `PoseBone` are separate ID-property containers, so which one is read
+    decides whether a stamp reaches the file at all. Every other `vtmb_*` bone key lives
+    on the pose bone -- the flags, the scales, the rotation limit, the rest matrix and the
+    seven spring fields -- and that is where `blender_templates.apply_skeleton` writes
+    this one too.
+    """
+    pb = arm_obj.pose.bones.get(bname)
+    return None if pb is None else pb.get("vtmb_hitgroup")
 
 
 def fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale=1.0, floor=0.05,
@@ -417,8 +430,7 @@ def fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale=1.0, floor=0.05,
     boxes = []
     for bi in sorted(lo):
         bname = d.bones[bi].name or ""
-        db = arm_obj.data.bones.get(bname)
-        g = db.get("vtmb_hitgroup") if db else None
+        g = _hitgroup_prop(arm_obj, bname)
         boxes.append((bi, int(_hitgroup_of(bname) if g is None else g),
                       tuple(lo[bi]), tuple(hi[bi])))
     if boxes:

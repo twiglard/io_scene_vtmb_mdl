@@ -1365,7 +1365,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     "model can be shot. Off writes no hitbox set at all and the engine "
                     "falls back to the movement hull, which is one box for the whole "
                     "body. The hit group each box reports is a guess off the bone name "
-                    "unless the bone carries a vtmb_hitgroup")
+                    "unless the pose bone carries a vtmb_hitgroup")
     checksum: bpy.props.IntProperty(
         name="Checksum", default=0x5A534E31, subtype="UNSIGNED",
         description="Scripting only. Written into both files; any value is legal as long "
