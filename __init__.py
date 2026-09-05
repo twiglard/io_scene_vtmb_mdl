@@ -611,6 +611,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "none of them feeding Base Color, is named in the report and skipped. "
                     "Neither half of an existing pair is overwritten. Nothing looks for "
                     "the image at all unless a .vmt is there too")
+    write_2bone_vtx: bpy.props.BoolProperty(
+        name="Also rewrite .dx7_2bone.vtx", default=False,
+        description="Rewrite the second strip file beside the model as well as the "
+                    ".dx80.vtx. The engine asks for it only under -dxlevel 70, and "
+                    "leaving it alone leaves it describing the old geometry, which is "
+                    "what the report warns about. It caps bones at two per triangle "
+                    "where the .dx80.vtx allows nine, so it is revised from its own copy "
+                    "and not derived from the other one. Nothing happens when no "
+                    ".dx7_2bone.vtx sits beside the source")
     write_flexes: bpy.props.BoolProperty(
         name="Shape keys as flexes", default=False,
         description="Rewrite each model's flexes from its shape keys -- the way to get a "
@@ -773,6 +782,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     box.label(text="saved as %s" % os.path.basename(self.filepath),
                               icon="INFO")
                 box.prop(self, "write_flexes")
+                box.prop(self, "write_2bone_vtx")
                 box.prop(self, "fit_hull")
                 row = box.split(factor=SPLIT)
                 row.label(text="name in the file")
@@ -960,6 +970,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 root_motion=self.root_motion,
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
                 write_flexes=self.write_flexes,
+                vtx_flavours=(("dx80", "dx7_2bone") if self.write_2bone_vtx
+                              else ("dx80",)),
                 # Derived only for a dialog, where the field is on screen with the
                 # derived value in it and the user can see and change it. A scripted call
                 # runs `execute` straight and gets `""`, which keeps the donor's name --
@@ -1026,9 +1038,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "vertex survives"
                         % (mesh["renumbered"],
                            "" if mesh["renumbered"] == 1 else "es"))
+        for x in r.get("vtx_more") or ():
+            self.report({"INFO"}, "%s rewritten too, %d bytes over %d strip groups"
+                        % (os.path.basename(x["path"]), x["bytes"], x["groups"]))
         for name in r["stale"]:
             self.report({"WARNING"}, "%s beside the model still describes the old "
-                                     "geometry; only .dx80.vtx is written" % name)
+                                     "geometry and was not rewritten" % name)
         phy = r.get("phy")
         if phy is not None:
             if phy["missing"]:
@@ -1119,12 +1134,28 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            "was" if len(surplus) == 1 else "were",
                            ", ".join(surplus[:4]),
                            "" if len(surplus) <= 4 else " and %d more" % (len(surplus) - 4)))
-        if r["scene"]["bones"] and r["scene"]["stale"]:
-            self.report({"WARNING"}, "%d bone%s moved; the %d animation%s you did not export "
-                                     "still key the old skeleton and may not follow it. "
-                                     "Export them together to re-encode."
+        n = r["scene"].get("rebased") or 0
+        if n:
+            self.report({"INFO"}, "%d bone%s turned, so %d animation%s you did not export "
+                                  "%s re-encoded onto the new bind"
                         % (r["scene"]["bones"], "" if r["scene"]["bones"] == 1 else "s",
-                           r["scene"]["stale"], "" if r["scene"]["stale"] == 1 else "s"))
+                           n, "" if n == 1 else "s", "was" if n == 1 else "were"))
+        wide = r["scene"].get("requantised") or []
+        if wide:
+            # One scale set serves every animation in the file, and fit_scales never
+            # narrows, so widening it for the new bind requantises the bone everywhere.
+            self.report({"WARNING"}, "%s needed a wider rotation scale, which requantises "
+                                     "%s in every animation in the file"
+                        % (", ".join(wide[:4])
+                           + ("" if len(wide) <= 4 else " and %d more" % (len(wide) - 4)),
+                           "it" if len(wide) == 1 else "them"))
+        root = r["scene"].get("root_turned") or []
+        if root:
+            # A movement block is an offset on the entity transform, above the skeleton, so
+            # nothing here can derive a rotation for it.
+            self.report({"WARNING"}, "%s has no parent and its bind turned, so the skeleton "
+                                     "now faces across the travel direction the movement "
+                                     "blocks still state" % ", ".join(root))
         gone = r["dropped"]
         if gone["anim"]:
             # apply_sequences matches the stash to the file by position and refuses one

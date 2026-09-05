@@ -11,6 +11,7 @@ which is what lets vertex and face counts move. Structure and evidence in
 plans/vtx-format.md; the reader is vtx.py.
 """
 
+import itertools
 import struct
 
 VTX_VERSION = 107
@@ -28,7 +29,11 @@ MATREPL_STRIDE = 8
 # 0x2c0138fc and 0x2c01390f.  Not 4, and not Valve's aligned 8.
 MATREPL_ENTRY_STRIDE = 6
 
+SG_IS_FLEXED = 0x01
 SG_IS_HW_SKINNED = 0x02
+# Troika's, absent from the 2003 tree. The shipped files set it only on cloth carriers and
+# every cloth particle lands in one; what else it takes is unread.
+SG_IS_CLOTH = 0x04
 SG_VERTS_ARE_BONED = 0x08
 SG_VERTS_ARE_PLAIN = 0x10
 
@@ -37,18 +42,37 @@ STRIP_IS_TRISTRIP = 0x02
 
 SHORT_MAX = 0x7fff
 
-# The leading, identity-map entry of each bone-count block of the table at
-# StudioRender.dll+0x6ce30. The corpus uses almost nothing else.
-BONE_MAP_IDENTITY = {0: 0, 1: 1, 2: 5, 3: 17, 4: 41}
-# The blocks those entries lead: 0, then 1-4, 5-16, 17-40, 41-64 for one to four bones.
-BONE_MAP_BLOCKS = ((0, 0), (4, 1), (16, 2), (40, 3), (64, 4))
+
+def _bone_map_table():
+    """g_boneMapPermutationTable, StudioRender.dll+0x6ce30, as (live count, slot order).
+
+    The arrangements P(4, k) for k = 0..4 in lexicographic order, each completed by its
+    unused slots ascending -- byte-identical to the module's own 1300 bytes.
+    """
+    rows = []
+    for k in range(5):
+        for pick in itertools.permutations(range(4), k):
+            rows.append((k, pick + tuple(x for x in range(4) if x not in pick)))
+    return rows
+
+
+BONE_MAP_TABLE = _bone_map_table()
+BONE_MAP_ROW = {row: i for i, row in enumerate(BONE_MAP_TABLE)}
+BONE_MAP_IDENTITY = {k: BONE_MAP_ROW[k, (0, 1, 2, 3)] for k in range(5)}
+
+
+def bone_map_index(count, order=(0, 1, 2, 3)):
+    """The entry binding `count` bones with hardware slot i taking .mdl weight order[i]."""
+    try:
+        return BONE_MAP_ROW[count, tuple(order)]
+    except KeyError:
+        raise ValueError("no table entry binds %d bones as %s" % (count, tuple(order)))
 
 
 def bone_map_numbones(index):
     """How many bones the table entry at `index` binds. Raises outside the 65 entries."""
-    for last, n in BONE_MAP_BLOCKS:
-        if index <= last:
-            return n
+    if 0 <= index < len(BONE_MAP_TABLE):
+        return BONE_MAP_TABLE[index][0]
     raise ValueError("boneMapIndex %d is past the 65-entry table" % index)
 
 
@@ -467,6 +491,68 @@ def pack_vert1(orig_id, bone_slots, max_per_vert=3):
     slots = (slots + [-1] * 4)[:4]
     return struct.pack("<5h", BONE_MAP_IDENTITY[len(live)], *slots) \
         + struct.pack("<h", orig_id)
+
+
+MIN_BONE_INFLUENCE = 1.0
+
+
+def reduce_bone_influence(bones, weights, max_bones):
+    """Drop the lightest bone until few enough remain, giving up on a whole influence.
+
+    studiomdl does this only for a hardware unflexed pass of a file that is not the
+    fixed-function flavour, so the two-bone files keep every bone the .mdl gave them.
+    """
+    keep = list(range(len(bones)))
+    while len(keep) > max_bones:
+        j = min(range(len(keep)), key=lambda i: weights[keep[i]])
+        if weights[keep[j]] >= MIN_BONE_INFLUENCE:
+            break
+        del keep[j]
+    return [bones[i] for i in keep]
+
+
+def assign_groups(triangles, flexed, vert_bones, vert_weights, max_tri, max_vert,
+                  fixed_function=False, force_no_flex=False):
+    """Which strip group each triangle belongs to, as studiomdl decides it.
+
+    Four passes per mesh -- hardware then software, flexed then not -- each seeing only
+    the triangles no earlier pass took, and an empty one dropped. A flexed pass caps at
+    one bone per triangle and per vertex; an unflexed one takes `max_tri`/`max_vert` from
+    the .vtx header. A hardware pass also wants the three corners within those caps.
+
+    `flexed` is the mesh-local vertices some morph target names, `force_no_flex` the
+    per-LOD facial-animation setting, which a donor states by having no flexed group.
+    Returns [(is_hw, is_flexed, [triangle, ...]), ...] in that order, and raises if a
+    triangle survives all four, which the software passes make impossible.
+    """
+    left = list(triangles)
+    out = []
+    for hw in (True, False):
+        for fx in (True, False):
+            cap_tri, cap_vert = (1, 1) if fx else (max_tri, max_vert)
+            take, rest = [], []
+            for tri in left:
+                if (not force_no_flex and any(v in flexed for v in tri)) != fx:
+                    rest.append(tri)
+                    continue
+                if hw:
+                    per = []
+                    for v in tri:
+                        b = vert_bones[v]
+                        if not fixed_function and not fx and len(b) > cap_vert:
+                            b = reduce_bone_influence(b, vert_weights[v], cap_vert)
+                        per.append(b)
+                    if (len(set(x for b in per for x in b)) > cap_tri
+                            or max(len(b) for b in per) > cap_vert):
+                        rest.append(tri)
+                        continue
+                take.append(tri)
+            left = rest
+            if take:
+                out.append((hw, fx, take))
+    if left:
+        raise ValueError("%d triangles fell out of every strip group pass" % len(left))
+    return out
 
 
 def partition(triangles, vert_bones=None, max_bones=16):

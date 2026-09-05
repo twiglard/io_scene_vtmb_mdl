@@ -811,19 +811,26 @@ def chain(m, content, seen=None):
 
 
 def pick_animations(m, content, anim_filter, max_anims, with_chained):
-    """(source, animation) pairs, the file's own first, then the include chain."""
+    """(source, animation) pairs, the file's own first, then the include chain.
+
+    Third return is every model the walk opened, m's own path first -- the same set
+    `chain` keeps to stop a cycle, kept rather than discarded so the scene records which
+    files an action may have come from. A quota that stops the walk early leaves it short
+    of the full closure, but never short of a file an imported action names.
+    """
     want = anim_filter.lower()
     out = [(m, a) for a in m.anims if want in a.name.lower()]
-    missing = []
+    missing, opened = [], [m.path]
     if with_chained and not (max_anims and len(out) >= max_anims):
         for rel, sub in chain(m, content):
             if sub is None:
                 missing.append(rel)
                 continue
+            opened.append(sub.path)
             out += [(sub, a) for a in sub.anims if want in a.name.lower()]
             if max_anims and len(out) >= max_anims:
                 break
-    return (out[:max_anims] if max_anims else out), missing
+    return (out[:max_anims] if max_anims else out), missing, opened
 
 
 def import_mdl(context, path, anim_filter="", max_anims=0,
@@ -851,11 +858,16 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     objs, warning = ([], None) if not with_mesh else \
         build_meshes(context, m, arm_obj, name, scale, content, with_flexes)
 
-    wanted, missing = [], []
+    wanted, missing, opened = [], [], [m.path]
     if with_anims:
-        wanted, missing = pick_animations(m, content, anim_filter, max_anims,
-                                          with_chained)
+        wanted, missing, opened = pick_animations(m, content, anim_filter, max_anims,
+                                                  with_chained)
         build_actions(m, arm_obj, wanted, scale, root_motion)
+    # Every .mdl the import read, so the animations panel can tell an action this import
+    # made from one another model left in the blend. `vtmb_includes` cannot: it is this
+    # file's direct includes, and the chain is transitive -- toreador_female_armor_0
+    # reaches move_and_ranged.mdl through pcidles_allsequences.mdl and names neither.
+    arm_obj["vtmb_chain"] = opened
     # Over what was imported, not over m.anims: a chained import's actions come mostly from
     # included files, and the export dialogs seed Root motion from this count.
     arm_obj["vtmb_movement_anims"] = sum(1 for _, a in wanted if a.movements)

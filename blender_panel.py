@@ -19,6 +19,7 @@ from . import mdl as mdl_mod
 from . import paths as paths_mod
 
 INCLUDES = "vtmb_includes"
+CHAIN = "vtmb_chain"
 CDTEXTURE = "vtmb_cdtexture"
 
 
@@ -343,12 +344,31 @@ def listed_action(obj):
     return acts[i] if 0 <= i < len(acts) else None
 
 
+def chain_paths(obj):
+    """The set of `.mdl` an import read into this armature, ready to compare against an
+    action's `vtmb_source`.
+
+    Compared as normalised strings and not with `os.path.samefile`: a model served out of
+    a `.vpk` has no file to stat, so `samefile` raises there and would cost a syscall per
+    action per redraw where it does not. Both sides of the compare are written by one
+    import from one loader, so the strings are identical by construction.
+    """
+    got = obj.get(CHAIN) if obj is not None else None
+    if not got:
+        return None
+    return {os.path.normcase(os.path.normpath(p)) for p in got if p}
+
+
 class VTMB_UL_actions(bpy.types.UIList):
     """Every action in the blend that could be this model's, and the mode each writes.
 
-    An action the importer stamped for another model is dropped; one with no stamp is
+    An action stamped for a model this import never read is dropped; one with no stamp is
     kept, because that is what an action authored in the scene looks like and dropping it
-    would hide exactly the ones a user made.
+    would hide exactly the ones a user made. The comparison is against every file the
+    import opened -- `vtmb_chain` -- and not against the armature's own `vtmb_source`,
+    because on a default import almost every action comes from an include and matches the
+    armature's source nowhere. An armature carrying no `vtmb_chain` filters nothing: that
+    is a blend written before the key existed, and an unfiltered list loses none of it.
     """
 
     def draw_item(self, context, layout, data, item, icon, active_data,
@@ -364,14 +384,14 @@ class VTMB_UL_actions(bpy.types.UIList):
 
     def filter_items(self, context, data, propname):
         acts = getattr(data, propname)
-        obj = context.object
-        src = (obj.get("vtmb_source") or "") if obj is not None else ""
+        mine = chain_paths(context.object)
         bit = self.bitflag_filter_item
         flt = [bit] * len(acts)
-        for i, a in enumerate(acts):
-            own = a.get("vtmb_source")
-            if src and own is not None and own != src:
-                flt[i] = 0
+        if mine:
+            for i, a in enumerate(acts):
+                own = a.get("vtmb_source")
+                if own and os.path.normcase(os.path.normpath(own)) not in mine:
+                    flt[i] = 0
         helper = bpy.types.UI_UL_list
         if self.filter_name:
             named = helper.filter_items_by_name(self.filter_name, bit, acts, "name")
@@ -569,8 +589,16 @@ class VTMB_PT_bone(bpy.types.Panel):
 
 
 def _spring_bone(context):
-    """The pose bone behind the Bone tab's active bone, or None."""
-    obj, bone = context.object, getattr(context, "bone", None)
+    """The pose bone behind the Bone tab's active bone, or None.
+
+    Edit mode leaves `context.bone` None and puts the active bone in `context.edit_bone`,
+    which is why Blender's own bone panels poll `context.bone or context.edit_bone`
+    (`bl_ui/properties_data_bone.py:19`). A bone added in Edit mode has no pose bone until
+    the mode is left, so that case still returns None and the panel stays away from a bone
+    with nothing stashed.
+    """
+    obj = getattr(context, "object", None)
+    bone = getattr(context, "bone", None) or getattr(context, "edit_bone", None)
     if obj is None or bone is None or obj.type != "ARMATURE":
         return None
     return obj.pose.bones.get(bone.name)

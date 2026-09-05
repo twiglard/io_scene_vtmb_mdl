@@ -561,6 +561,31 @@ def model_vertex_counts(d):
     return out
 
 
+STUDIOHDR_FLAGS_CLOTH = 0x0400
+
+
+def _stamp_cloth_flag(d):
+    """`studiohdr_t.flags` bit 0x400 is what gets the model a StudioRender instance handle.
+
+    `engine.dll 0x200a7d35` tests it on the header and only then calls `IStudioRender`
+    vtable slot 38 to allocate a handle, storing it at `ModelInstance_t +0x0a`.  Without
+    one the handle stays 0xffff, and the mesh-draw dispatcher `StudioRender.dll
+    0x2c01aaf0` compares exactly that at `0x2c01ab39` and takes the Plain half of
+    `g_SoftwareProcessFunc` whatever the `.vtx` cloth bit says -- so the cloth object is
+    built and stepped and nothing on screen moves.  Over the 4445-model corpus the bit and
+    a cloth object are the same set with no exceptions: 60 of 60 models that bind a mesh to
+    cloth carry it, and 4385 of 4385 that do not, leave it clear.
+
+    Derived rather than authored, so a writer cannot forget it.  Cleared as well as set:
+    dropping the last cloth region has to clear the bit or the engine hands out a handle
+    for a model with nothing to put in it.
+    """
+    fl = struct.unpack_from("<i", d.hdr, 228)[0]
+    has = any(mr.extra.get("cloth") for r in d.bodyparts for mr in r.kids)
+    fl = (fl | STUDIOHDR_FLAGS_CLOTH) if has else (fl & ~STUDIOHDR_FLAGS_CLOTH)
+    struct.pack_into("<i", d.hdr, 228, fl)
+
+
 def emit(d, checksum=None, drop=False):
     """Bytes for the description.  Every count comes from a len() and every offset from
     where its target landed, so a description with a record added emits a valid file.
@@ -595,6 +620,7 @@ def emit(d, checksum=None, drop=False):
                          "" if len(counts) == 1 else
                          " (%s)" % ", ".join("%s %d" % (n, c) for _, n, c in counts)))
     d.refit_count = stamp_sequence_boxes(d, force=bool(d.refit_boxes))
+    _stamp_cloth_flag(d)
     quantise(d)
     o = Out()
     nb = len(d.bones)
@@ -1111,7 +1137,14 @@ def set_bone_poses(d, poses):
     already encoded against, surfaceprop, and the procedural helper.  `poseToBone` is
     restamped for every bone, not only the named ones, because a moved parent changes its
     children's world matrices too.
+
+    Returns `rebase_carried`'s report.  A rotation channel is `int16 * rotscale` with no
+    bind base, so an animation nobody re-exported would otherwise keep pointing where the
+    old bind put it while the rest pose moved out from under it; re-basing is unconditional
+    and there is no option for it, because one file answering the same edit two ways -- the
+    re-exported animations following it and the carried ones not -- is the defect.
     """
+    old = _skeleton(d)
     for k, (pos, quat, flags) in poses.items():
         raw = d.bones[k].raw
         struct.pack_into("<3f", raw, 0x20, *pos)
@@ -1119,6 +1152,59 @@ def set_bone_poses(d, poses):
         if flags is not None:
             struct.pack_into("<i", raw, 0x88, flags)
     _stamp_posetobone(d)
+    return rebase_carried(d, old)
+
+
+def rebase_carried(d, old):
+    """Re-encode every carried animation against the bind `set_bone_poses` just wrote.
+
+    `old` is the skeleton as it was, which is the only thing that can still say what the
+    blocks were encoded against -- the records themselves have already been overwritten.
+
+    Only a bone whose bind actually moved is re-based.  A record written for a flags-only
+    edit carries Blender's own `matrix_local` rather than the file's, which is ~1.3e-4
+    away, and re-basing on that would requantise the file for storage noise.
+
+    An edited animation is left alone: it holds `extra["poses"]` in float and has not been
+    quantised yet, so `quantise` will encode it against the new bind anyway.
+    """
+    new = _skeleton(d)
+    moved = [k for k in range(len(d.bones))
+             if list(old.bones[k].pos) != list(new.bones[k].pos)
+             or list(old.bones[k].quat) != list(new.bones[k].quat)]
+    turned = [k for k in moved if list(old.bones[k].quat) != list(new.bones[k].quat)]
+    report = {"moved": moved, "turned": turned, "anims": 0, "widened": [],
+              "root_turned": []}
+    if not moved:
+        return report
+    # A movement block is an offset on the entity transform, above the whole skeleton, so
+    # no bind edit invalidates one.  Turning a parentless bone's bind does rotate every
+    # frame under a travel direction the block still states unrotated, and that is a
+    # consequence to name rather than a value to derive.
+    if any(r.extra.get("movements") for r in d.anims):
+        report["root_turned"] = [k for k in turned
+                                 if struct.unpack_from("<i", d.bones[k].raw, 0x04)[0] < 0]
+    carried = [r for r in d.anims if r.extra.get("block")]
+    if not carried:
+        return report
+    tracks = [W.read_tracks(_Block(r.extra["block"], new.bones), _AnimHdr(r))
+              for r in carried]
+    chans = [W.rebased_channels(t, old, new, moved) for t in tracks]
+    scales, widened = W.fit_rebase_scales(new, chans)
+    for k, br in enumerate(d.bones):
+        struct.pack_into("<3f", br.raw, 0x3c, *scales[k][:3])
+        struct.pack_into("<4f", br.raw, 0x48, *scales[k][3:])
+        new.bones[k].posscale = scales[k][:3]
+        new.bones[k].rotscale = scales[k][3:]
+    for r, t, ch in zip(carried, tracks, chans):
+        if not ch:
+            continue
+        W.apply_rebase(t, new, ch, scales)
+        r.extra["block"] = W._anim_block(new, t)
+        r.extra["block_bones"] = len(d.bones)
+        report["anims"] += 1
+    report["widened"] = sorted(d.bones[k].name for k in widened)
+    return report
 
 
 def _renumber_verts(mr, i):
@@ -1802,6 +1888,7 @@ class _Block(object):
     extract = M.Mdl.extract
     channel = M.Mdl.channel
     anim_channels = M.Mdl.anim_channels
+    local_pose = M.Mdl.local_pose
 
     def __init__(self, data, bones):
         self.d = data
@@ -1961,21 +2048,44 @@ def _bone_vertex_boxes(d):
              [(hi[b][c] - lo[b][c]) * 0.5 for c in range(3)]) for b in sorted(lo)]
 
 
-def _anim_boxes(d, carried):
-    """{animation index: (min, max)} over every frame, for the animations still holding
-    their poses. Root motion is not applied: `movements` carries the model away from the
-    origin and the engine offsets the whole entity, so a sequence box that already included
-    that offset would be counted twice."""
+def _pose_frames(r, m):
+    """Parent-local poses per frame: the ones this pass authored, else the donor's own
+    block decoded back.  It decodes through a `_Block` and not through the `Mdl` the export
+    opened, because that one is wrapped by `_EditedBones` and would hand back the file's
+    original bone list.  One `_Block` per animation -- the cache keys on `base`, 0 for every
+    block."""
+    poses = r.extra.get("poses")
+    if poses:
+        for f in poses:
+            yield [f[b.index] if f[b.index] is not None else (b.pos, b.quat)
+                   for b in m.bones]
+        return
+    blk = r.extra.get("block") or b""
+    if not blk:
+        return
+    hdr = _AnimHdr(r)
+    sh = _Block(blk, m.bones)
+    for k in range(max(1, hdr.numframes)):
+        yield sh.local_pose(hdr, k)
+
+
+def _anim_boxes(d, carried, want=None):
+    """{animation index: (min, max)} over every frame of every animation, authored this
+    pass or decoded out of the donor.  `want` limits it to the animations some sequence is
+    about to be stamped from, so an export with nothing to stamp decodes nothing.
+
+    Root motion is not applied: `movements` carries the model away from the origin and the
+    engine offsets the whole entity, so a sequence box that already included that offset
+    would be counted twice.  `_AnimHdr` carries no movements, so a decoded animation gets
+    that for free.  studiomdl does the same -- `extractLinearMotion` runs long before the
+    sweep at `utils/studiomdl/simplify.cpp:5278`."""
     m = _skeleton(d)
     out = {}
     for i, r in enumerate(d.anims):
-        poses = r.extra.get("poses")
-        if not poses:
+        if want is not None and i not in want:
             continue
         lo, hi = [float("inf")] * 3, [float("-inf")] * 3
-        for f in poses:
-            local = [f[b.index] if f[b.index] is not None else (b.pos, b.quat)
-                     for b in m.bones]
+        for local in _pose_frames(r, m):
             world = M.Mdl.world_matrices(m, local)
             for b, ctr, half in carried:
                 t = world[b]
@@ -2009,33 +2119,54 @@ def stamp_sequence_boxes(d, force=False):
     animations of the skinned vertex sweep over every frame
     (`utils/studiomdl/simplify.cpp:5276` and `:5349`).
 
-    Only a sequence whose box is still zero and whose every cited animation still holds its
-    poses: one read out of a file keeps the box that file shipped, and one whose animation
-    is already encoded cannot be swept. Returns how many were stamped.
+    A zero or inverted box is replaced by the sweep.  `force` takes the valid ones too, for
+    a donor whose geometry moved, but there it UNIONS rather than replaces: a shipped box
+    is not reproducible from a shipped file -- `simplify.cpp:5314` sweeps source meshes
+    with uncompressed poses, and only compiled LOD meshes and RLE blocks ship -- so it runs
+    tens of units wide of this sweep, and replacing one would shrink the render bounds and
+    the collision radius against geometry nothing here can see.  A zero box is replaced and
+    not unioned, since unioning with an empty box at the origin would reach back to it.
 
-    `force` takes the non-zero ones too, which is what a donor whose geometry moved needs
-    -- its boxes still describe where the vertices used to be. It still cannot reach a
-    sequence whose animations were not re-encoded this pass, since there are no poses to
-    sweep, so the count coming back is what a caller has to report against `len(d.seqs)`.
+    Returns how many sequences the bytes actually moved for.
     """
-    if not d.seqs or not any(r.extra.get("poses") for r in d.anims):
+    if not d.seqs:
         return 0
-    boxes = _anim_boxes(d, _bone_vertex_boxes(d))
+    # Decided before anything is decoded, so an export with nothing to stamp pays for no
+    # sweep at all.
+    pending = {}
+    for k, r in enumerate(d.seqs):
+        box = struct.unpack_from("<6f", r.raw, 0x1c)
+        valid = any(box) and all(box[c] <= box[c + 3] for c in range(3))
+        if valid and not force:
+            continue
+        pending[k] = valid
+    if not pending:
+        return 0
+    want = set()
+    for k in pending:
+        want.update(_seq_anims(d.seqs[k].raw))
+    boxes = _anim_boxes(d, _bone_vertex_boxes(d), want)
     if not boxes:
         return 0
     n, first = 0, False
-    for k, r in enumerate(d.seqs):
-        box = struct.unpack_from("<6f", r.raw, 0x1c)
-        if not force and any(box) and all(box[c] <= box[c + 3] for c in range(3)):
-            continue
+    for k, valid in sorted(pending.items()):
+        r = d.seqs[k]
         want = _seq_anims(r.raw)
         cited = [boxes[i] for i in want if i in boxes]
         if len(cited) != len(want):
             continue
-        struct.pack_into("<3f", r.raw, 0x1c,
-                         *[min(b[0][c] for b in cited) for c in range(3)])
-        struct.pack_into("<3f", r.raw, 0x28,
-                         *[max(b[1][c] for b in cited) for c in range(3)])
+        lo = [min(b[0][c] for b in cited) for c in range(3)]
+        hi = [max(b[1][c] for b in cited) for c in range(3)]
+        if valid:
+            was = struct.unpack_from("<6f", r.raw, 0x1c)
+            lo = [min(lo[c], was[c]) for c in range(3)]
+            hi = [max(hi[c], was[c + 3]) for c in range(3)]
+        # bbmax at +0x28 follows bbmin, so the pair is one compare -- on the bytes, which
+        # keeps a difference below float32 out of the count.
+        new = struct.pack("<6f", *(lo + hi))
+        if new == bytes(r.raw[0x1c:0x34]):
+            continue
+        r.raw[0x1c:0x34] = new
         n += 1
         first = first or k == 0
     if first:

@@ -7,9 +7,10 @@ the bone state changes that name them, where `vtx_write` alone only relays out w
 parsed. That makes it the corpus comparison; it is not what an exporter calls.
 
 `revise` is, and does the opposite: it keeps every strip group the edit did not touch, byte
-for byte as the compiler emitted it, and re-emits only the cells named. LOD 0 only, and a
-named mesh must be a single strip group, because which group a new triangle belongs to is
-studiomdl's decision and is recorded nowhere.
+for byte as the compiler emitted it, and re-emits only the cells named. LOD 0 only. A named
+mesh split over several strip groups is dealt out again by `vtx_write.assign_groups`, which
+is studiomdl's own rule; a mesh whose groups would change in number or kind, and any mesh
+carrying a cloth group, is refused instead.
 
 `seed` and `scratch` write a .vtx for a model that never had one.
 """
@@ -31,8 +32,8 @@ else:
 def vertex_bones(mesh, orig_ids, verts):
     """Group-local vertex -> its .mdl bones, in the .mdl's own order.
 
-    Order is load-bearing: the table at StudioRender.dll+0x6ce30 pairs hardware slot i
-    with weight i, so sorting or deduplicating here silently rebinds the weights.
+    The table at StudioRender.dll+0x6ce30 pairs hardware slot i with weight i, so sorting
+    or deduplicating here binds a bone to another bone's weight.
     """
     out = {}
     for v, orig in enumerate(orig_ids):
@@ -113,7 +114,50 @@ def _same_faces(a, b):
     return sorted(_canon(t) for t in a) == sorted(_canon(t) for t in b)
 
 
-def revise(mdl, vtx_path, faces):
+def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, i, j, k):
+    """New triangles dealt out over a split mesh's existing strip groups.
+
+    studiomdl's rule is in `vtx_write.assign_groups`; `plans/vtx-partition-check.py`
+    holds it to the shipped corpus. The donor's own groups say which passes the mesh has,
+    and a re-partition that would add or drop one is refused rather than guessed at: the
+    group array would have to change length, which no writer path does.
+    """
+    if any(g.flags & W.SG_IS_CLOTH for g in mesh.groups):
+        raise ValueError(
+            "bodypart %d model %d mesh %d has a strip group flagged %#04x, which the "
+            "shipped files set only on cloth, and what puts a triangle in it is unread"
+            % (i, j, k, W.SG_IS_CLOTH))
+    flexed = set()
+    for f in src_mesh.flexes:
+        for va in f.verts:
+            flexed.add(va.index)
+    vb, vw = {}, {}
+    for t in new:
+        for x in t:
+            if x in vb:
+                continue
+            vert = verts[src_mesh.vertexoffset + x]
+            vb[x] = list(vert.bones[:min(4, vert.numbones)])
+            vw[x] = list(vert.weights)
+    # forceNoFlex is a per-LOD .qc setting the donor states by having no flexed group.
+    force_no_flex = not any(g.flags & W.SG_IS_FLEXED
+                            for e in lod.meshes for g in e.groups)
+    passes = W.assign_groups(new, flexed, vb, vw, v.maxbones_tri, v.maxbones_vert,
+                             fixed_function, force_no_flex)
+    want = [(bool(g.flags & W.SG_IS_HW_SKINNED), bool(g.flags & W.SG_IS_FLEXED))
+            for g in mesh.groups]
+    got = [(hw, fx) for hw, fx, _t in passes]
+    if want != got:
+        raise ValueError(
+            "bodypart %d model %d mesh %d is split over %d strip groups and the new "
+            "triangles need %d: the donor has %s and the edit wants %s"
+            % (i, j, k, len(want), len(got),
+               " ".join("hw%d/flex%d" % (a, b) for a, b in want),
+               " ".join("hw%d/flex%d" % (a, b) for a, b in got)))
+    return [t for _hw, _fx, t in passes]
+
+
+def revise(mdl, vtx_path, faces, fixed_function=None):
     """One .vtx re-emitted with new triangles for the cells named and the rest untouched.
 
     `mdl` is the model as it will be written, since a changed mesh's bone bindings come out
@@ -124,16 +168,17 @@ def revise(mdl, vtx_path, faces):
     Only LOD 0 is revised; the lower LODs keep their own triangles, which stay valid
     because an addition never moves an original vertex id.
 
-    A mesh split over several strip groups can only be re-emitted if its faces did not
-    actually move: the groups partition it by whether a vertex is reached by a morph target
-    and whether the strip fits the hardware bone palette, and which side a *new* triangle
-    falls is studiomdl's decision and is recorded nowhere.
+    A mesh split over several strip groups is partitioned again by
+    `vtx_write.assign_groups`, studiomdl's own four-pass rule, unless the donor's groups
+    would have to change in number or kind, or one of them is flagged as cloth.
 
     The .mdl's checksum is written through unchanged: the pair only has to agree with each
     other, and both files are written together.
     """
     reader = R.Vtx(vtx_path)
     v = W.VtxFile(vtx_path)
+    if fixed_function is None:
+        fixed_function = os.path.basename(vtx_path).endswith(".dx7_2bone.vtx")
     st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0)
     ri = 0
     for i, bp in enumerate(v.bodyparts):
@@ -154,6 +199,7 @@ def revise(mdl, vtx_path, faces):
                         donor.append((sg, ids,
                                       [tuple(t) for t in reader.triangles(sg)]
                                       if grp.numverts else []))
+                    split = None
                     if new is not None and len(mesh.groups) != 1:
                         # The comparison is in mesh-local indices, which is what the caller
                         # speaks; `rebuild_group` wants the group-local ones kept above.
@@ -162,11 +208,8 @@ def revise(mdl, vtx_path, faces):
                         if _same_faces(flat, new):
                             new = None
                         else:
-                            raise ValueError(
-                                "bodypart %d model %d mesh %d is split over %d strip "
-                                "groups, and which of them a new triangle belongs to is "
-                                "studiomdl's decision and is recorded nowhere"
-                                % (i, j, k, len(mesh.groups)))
+                            split = _repartition(mesh, src_mesh, new, verts, v,
+                                                 lod, fixed_function, i, j, k)
                     for n, grp in enumerate(mesh.groups):
                         ri += 1
                         if new is None:
@@ -175,9 +218,10 @@ def revise(mdl, vtx_path, faces):
                             orig, tris = donor[n][1], donor[n][2]
                         else:
                             st["revised"] += 1
-                            orig = sorted(set(x for t in new for x in t))
+                            mine = new if split is None else split[n]
+                            orig = sorted(set(x for t in mine for x in t))
                             local = dict((o, m) for m, o in enumerate(orig))
-                            tris = [tuple(local[x] for x in t) for t in new]
+                            tris = [tuple(local[x] for x in t) for t in mine]
                         vb = (vertex_bones(src_mesh, orig, verts)
                               if grp.flags & W.SG_VERTS_ARE_BONED else None)
                         W.rebuild_group(grp, orig, tris, vb,
@@ -201,7 +245,7 @@ def seed(mdl, checksum, boned=True):
     import struct as _s
     parts = []
     for bp in mdl.bodyparts:
-        parts.append([[len(m.meshes)] for m in bp.models])
+        parts.append([[getattr(e, "cloth", False) for e in m.meshes] for m in bp.models])
 
     out = bytearray()
     flags = W.SG_VERTS_ARE_BONED if boned else W.SG_VERTS_ARE_PLAIN
@@ -216,7 +260,8 @@ def seed(mdl, checksum, boned=True):
         _s.pack_into("<2i", out, bpo + i * W.BODYPART_STRIDE,
                      len(models), mo - (bpo + i * W.BODYPART_STRIDE))
         out += b"\0" * (len(models) * W.MODEL_STRIDE)
-        for j, (nmesh,) in enumerate(models):
+        for j, meshcloth in enumerate(models):
+            nmesh = len(meshcloth)
             lo = len(out)
             _s.pack_into("<2i", out, mo + j * W.MODEL_STRIDE, 1,
                          lo - (mo + j * W.MODEL_STRIDE))
@@ -228,7 +273,17 @@ def seed(mdl, checksum, boned=True):
                 go = len(out)
                 _s.pack_into("<hhi", out, eo + k * W.MESH_STRIDE, 1, 0,
                              go - (eo + k * W.MESH_STRIDE))
-                out += _s.pack("<3hBB3i", 0, 0, 0, flags, 0,
+                # A cloth mesh is drawn by the ProcessMesh*_Cloth_* half of
+                # g_SoftwareProcessFunc, and StudioRender picks that half only when bit
+                # 0x04 has reached the runtime mesh's +0x0c: 0x2c01ab31 tests the byte and
+                # 0x2c01ab40 adds 24 to the table index.  Without it the mesh draws from
+                # the skinned vertices and the simulated particles never reach the screen.
+                # It also cannot be hardware-skinned -- no shipped group carries 0x02 and
+                # 0x04 together, over 38 707 groups.
+                f = flags
+                if meshcloth[k]:
+                    f = (f | W.SG_IS_CLOTH) & ~W.SG_IS_HW_SKINNED
+                out += _s.pack("<3hBB3i", 0, 0, 0, f, 0,
                                W.GROUP_STRIDE, W.GROUP_STRIDE, W.GROUP_STRIDE)
     # materialReplacementListOffset is indexed unconditionally, so 0 is not "absent": the
     # engine reads the version field as numReplacements and walks off the file.

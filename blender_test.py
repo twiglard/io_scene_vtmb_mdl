@@ -116,7 +116,7 @@ def check_chained(mod, arm, m, content, meshes=()):
     across files, and a skinned mesh names its bones the same way, so a chained import that
     reordered or dropped a bone leaves a vertex group pointing at nothing.
     """
-    pairs, missing = mod.blender_import.pick_animations(m, content, "", 0, True)
+    pairs, missing, _ = mod.blender_import.pick_animations(m, content, "", 0, True)
     chained = [(src, a) for src, a in pairs if src is not m]
     print("  chain: %d animations over %d files, %d unresolved"
           % (len(chained), len({s.path for s, _ in chained}), len(missing)))

@@ -263,7 +263,7 @@ class Seq:
 
 class Mesh:
     __slots__ = ("index", "material", "numvertices", "vertexoffset", "materialtype",
-                 "materialparam", "flexes")
+                 "materialparam", "flexes", "cloth")
 
 
 class Flex:
@@ -457,6 +457,10 @@ class Mdl:
             e.material, _, e.numvertices, e.vertexoffset = \
                 struct.unpack_from("<4i", d, eo)
             e.materialtype, e.materialparam = struct.unpack_from("<2i", d, eo + 24)
+            # +0x30/+0x34/+0x38 bind this mesh's vertices to a cloth object -- owner column,
+            # particle index, cloth normal index.  All three are 0 on a mesh without cloth,
+            # and the .vtx strip group of one that has them must carry SG_IS_CLOTH.
+            e.cloth = all(struct.unpack_from("<3i", d, eo + 0x30))
             e.flexes = self._read_flexes(eo)
             m.meshes.append(e)
         return m

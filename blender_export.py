@@ -1129,22 +1129,26 @@ def verify_writer(src):
     return bad
 
 
+# The two flavour strings Mod_LoadVtxFile_vtmb builds a path from, .dx80 first. The
+# engine asks for .dx7_2bone only under -dxlevel 70.
+VTX_FLAVOURS = ("dx80", "dx7_2bone")
+
+
 def vtx_path(path, flavour="dx80"):
-    """The .vtx beside a .mdl. Only .dx80 is written, which is the flavour
-    `Mod_LoadVtxFile_vtmb` asks for first."""
+    """The .vtx beside a .mdl."""
     stem = path[:-4] if path.lower().endswith(".mdl") else path
     return "%s.%s.vtx" % (stem, flavour)
 
 
-def stale_flavours(dest):
+def stale_flavours(dest, written=("dx80",)):
     """Other .vtx flavours beside the file just written, which now disagree with it.
 
-    Only `.dx80.vtx` is emitted, so a `.dx7_2bone.vtx` next to a model whose geometry moved
-    still describes the old one. The engine tests only the flavour it loaded and takes
-    `.dx80.vtx` first, so this is a warning and not a refusal.
+    A flavour nobody rewrote still describes the old geometry. The engine tests only the
+    flavour it loaded and takes `.dx80.vtx` first, so this is a warning, not an error.
     """
     return [os.path.basename(p) for p in
-            (vtx_path(dest, "dx7_2bone"), vtx_path(dest, "dx90"), vtx_path(dest, "sw"))
+            (vtx_path(dest, f)
+             for f in ("dx7_2bone", "dx90", "sw") if f not in written)
             if os.path.exists(p)]
 
 
@@ -1202,30 +1206,44 @@ def phy_report(source, dest, removed, renamed, geometry_moved):
             "removed": gone, "renamed": moved, "geometry": geometry_moved}
 
 
-def revise_vtx(source, dest, data, revised):
-    """Rewrite the .vtx for a model whose geometry moved, and return what it cost.
+def revise_vtx(source, dest, data, revised, flavours=("dx80",)):
+    """Rewrite the .vtx for a model whose geometry moved, and return what each cost.
 
     The donor's own file supplies every strip group the edit did not touch, so a change to
-    one mesh leaves the others byte for byte as the compiler emitted them.
+    one mesh leaves the others byte for byte as the compiler emitted them. Each flavour is
+    revised from its own donor: the two files cap bones per triangle at 9 and at 2, so
+    they do not share a strip-group partition and neither can be derived from the other.
+
+    A flavour asked for but absent beside the source is skipped, except `.dx80.vtx`, which
+    the engine takes first and without which it draws nothing.
     """
-    src = vtx_path(source)
-    if not os.path.exists(src):
-        raise ValueError("%s has no .dx80.vtx beside it, and a changed vertex or face "
-                         "count needs one rewritten -- the engine draws nothing when the "
-                         "pair disagrees" % os.path.basename(source))
-    blob, st = vtxr_mod.revise(mdl_mod.Mdl("<written>", data=data), src, revised)
-    out = vtx_path(dest)
-    with open(out, "wb") as f:
-        f.write(blob)
-    st["path"] = out
-    st["bytes"] = len(blob)
-    return st
+    written = mdl_mod.Mdl("<written>", data=data)
+    out = []
+    for flavour in flavours:
+        src = vtx_path(source, flavour)
+        if not os.path.exists(src):
+            if flavour == "dx80":
+                raise ValueError(
+                    "%s has no .dx80.vtx beside it, and a changed vertex or face count "
+                    "needs one rewritten -- the engine draws nothing when the pair "
+                    "disagrees" % os.path.basename(source))
+            continue
+        blob, st = vtxr_mod.revise(written, src, revised)
+        path = vtx_path(dest, flavour)
+        with open(path, "wb") as f:
+            f.write(blob)
+        st["path"] = path
+        st["bytes"] = len(blob)
+        st["flavour"] = flavour
+        out.append(st)
+    return out
 
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
-                   model_name="", hull=None, cdtexture=None, write_flexes=False):
+                   model_name="", hull=None, cdtexture=None, write_flexes=False,
+                   vtx_flavours=("dx80",)):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -1384,14 +1402,22 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     d = build_mod.apply_anims(d, edits, source)
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0, "stale": 0,
+             "rebased": 0, "requantised": [], "root_turned": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj)}
     poses = read_bones(m, arm_obj, scale)
     if poses:
-        build_mod.set_bone_poses(d, poses)
+        # Translation decodes additively over the record's own `pos`, so a bind that only
+        # moved carries every animation with it for nothing. A bind that TURNED does not:
+        # a rotation channel is `int16 * rotscale` with no bind base at all, so an
+        # animation nobody re-exported would keep pointing where the old bind put it.
+        # Those are re-encoded here and not left for a later export -- one file answering
+        # the same edit two ways, the re-exported animations following the bone and the
+        # carried ones not, is the defect and an option would be a second way to produce it.
+        rebase = build_mod.set_bone_poses(d, poses)
         scene["bones"] = len(poses)
-        # A rotation channel is `int16 * rotscale` with no bind base, so an animation left
-        # un-re-encoded keeps a pose the moved bind disagrees with -- 1.0e-01 against 5.4e-04.
-        scene["stale"] = len(d.anims) - len(edits)
+        scene["rebased"] = rebase["anims"]
+        scene["requantised"] = rebase["widened"]
+        scene["root_turned"] = [d.bones[k].name for k in rebase["root_turned"]]
     for ref, name in sorted(read_materials(m, source).items()):
         if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
             d.textures[ref].name = name
@@ -1480,8 +1506,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
     # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
     # was named, so an empty face map is the whole of what either needs.
-    vtx = (revise_vtx(source, dest, data, revised)
-           if (revised or removed or added_bones) else None)
+    touched = (revise_vtx(source, dest, data, revised, vtx_flavours)
+               if (revised or removed or added_bones) else [])
+    vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
@@ -1489,12 +1516,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),
             "anims": len(m.anims), "sequences": len(d.seqs),
             "vtx": vtx, "removed": removed, "added_bones": added_bones,
+            "vtx_more": [x for x in touched if x["flavour"] != "dx80"],
             "renamed": renamed,
             "model_name": model_name, "hull": hull, "cdtexture": cdtex,
             "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],
-            "stale": stale_flavours(dest) if (revised or removed or added_bones) else [],
+            "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
+                      if (revised or removed or added_bones) else []),
             "phy": phy_report(source, dest, removed, renamed, bool(revised))}
 
 
