@@ -32,9 +32,14 @@ UV_TOL = 1e-6
 # disagree by up to 9.2e-03; under this a normal is taken as unedited.
 NORMAL_EPS = 1.5e-2
 NORMAL_ATTR = "vtmb_normal"
-# Against the import stash an untouched bone compares exactly; this only absorbs a
-# recomposition of the same float32s.
-REST_EPS = 1e-6
+# Against the import stash an untouched bone compares exactly -- until an edit happens.
+# Leaving Edit Mode recomposes every bone from head/tail/roll, and that reaches bones the
+# edit never named: over andrei (171 bones) and toreador_male_armor_3 (73), moving a bone
+# 3 units and turning one 0.35 rad, the worst deviation on an unreached bone is 1.368e-05
+# and the smallest on a reached one is 3.403e-01. It does not track how far the bone sits
+# from its parent -- the worst lands at |pos| 1.0 to 9.2 where bones reach 44 -- so an
+# absolute bound is the right form. This is 7.3x over the noise and 3400x under the signal.
+REST_EPS = 1e-4
 # Without a stash the file's record is the baseline, and Blender loses 3.2e-05 of a bone's
 # offset to chain composition and 1.4e-03 per quaternion entry to head/tail/roll storage.
 REST_POS_EPS = 1e-3
@@ -291,6 +296,12 @@ def read_bones(m, arm_obj, scale):
                         for i in range(4) for j in range(4))
         if not moved and (flags is None or flags == b.flags):
             continue
+        if not moved:
+            # A flags-only record. Blender's own pos and quat are the file's to within the
+            # bound above, and writing them anyway hands `rebase_carried` a bone that reads
+            # as moved under its exact `!=`, which re-quantises every animation in the file
+            # for storage noise.
+            pos, quat = b.pos, b.quat
         out[k] = (pos, quat, flags)
     return out
 
