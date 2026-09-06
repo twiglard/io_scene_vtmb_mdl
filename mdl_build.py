@@ -2203,6 +2203,32 @@ def add_sequence(d, label, anim, activity=None, flags=0):
     return len(d.seqs) - 1
 
 
+def encode_events(events, where=""):
+    """[{cycle, event, type, options}] -> the 76-byte mstudioevent_t records.
+
+    Re-encoding the whole record is byte-safe and measured, not assumed: the four fields
+    cover all 76 bytes, and of the 1872 event records in the 4445-model corpus 0 carry a
+    byte after options' terminating NUL and 0 fill all 64 without one, so the zero
+    padding reproduces every shipped record.
+
+    Options past 63 bytes is refused rather than trimmed. The field has to hold a NUL for
+    the engine to stop reading -- CBaseAnimating::HandleAnimEvent takes ids 2070 and 2071
+    through LookupPhysicsChain and the rest through atoi -- and a silent trim is the kind
+    of narrowing roadmap 4c rates worse than a refusal.
+    """
+    out = []
+    for e in events or []:
+        opt = str(e.get("options") or "").encode("latin1", "replace")
+        if len(opt) > M.EVENT_OPTIONS_LEN - 1:
+            raise Refused("%sevent %d options is %d bytes and the field holds %d plus a "
+                          "terminator" % (where, int(e.get("event") or 0), len(opt),
+                                          M.EVENT_OPTIONS_LEN - 1))
+        out.append(struct.pack("<fii", float(e.get("cycle") or 0.0),
+                               int(e.get("event") or 0), int(e.get("type") or 0))
+                   + opt.ljust(M.EVENT_OPTIONS_LEN, bytes([0])))
+    return out
+
+
 def remove_animation(d, i):
     """Drop animation `i` and every sequence left with nothing to play.
 

@@ -228,8 +228,37 @@ def sequence_stash(m):
     return [{"label": s.label, "activity": s.activity,
              "groupsize": list(s.groupsize),
              "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
-                         for i in col] for col in s.blends]}
+                         for i in col] for col in s.blends],
+             "events": [{"cycle": e.cycle, "event": e.event, "type": e.type,
+                         "options": e.options} for e in s.events]}
             for s in m.seqs]
+
+
+def _event_markers(m, made):
+    """One pose marker per mstudioevent_t, on the action of its sequence's first blend.
+
+    A marker is the only per-frame datum an Action already carries and it survives the
+    NLA, so it is what makes an event visible on the timeline. It is not the record --
+    a marker holds a name and a frame and nothing else, and Blender's own retiming
+    renumbers it -- so `vtmb_sequences` stays the truth and the export reads that.
+    """
+    by_index = {}
+    for act in made:
+        if act.get("vtmb_source") == m.path:
+            by_index.setdefault(act.get("vtmb_anim_index"), act)
+    stamped = 0
+    for s in m.seqs:
+        if not s.events or not s.blends or not s.blends[0]:
+            continue
+        act = by_index.get(s.blends[0][0])
+        if act is None:
+            continue
+        span = max(1, int(act.get("vtmb_numframes") or 1) - 1)
+        for e in s.events:
+            mk = act.pose_markers.new("event %d" % e.event)
+            mk.frame = int(round(e.cycle * span))
+            stamped += 1
+    return stamped
 
 
 def missing_paths(content, includes=(), cdtextures=(), material_names=()):
@@ -862,7 +891,8 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     if with_anims:
         wanted, missing, opened = pick_animations(m, content, anim_filter, max_anims,
                                                   with_chained)
-        build_actions(m, arm_obj, wanted, scale, root_motion)
+        made = build_actions(m, arm_obj, wanted, scale, root_motion)
+        _event_markers(m, made)
     # Every .mdl the import read, so the animations panel can tell an action this import
     # made from one another model left in the blend. `vtmb_includes` cannot: it is this
     # file's direct includes, and the chain is transitive -- toreador_female_armor_0

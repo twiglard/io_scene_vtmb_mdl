@@ -56,6 +56,13 @@ SEQDESC_STRIDE = 764
 SEQ_BBMIN = 0x1c
 SEQ_ANIM = 0x38
 SEQ_GROUPSIZE = 0x23C
+SEQ_NUMEVENTS = 0x14
+SEQ_EVENTINDEX = 0x18
+
+# mstudioevent_t: float cycle, int event, int type, char options[64].
+EVENT_STRIDE = 76
+EVENT_OPTIONS = 0x0c
+EVENT_OPTIONS_LEN = 64
 
 MOVEMENT_STRIDE = 44
 
@@ -258,7 +265,17 @@ class Movement:
 
 class Seq:
     __slots__ = ("index", "label", "activity", "flags", "groupsize", "blends",
-                 "bbmin", "bbmax")
+                 "bbmin", "bbmax", "events")
+
+
+class Event:
+    """One mstudioevent_t. `cycle` is 0..1 along the sequence, not a frame.
+
+    `options` is a 64-byte char array read to its first NUL. Over the 4445-model corpus
+    no record carries a byte after that NUL and none fills all 64 without one, so the
+    string is the whole field and re-encoding it loses nothing.
+    """
+    __slots__ = ("cycle", "event", "type", "options")
 
 
 class Mesh:
@@ -405,7 +422,28 @@ class Mdl:
         s.groupsize = (gx, gy)
         s.blends = [[struct.unpack_from("<h", d, off + SEQ_ANIM + x * 0x20 + y * 2)[0]
                      for y in range(gy)] for x in range(gx)]
+        s.events = self._read_events(off)
         return s
+
+    def _read_events(self, off):
+        """The sequence's mstudioevent_t array, empty on the 12862 sequences with none.
+
+        eventindex is relative to the seqdesc, like every other pointer in the record.
+        """
+        d = self.d
+        n, ei = struct.unpack_from("<2i", d, off + SEQ_NUMEVENTS)
+        out = []
+        for j in range(max(0, n)):
+            o = off + ei + j * EVENT_STRIDE
+            if o + EVENT_STRIDE > len(d):
+                break
+            e = Event()
+            e.cycle, e.event, e.type = struct.unpack_from("<fii", d, o)
+            opt = d[o + EVENT_OPTIONS:o + EVENT_OPTIONS + EVENT_OPTIONS_LEN]
+            z = opt.find(bytes([0]))
+            e.options = opt[:z if z >= 0 else len(opt)].decode("latin1")
+            out.append(e)
+        return out
 
     def _read_materials(self):
         d = self.d

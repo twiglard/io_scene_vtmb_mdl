@@ -449,6 +449,173 @@ class VTMB_PT_action(bpy.types.Panel):
         draw_action_fields(lay, act)
 
 
+# Only the ids whose handler carries its own name: HandleAnimEvent's third arm, 4005,
+# reaches entity+0x6f0, and the other 33 the corpus ships have no located handler at all.
+EVENT_HANDLERS = {
+    2070: "TurnOffPhysicsChain",
+    2071: "TurnOnPhysicsChain",
+}
+
+
+def _event_seq(arm_obj, act):
+    """(stash index, the sequence dict) whose first blend names this action, else (None, None).
+
+    Chained actions belong to another file and no sequence here names them, which is why
+    the match is on the action's own name rather than on `vtmb_anim_index`.
+    """
+    stash = arm_obj.get("vtmb_sequences") if arm_obj is not None else None
+    for k, seq in enumerate(stash or ()):
+        blends = seq.get("blends") or []
+        if blends and blends[0] and blends[0][0] == act.name:
+            return k, seq
+    return None, None
+
+
+def _event_armature(context, act):
+    obj = context.object
+    if obj is not None and obj.type == "ARMATURE" and _event_seq(obj, act)[0] is not None:
+        return obj
+    for o in bpy.data.objects:
+        if o.type == "ARMATURE" and _event_seq(o, act)[0] is not None:
+            return o
+    return None
+
+
+def _write_events(arm_obj, index, events):
+    """Replace one sequence's event list in the stash.
+
+    An ID-property list is not mutable in place, so the whole stash is rebuilt -- which is
+    also what keeps the sequence order the export matches by position.
+    """
+    stash = [dict(x) for x in arm_obj.get("vtmb_sequences") or ()]
+    stash[index]["events"] = events
+    arm_obj["vtmb_sequences"] = stash
+
+
+def _sync_markers(act, events):
+    """Redraw the action's event markers from the stash, which is the record.
+
+    Markers Blender's retiming moved are discarded rather than read back: a marker holds
+    a name and a frame and cannot say which record it came from.
+    """
+    for mk in [m for m in act.pose_markers if m.name.startswith("event ")]:
+        act.pose_markers.remove(mk)
+    span = max(1, int(act.get("vtmb_numframes") or 1) - 1)
+    for e in events:
+        mk = act.pose_markers.new("event %d" % int(e.get("event") or 0))
+        mk.frame = int(round(float(e.get("cycle") or 0.0) * span))
+
+
+class VTMB_OT_add_event(bpy.types.Operator):
+    bl_idname = "vtmb.add_event"
+    bl_label = "Add animation event"
+    bl_description = ("Append an mstudioevent_t to the sequence this action drives, at "
+                      "the current frame. The id is the number the game switches on")
+    bl_options = {"REGISTER", "UNDO"}
+
+    event_id: bpy.props.IntProperty(name="Event id", default=2050, min=0)
+    options: bpy.props.StringProperty(
+        name="Options", default="",
+        description="The event's options[64] string. Read by atoi for most ids and as a "
+                    "spring bone chain name for 2070 and 2071. 63 bytes at most")
+
+    def execute(self, context):
+        act = panel_action(context)
+        arm_obj = _event_armature(context, act) if act else None
+        if act is None or arm_obj is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        if len(self.options.encode("latin1", "replace")) > 63:
+            self.report({"ERROR"}, "options is over 63 bytes and the field holds 63 "
+                                   "plus a terminator")
+            return {"CANCELLED"}
+        k, seq = _event_seq(arm_obj, act)
+        span = max(1, int(act.get("vtmb_numframes") or 1) - 1)
+        cycle = min(1.0, max(0.0, context.scene.frame_current / float(span)))
+        events = [dict(x) for x in seq.get("events") or ()]
+        events.append({"cycle": cycle, "event": self.event_id, "type": 0,
+                       "options": self.options})
+        _write_events(arm_obj, k, events)
+        _sync_markers(act, events)
+        self.report({"INFO"}, "event %d at cycle %.4f, %d on this sequence"
+                              % (self.event_id, cycle, len(events)))
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class VTMB_OT_remove_event(bpy.types.Operator):
+    bl_idname = "vtmb.remove_event"
+    bl_label = "Remove animation event"
+    bl_description = "Drop one mstudioevent_t from the sequence this action drives"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: bpy.props.IntProperty(name="Index", default=0, min=0)
+
+    def execute(self, context):
+        act = panel_action(context)
+        arm_obj = _event_armature(context, act) if act else None
+        if act is None or arm_obj is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        k, seq = _event_seq(arm_obj, act)
+        events = [dict(x) for x in seq.get("events") or ()]
+        if not 0 <= self.index < len(events):
+            self.report({"ERROR"}, "no event %d on this sequence" % self.index)
+            return {"CANCELLED"}
+        gone = events.pop(self.index)
+        _write_events(arm_obj, k, events)
+        _sync_markers(act, events)
+        self.report({"INFO"}, "dropped event %d, %d left"
+                              % (int(gone.get("event") or 0), len(events)))
+        return {"FINISHED"}
+
+
+def draw_action_events(lay, context, act):
+    """The sequence's mstudioevent_t array, one row each.
+
+    Drawn from `vtmb_sequences` and never from the markers: a marker carries a name and a
+    frame, so the stash is the only thing that can say what an event's options string was.
+    """
+    arm_obj = _event_armature(context, act)
+    if arm_obj is None:
+        lay.label(text="no imported sequence names this action", icon="INFO")
+        return
+    _k, seq = _event_seq(arm_obj, act)
+    events = list(seq.get("events") or ())
+    span = max(1, int(act.get("vtmb_numframes") or 1) - 1)
+    if not events:
+        lay.label(text="no events", icon="INFO")
+    box = lay.box() if events else None
+    for i, e in enumerate(events):
+        eid = int(e.get("event") or 0)
+        cycle = float(e.get("cycle") or 0.0)
+        row = box.row(align=True)
+        named = EVENT_HANDLERS.get(eid)
+        row.label(text="%d%s" % (eid, "  " + named if named else ""))
+        row.label(text="frame %d" % int(round(cycle * span)))
+        opt = str(e.get("options") or "")
+        row.label(text=opt if opt else "-")
+        row.operator("vtmb.remove_event", text="", icon="X").index = i
+    lay.operator("vtmb.add_event", icon="ADD")
+
+
+class VTMB_PT_action_events(bpy.types.Panel):
+    bl_label = "VTMB events"
+    bl_space_type = "DOPESHEET_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "VTMB"
+
+    @classmethod
+    def poll(cls, context):
+        return panel_action(context) is not None
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_action_events(self.layout, context, panel_action(context))
+
+
 FLAGS_ATTR = "vtmb_bone_flags"
 
 # Not Valve's BONE_ALWAYS_PROCEDURAL, which is 0x4; here 0x1 equals proctype != 0
@@ -618,8 +785,10 @@ def _fallback_line(act):
 
 
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
+           VTMB_OT_add_event, VTMB_OT_remove_event,
            VTMB_UL_actions,
            VTMB_PT_armature, VTMB_PT_actions, VTMB_PT_action,
+           VTMB_PT_action_events,
            VTMB_PT_bone_flags, VTMB_PT_bone]
 
 _PROPS = (

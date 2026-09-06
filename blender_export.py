@@ -1125,7 +1125,23 @@ def apply_sequences(d, arm_obj, anim_names):
                 if struct.unpack_from("<h", rec.raw, at)[0] != a:
                     n += 1
                 struct.pack_into("<h", rec.raw, at, a)
+        n += _apply_events(rec, s.get("events"))
     return n
+
+
+def _apply_events(rec, events):
+    """Rewrite one sequence's mstudioevent_t array from the stash. Returns what moved.
+
+    The encoding lives in `mdl_build` beside the rest of the record layout, so a check
+    can reach it without Blender.
+    """
+    if events is None:
+        return 0
+    out = build_mod.encode_events(events, "sequence %r: " % rec.name)
+    if out == list(rec.extra.get("events") or []):
+        return 0
+    rec.extra["events"] = out
+    return 1
 
 
 def verify_writer(src):
