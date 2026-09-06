@@ -29,6 +29,7 @@ HDR_NUMSKINREF = 308
 HDR_NUMBODYPARTS = 320
 HDR_NUMFLEXDESC = 344
 HDR_NUMHITBOXSETS = 256
+HDR_NUMATTACHMENTS = 328
 HDR_NUMINCLUDEMODELS = 404
 HDR_NUMSPRINGBONES = 396
 HDR_NUMPOSEPARAMS = 384
@@ -38,6 +39,7 @@ HDR_NUMPOSEPARAMS = 384
 INCLUDE_STRIDE = 116
 
 HITBOXSET_STRIDE = 12
+ATTACHMENT_STRIDE = 60
 SPRINGBONE_STRIDE = 28
 BBOX_STRIDE = 32
 
@@ -339,6 +341,10 @@ class Hitbox:
     __slots__ = ("index", "bone", "group", "bbmin", "bbmax")
 
 
+class Attachment:
+    __slots__ = ("index", "name", "type", "bone", "local")
+
+
 class Vertex:
     __slots__ = ("pos", "normal", "uv", "bones", "weights", "numbones")
 
@@ -382,6 +388,7 @@ class Mdl:
         self._read_flexdescs()
         self._read_bodyparts()
         self._read_hitboxsets()
+        self._read_attachments()
         self._read_includes()
         self._read_springbones()
 
@@ -615,6 +622,20 @@ class Mdl:
                 x.bbmax = struct.unpack_from("<3f", d, bo + 20)
                 s.boxes.append(x)
             self.hitboxsets.append(s)
+
+    def _read_attachments(self):
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMATTACHMENTS)
+        self.attachments = []
+        for i in range(n):
+            off = idx + i * ATTACHMENT_STRIDE
+            a = Attachment()
+            a.index = i
+            a.name = self._cstr(off + struct.unpack_from("<i", d, off)[0])
+            a.type, a.bone = struct.unpack_from("<ii", d, off + 4)
+            flat = struct.unpack_from("<12f", d, off + 12)
+            a.local = [list(flat[0:4]), list(flat[4:8]), list(flat[8:12])]
+            self.attachments.append(a)
 
     def _read_includes(self):
         d = self.d

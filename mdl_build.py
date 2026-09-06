@@ -1465,6 +1465,24 @@ def add_hitbox(d, boxes, name="default", at=None):
     return at
 
 
+def add_attachment(d, name, bone, local=None, type=0):
+    """Append one mount point, return its index.
+
+    `local` is the 3x4 rotation-translation the mount sits at in the bone's own space, as
+    three rows of four; None is the identity, which is what 1306 of the 1334 shipped records
+    carry -- the 28 that do not are all view-model weapons.  `type` is 0 on all 1334, so
+    nothing here derives it and the default is the only value the corpus has.
+    """
+    if not 0 <= bone < len(d.bones):
+        raise Refused("attachment %r cites bone %d of %d" % (name, bone, len(d.bones)))
+    raw = bytearray(60)
+    struct.pack_into("<ii", raw, 4, type, bone)
+    rows = local or ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
+    struct.pack_into("<12f", raw, 12, *[f for row in rows for f in row])
+    d.attachments.append(Rec(raw, name))
+    return len(d.attachments) - 1
+
+
 def add_include(d, name):
     """Append one chained model, return its index.  `name` is the path the engine resolves,
     'models/character/pc/male/pcidles_allsequences.mdl'.

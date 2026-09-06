@@ -1,5 +1,6 @@
-"""The armature's two path lists, in Properties > Object Data, and the per-action fields
-in the Action editor's sidebar.
+"""The armature's fields in Properties > Object Data -- the two path lists, the pose
+parameter array and the skin family picker -- and the per-action fields in the Action
+editor's sidebar.
 
 They are the plain custom properties the rest of the addon already reads -- an import
 stamps them, a bone-set template writes `vtmb_includes` -- so this edits those keys rather
@@ -11,6 +12,7 @@ material.
 import os
 
 import bpy
+import mathutils
 
 from . import blender_export
 from . import blender_import
@@ -118,19 +120,255 @@ def _content(context, obj):
     return blender_import.Content(roots) if roots else None
 
 
-def scene_material_names(context, arm_obj):
-    """Every material slot name on the meshes this armature owns, first-seen order."""
+def arm_meshes(context, arm_obj):
+    """The mesh objects this armature owns, parented or bound by an Armature modifier."""
     out = []
     for o in context.scene.objects:
         if o.type != "MESH":
             continue
-        if o.parent is not arm_obj and not any(
-                getattr(mo, "object", None) is arm_obj for mo in o.modifiers):
-            continue
+        if o.parent is arm_obj or any(getattr(mo, "object", None) is arm_obj
+                                      for mo in o.modifiers):
+            out.append(o)
+    return out
+
+
+def scene_material_names(context, arm_obj):
+    """Every material slot name on the meshes this armature owns, first-seen order."""
+    out = []
+    for o in arm_meshes(context, arm_obj):
         for m in o.data.materials:
             if m is not None and m.name not in out:
                 out.append(m.name)
     return out
+
+
+def skin_rows(arm_obj):
+    """The skin table as rows, back out of the flattened `vtmb_skin_table` stamp."""
+    flat = list(arm_obj.get("vtmb_skin_table") or ())
+    nref = int(arm_obj.get("vtmb_skin_refs") or 0)
+    if not flat or nref <= 0:
+        return []
+    return [[int(x) for x in flat[f:f + nref]] for f in range(0, len(flat), nref)]
+
+
+def skin_family_names(arm_obj, family):
+    """The material name each skinref selects under `family`, in skinref order."""
+    rows = skin_rows(arm_obj)
+    mats = list(arm_obj.get("vtmb_skin_materials") or ())
+    if not 0 <= family < len(rows):
+        return []
+    return [str(mats[r]) if 0 <= r < len(mats) else "" for r in rows[family]]
+
+
+class VTMB_OT_set_skin_family(bpy.types.Operator):
+    bl_idname = "vtmb.set_skin_family"
+    bl_label = "Show skin family"
+    bl_description = ("Point every mesh's material slots at one row of the model's skin "
+                      "table. The engine picks the same row from CBaseAnimating.m_nSkin, "
+                      "and 488 entities across 51 of the 108 shipped maps set a non-zero "
+                      "one. The export writes texture names back through whichever row is "
+                      "showing, so this is what the file records, not only what is drawn")
+    bl_options = {"REGISTER", "UNDO"}
+
+    family: bpy.props.IntProperty(name="Skin family", default=0, min=0)
+
+    def execute(self, context):
+        arm_obj = context.object
+        if arm_obj is None or arm_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "select the model's armature")
+            return {"CANCELLED"}
+        rows = skin_rows(arm_obj)
+        if not 0 <= self.family < len(rows):
+            self.report({"ERROR"}, "this model carries %d skin famil%s, so there is no "
+                                   "family %d" % (len(rows),
+                                                  "y" if len(rows) == 1 else "ies",
+                                                  self.family))
+            return {"CANCELLED"}
+        mats = list(arm_obj.get("vtmb_skin_materials") or ())
+        moved, missing = 0, []
+        # Every mesh in one pass: the export inverts one row for the whole model, so a
+        # half-switched scene names one texture record two ways and is refused outright.
+        for o in arm_meshes(context, arm_obj):
+            refs = [int(x) for x in (o.get("vtmb_skinrefs") or ())]
+            for slot, r in enumerate(refs):
+                if slot >= len(o.data.materials):
+                    continue
+                ref = rows[self.family][r] if 0 <= r < len(rows[self.family]) else r
+                name = str(mats[ref]) if 0 <= ref < len(mats) else ""
+                mat = bpy.data.materials.get(name) if name else None
+                if mat is None:
+                    missing.append(name or "record %d" % ref)
+                    continue
+                if o.data.materials[slot] is not mat:
+                    o.data.materials[slot] = mat
+                    moved += 1
+        arm_obj["vtmb_skin_family"] = self.family
+        if missing:
+            self.report({"WARNING"}, "family %d: %d slot(s) moved, and no material in "
+                                     "the blend is named %s"
+                        % (self.family, moved, ", ".join(sorted(set(missing))[:3])))
+        else:
+            self.report({"INFO"}, "skin family %d, %d slot(s) moved"
+                                  % (self.family, moved))
+        return {"FINISHED"}
+
+
+def draw_skin_families(lay, arm_obj):
+    """One row per skin family, the one on screen marked.
+
+    Drawn only above one family, which is 201 of the 4445 shipped models.
+    """
+    rows = skin_rows(arm_obj)
+    if len(rows) < 2:
+        lay.label(text="one skin family", icon="INFO")
+        return
+    active = int(arm_obj.get("vtmb_skin_family") or 0)
+    box = lay.box()
+    for f in range(len(rows)):
+        row = box.row(align=True)
+        op = row.operator("vtmb.set_skin_family", text="",
+                          icon="RADIOBUT_ON" if f == active else "RADIOBUT_OFF")
+        op.family = f
+        row.label(text="skin %d" % f)
+        row.label(text=", ".join(n for n in skin_family_names(arm_obj, f) if n)[:64])
+
+
+class VTMB_PT_skin_families(bpy.types.Panel):
+    bl_label = "VTMB skin families"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_skin_families(self.layout, context.object)
+
+
+def accessories_of(arm_obj):
+    """(attachment empties, {set ordinal: [box empties]}, {set ordinal: name}) for drawing.
+
+    The export's own grouping, so what the panel counts is what the file will carry.
+    """
+    return blender_export.accessory_objects(arm_obj)
+
+
+class VTMB_OT_add_attachment(bpy.types.Operator):
+    bl_idname = "vtmb.add_attachment"
+    bl_label = "Add attachment"
+    bl_description = ("Mount point on the active bone. 495 shipped characters carry theirs "
+                      "as attachment '0' on Bip01 R Hand")
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: bpy.props.StringProperty(name="Name", default="0")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and context.active_bone is not None)
+
+    def execute(self, context):
+        arm_obj, bone = context.object, context.active_bone
+        obj = bpy.data.objects.new("%s.%s" % (arm_obj.name, self.name), None)
+        obj.empty_display_type = "ARROWS"
+        obj.empty_display_size = 1.0
+        _link_beside(arm_obj, obj)
+        obj.parent = arm_obj
+        obj.parent_type = "BONE"
+        obj.parent_bone = bone.name
+        obj.matrix_parent_inverse = mathutils.Matrix.Translation((0.0, -bone.length, 0.0))
+        obj.matrix_basis = mathutils.Matrix.Identity(4)
+        obj["vtmb_attachment"] = self.name
+        obj["vtmb_attachment_type"] = 0
+        return {"FINISHED"}
+
+
+class VTMB_OT_add_hitbox(bpy.types.Operator):
+    bl_idname = "vtmb.add_hitbox"
+    bl_label = "Add hitbox"
+    bl_description = ("Axis-aligned box on the active bone, in the named set. Group is the "
+                      "Source hit group and nothing in the file derives it")
+    bl_options = {"REGISTER", "UNDO"}
+
+    group: bpy.props.IntProperty(name="Group", default=0, min=0)
+    set_index: bpy.props.IntProperty(name="Set", default=0, min=0)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and context.active_bone is not None)
+
+    def execute(self, context):
+        arm_obj, bone = context.object, context.active_bone
+        _attach, boxes, names = accessories_of(arm_obj)
+        if self.set_index not in names:
+            root = bpy.data.objects.new("%s.default" % arm_obj.name, None)
+            root.empty_display_type = "PLAIN_AXES"
+            _link_beside(arm_obj, root)
+            root.parent = arm_obj
+            root["vtmb_hitboxset"] = "default"
+            root["vtmb_hitboxset_index"] = self.set_index
+        obj = bpy.data.objects.new("%s.box" % arm_obj.name, None)
+        obj.empty_display_type = "CUBE"
+        obj.empty_display_size = 1.0
+        _link_beside(arm_obj, obj)
+        obj.parent = arm_obj
+        obj.parent_type = "BONE"
+        obj.parent_bone = bone.name
+        obj.matrix_parent_inverse = mathutils.Matrix.Translation((0.0, -bone.length, 0.0))
+        # Half the bone's own length, so a new box is visible without being the whole model.
+        h = max(bone.length, 1e-4) * 0.5
+        obj.matrix_basis = mathutils.Matrix.Diagonal((h, h, h, 1.0))
+        obj["vtmb_hitbox_group"] = self.group
+        obj["vtmb_hitboxset_index"] = self.set_index
+        return {"FINISHED"}
+
+
+def _link_beside(arm_obj, obj):
+    for c in bpy.data.collections:
+        if arm_obj.name in c.objects:
+            c.objects.link(obj)
+            return
+    bpy.context.scene.collection.objects.link(obj)
+
+
+def draw_accessories(lay, context, arm_obj):
+    attach, boxes, names = accessories_of(arm_obj)
+    row = lay.row(align=True)
+    row.operator("vtmb.add_attachment", icon="EMPTY_ARROWS")
+    row.operator("vtmb.add_hitbox", icon="MESH_CUBE")
+    if not attach and not boxes:
+        lay.label(text="no attachment and no hitbox", icon="INFO")
+        return
+    for obj in attach:
+        lay.label(text="%s on %s" % (obj.get("vtmb_attachment") or obj.name,
+                                     obj.parent_bone or "no bone"), icon="EMPTY_ARROWS")
+    for k in sorted(boxes):
+        lay.label(text="%s: %d box%s" % (names.get(k, "default"), len(boxes[k]),
+                                         "" if len(boxes[k]) == 1 else "es"),
+                  icon="MESH_CUBE")
+
+
+class VTMB_PT_accessories(bpy.types.Panel):
+    bl_label = "VTMB attachments and hitboxes"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_accessories(self.layout, context, context.object)
 
 
 class VTMB_OT_add_cdtexture(bpy.types.Operator):
@@ -933,6 +1171,8 @@ def _fallback_line(act):
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
+           VTMB_OT_set_skin_family, VTMB_PT_skin_families,
+           VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_PT_action_events, VTMB_PT_action_params,
            VTMB_PT_bone_flags, VTMB_PT_bone]

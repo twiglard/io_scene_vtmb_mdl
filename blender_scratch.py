@@ -438,6 +438,27 @@ def fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale=1.0, floor=0.05,
     return len(boxes)
 
 
+def add_attachments(d, arm_obj, bone_index, scale=1.0):
+    """Every attachment empty in the scene, on the bone it is parented to. Returns the count.
+
+    Silently skipping one whose bone the authored skeleton does not carry would lose a mount
+    point the user placed, so an unresolvable bone is refused instead.
+    """
+    n = 0
+    for obj in export_mod.accessory_objects(arm_obj)[0]:
+        want = obj.parent_bone if obj.parent_type == "BONE" else ""
+        if want not in bone_index:
+            raise Refused("attachment %r is on bone %r, which is not being written"
+                          % (obj.name, want or "<none>"))
+        rows = [[obj.matrix_basis[r][c] / (scale if c == 3 else 1.0) for c in range(4)]
+                for r in range(3)]
+        build_mod.add_attachment(d, str(obj.get("vtmb_attachment") or obj.name),
+                                 bone_index[want], rows,
+                                 int(obj.get("vtmb_attachment_type") or 0))
+        n += 1
+    return n
+
+
 def sample_action(context, arm_obj, action, d, scale=1.0, use_range=False):
     """`poses[frame][bone]` of local (pos, quat), in the bone order already authored.
 
@@ -546,6 +567,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     faces, unskinned, kept, crowded = add_meshes(d, mesh_objs, bone_index, scale)
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
+    add_attachments(d, arm_obj, bone_index, scale)
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
     return d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable

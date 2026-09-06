@@ -1220,7 +1220,7 @@ SCRATCH_DROPS = (
     "cloth, flex descs, controllers, rules and every vertanim",
     "eyeballs, mouths and pose parameters",
     "spring bones, procedural bones, IK chains and bone controllers",
-    "attachments, sequence events and autolayers",
+    "sequence events and autolayers",
 )
 
 

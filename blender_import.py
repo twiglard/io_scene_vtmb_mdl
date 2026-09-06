@@ -412,10 +412,11 @@ def _has_image(mat):
     return bool(tree and any(n.type == "TEX_IMAGE" and n.image for n in tree.nodes))
 
 
-def _material(m, index, content):
+def _material(m, index, content, family=0):
     ref = index
-    if m.skins and 0 <= index < len(m.skins[0]):
-        ref = m.skins[0][index]
+    row = m.skins[family] if 0 <= family < len(m.skins) else None
+    if row and 0 <= index < len(row):
+        ref = row[index]
     name = m.materials[ref] if 0 <= ref < len(m.materials) else "material_%d" % index
     mat = bpy.data.materials.get(name)
     if mat is None:
@@ -504,6 +505,94 @@ def build_shape_keys(obj, model, scale):
     return len(order), nrec, dropped
 
 
+def _accessory_collection(context, arm_obj, name):
+    """A sub-collection so the export's mesh walk and the user's own selections miss these.
+
+    Linked under whatever collection the armature landed in, not under the scene root.
+    """
+    coll = bpy.data.collections.new("%s accessories" % name)
+    for c in bpy.data.collections:
+        if arm_obj.name in c.objects:
+            c.children.link(coll)
+            break
+    else:
+        context.scene.collection.children.link(coll)
+    return coll
+
+
+def _bone_child(obj, arm_obj, bone):
+    """Parent to the bone, with the tail offset taken back out.
+
+    Measured on Blender 5.2: with both matrices identity a bone child lands at
+    `bone.matrix_local @ Translation((0, bone.length, 0))`, so this inverse is what makes
+    `matrix_basis` mean bone space and nothing else.
+    """
+    obj.parent = arm_obj
+    obj.parent_type = "BONE"
+    obj.parent_bone = bone.name
+    obj.matrix_parent_inverse = mathutils.Matrix.Translation((0.0, -bone.length, 0.0))
+
+
+def build_accessories(context, m, arm_obj, name, scale):
+    """Attachments as ARROWS empties and hitboxes as CUBE empties, both in bone space.
+
+    A CUBE empty draws -size to +size in its local space, so an arbitrary AABB is the
+    scale and the centre and comes back exactly.  `matrix_basis` holds the file's own
+    bone-space matrix and no bone matrix at all -- Blender's bone parenting supplies that
+    -- so the export reads back what it will write with nothing to invert.
+    """
+    dbs = arm_obj.data.bones
+    made = []
+    if not m.attachments and not m.hitboxsets:
+        return made
+    coll = _accessory_collection(context, arm_obj, name)
+    for a in m.attachments:
+        if not 0 <= a.bone < len(m.bones):
+            continue
+        bone = dbs.get(m.bones[a.bone].name)
+        if bone is None:
+            continue
+        obj = bpy.data.objects.new("%s.%s" % (name, a.name or str(a.index)), None)
+        obj.empty_display_type = "ARROWS"
+        obj.empty_display_size = max(scale, 1e-4)
+        coll.objects.link(obj)
+        _bone_child(obj, arm_obj, bone)
+        obj.matrix_basis = _scaled(a.local, scale)
+        obj["vtmb_attachment"] = a.name
+        obj["vtmb_attachment_type"] = a.type
+        obj["vtmb_attachment_index"] = a.index
+        made.append(obj)
+    for hs in m.hitboxsets:
+        root = bpy.data.objects.new("%s.%s" % (name, hs.name or "default"), None)
+        root.empty_display_type = "PLAIN_AXES"
+        root.empty_display_size = max(scale, 1e-4)
+        coll.objects.link(root)
+        root.parent = arm_obj
+        root["vtmb_hitboxset"] = hs.name
+        root["vtmb_hitboxset_index"] = hs.index
+        made.append(root)
+        for x in hs.boxes:
+            if not 0 <= x.bone < len(m.bones):
+                continue
+            bone = dbs.get(m.bones[x.bone].name)
+            if bone is None:
+                continue
+            obj = bpy.data.objects.new("%s.box%d" % (root.name, x.index), None)
+            obj.empty_display_type = "CUBE"
+            obj.empty_display_size = 1.0
+            coll.objects.link(obj)
+            _bone_child(obj, arm_obj, bone)
+            half = [(hi - lo) * 0.5 * scale for lo, hi in zip(x.bbmin, x.bbmax)]
+            mid = [(hi + lo) * 0.5 * scale for lo, hi in zip(x.bbmin, x.bbmax)]
+            obj.matrix_basis = (mathutils.Matrix.Translation(mid)
+                                @ mathutils.Matrix.Diagonal(half + [1.0]))
+            obj["vtmb_hitbox_group"] = x.group
+            obj["vtmb_hitboxset_index"] = hs.index
+            obj["vtmb_hitbox_index"] = x.index
+            made.append(obj)
+    return made
+
+
 def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
     path, blob = content.companion(m, vtx_mod.SUFFIXES)
     if path is None:
@@ -538,6 +627,7 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
                         mesh.material))
 
     objs = []
+    skin_mats = {}
     nkeys = nflexrec = nflexdrop = 0
     for gi, (bp, model) in enumerate(models):
         faces = faces_by_model.get(gi)
@@ -613,6 +703,15 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # The mesh partition of the vertex array, which Blender's per-face material slot
         # cannot express: two meshes may share a material, and a loose vertex has no face.
         obj["vtmb_meshes"] = [[slots[x.material], x.numvertices] for x in model.meshes]
+        # The skinref each slot was built from, in slot order. vtmb.set_skin_family needs
+        # the inverse of `slots` and cannot rebuild it: that would take the .mdl back.
+        obj["vtmb_skinrefs"] = [r for r, _ in sorted(slots.items(), key=lambda kv: kv[1])]
+        for fam in range(len(m.skins) or 1):
+            row = m.skins[fam] if fam < len(m.skins) else None
+            for r, j in slots.items():
+                ref = row[r] if row and 0 <= r < len(row) else r
+                skin_mats[ref] = (me.materials[j].name if fam == 0
+                                  else _material(m, r, content, fam).name)
         # Keyed by file vertex, not by Blender vertex: an edit rewrites the second and
         # interpolates any float attribute, so only an object property survives one.
         obj["vtmb_orig_co"] = [c * scale for v_ in verts for c in v_.pos]
@@ -643,6 +742,10 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         obj.parent = arm_obj
         obj.modifiers.new(name="Armature", type="ARMATURE").object = arm_obj
         objs.append(obj)
+    # Every family's material datablock, indexed by mstudiotexture_t record, so the picker
+    # re-points a slot without needing a Content or the .mdl back.
+    arm_obj["vtmb_skin_materials"] = [skin_mats.get(i, "")
+                                      for i in range(len(m.materials))]
     note = None
     if nflexrec:
         # A shape key is coordinates only, so every record's normal delta stays in the
@@ -895,6 +998,7 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     }
     objs, warning = ([], None) if not with_mesh else \
         build_meshes(context, m, arm_obj, name, scale, content, with_flexes)
+    build_accessories(context, m, arm_obj, name, scale)
 
     wanted, missing, opened = [], [], [m.path]
     if with_anims:
@@ -915,17 +1019,18 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
             % (len(missing), ", ".join(missing[:3]))
         warning = "%s; %s" % (warning, note) if warning else note
 
-    # Only family 0 is built into material slots -- `_material` reads m.skins[0] and there
-    # is nowhere in Blender for the others to go. Nothing is lost on a round trip, because
-    # no export path rewrites the skin table, but the alternate looks are not in the scene
-    # and the file gives no other sign of them.
+    # Flattened because a Blender ID property takes no nested list. Slots built from row N
+    # while `read_materials` inverts through row 0 renames every `mstudiotexture_t`.
     arm_obj["vtmb_skin_families"] = len(m.skins)
+    arm_obj["vtmb_skin_refs"] = len(m.skins[0]) if m.skins else 0
+    arm_obj["vtmb_skin_table"] = [r for row in m.skins for r in row]
+    arm_obj["vtmb_skin_family"] = 0
     alt = sum(1 for f in m.skins[1:] if f != m.skins[0]) if m.skins else 0
     arm_obj["vtmb_skin_alt"] = alt
     if alt:
-        note = ("%d of the file's %d skin families differ from the first, and only the "
-                "first is in the scene; a rebuild that regenerates the table from the "
-                "material slots flattens them all to it" % (alt, len(m.skins)))
+        note = ("%d of the file's %d skin families differ from the first; the slots show "
+                "family 0 and VTMB skin families in the armature's Object Data tab "
+                "switches them" % (alt, len(m.skins)))
         warning = "%s; %s" % (warning, note) if warning else note
 
     packed = sum(len(v.index) for v in content.packs if v is not None)

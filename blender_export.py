@@ -989,7 +989,20 @@ def describe_unwritten(unwritten, limit=3):
         len(unwritten), "" if len(unwritten) == 1 else "s", head, more)
 
 
-def read_materials(m, source):
+def skin_family(m, arm_obj):
+    """Which row of the skin table the scene's material slots are showing.
+
+    Out of range is refused, not clamped: the engine clamps to row 0 silently, and a
+    rename read back through the wrong row renames every mstudiotexture_t in the file.
+    """
+    fam = int(arm_obj.get("vtmb_skin_family") or 0)
+    if m.skins and not 0 <= fam < len(m.skins):
+        raise ValueError("the armature's skin family is %d, but %s carries %d"
+                         % (fam, os.path.basename(m.path), len(m.skins)))
+    return fam
+
+
+def read_materials(m, source, family=0):
     """{file texture index: name} from the scene's material slots.
 
     `obj["vtmb_meshes"]` records which slot each file mesh landed in, and it is the only
@@ -1009,8 +1022,9 @@ def read_materials(m, source):
             if not 0 <= slot < len(mats) or mats[slot] is None:
                 continue
             ref = mesh.material
-            if m.skins and 0 <= ref < len(m.skins[0]):
-                ref = m.skins[0][ref]
+            row = m.skins[family] if 0 <= family < len(m.skins) else None
+            if row and 0 <= ref < len(row):
+                ref = row[ref]
             name = mats[slot].name
             if out.get(ref, name) != name:
                 raise ValueError("texture %d is named both %r and %r by the scene's "
@@ -1078,6 +1092,146 @@ def apply_springbones(d, m, arm_obj):
             if bytes(r.raw[at:at + 4]) != packed:
                 r.raw[at:at + 4] = packed
                 changed += 1
+    return changed
+
+
+# An accessory matrix survives Blender as the object's loc/rot/scale, so reading one back
+# is a decomposition and not a copy. Measured over both check donors, the worst deviation
+# is 1.325e-08 on an attachment matrix and 1.666e-06 on a box half-extent, which is a
+# sqrt of float32 sums -- so the bound is relative, at 18x the worst seen.
+ACC_EPS = 1e-6
+
+
+def _same(a, b):
+    return abs(a - b) <= ACC_EPS * max(1.0, abs(a), abs(b))
+
+
+def accessory_objects(arm_obj):
+    """(attachment empties, {set ordinal: [box empties]}, {set ordinal: set name}).
+
+    Grouped by the stamped ordinal and not by the hierarchy: an empty carries one parent
+    and that parent is the bone, so a set cannot also be an object parent.  A record the
+    scene added carries no ordinal and sorts last, which is where `emit` appends it.
+    """
+    attach, boxes, names = [], {}, {}
+    for obj in arm_obj.children_recursive:
+        if obj.get("vtmb_attachment") is not None:
+            attach.append(obj)
+        elif obj.get("vtmb_hitbox_group") is not None:
+            boxes.setdefault(int(obj.get("vtmb_hitboxset_index") or 0), []).append(obj)
+        elif obj.get("vtmb_hitboxset") is not None:
+            names[int(obj.get("vtmb_hitboxset_index") or 0)] = str(obj["vtmb_hitboxset"])
+    big = 1 << 30
+    attach.sort(key=lambda o: (int(o.get("vtmb_attachment_index", big)), o.name))
+    for k in boxes:
+        boxes[k].sort(key=lambda o: (int(o.get("vtmb_hitbox_index", big)), o.name))
+    return attach, boxes, names
+
+
+def _accessory_bone(obj, m, arm_obj, bmap, what):
+    """The file bone index an accessory empty is mounted on, refusing an unresolvable one."""
+    want = obj.parent_bone if obj.parent_type == "BONE" else ""
+    if not want:
+        raise ValueError("%s %r is not parented to a bone" % (what, obj.name))
+    for b in m.bones:
+        if bmap.get(b.name) == want:
+            return b.index
+    raise ValueError("%s %r is on bone %r, which is not one this model carries"
+                     % (what, obj.name, want))
+
+
+def read_attachments(m, arm_obj, scale):
+    """[(name, type, bone, 12 floats)] out of the scene, in bone space.
+
+    `matrix_basis` is already the file's own bone-space matrix -- Blender's bone parenting
+    supplies `bone.matrix_local` and `matrix_parent_inverse` takes the tail offset back
+    out -- so nothing here inverts anything and there is no error to cancel.
+    """
+    bmap = bone_map(m, arm_obj)
+    out = []
+    for obj in accessory_objects(arm_obj)[0]:
+        bi = _accessory_bone(obj, m, arm_obj, bmap, "attachment")
+        local = obj.matrix_basis
+        out.append((str(obj.get("vtmb_attachment") or obj.name),
+                    int(obj.get("vtmb_attachment_type") or 0), bi,
+                    tuple(local[r][c] / (scale if c == 3 else 1.0)
+                          for r in range(3) for c in range(4))))
+    return out
+
+
+def read_hitboxsets(m, arm_obj, scale):
+    """[(set name, [(bone, group, bbmin+bbmax)])] out of the scene, in bone space.
+
+    A CUBE empty draws -size to +size, so the box is the empty's own scale and translation
+    and comes back without a bounding-box walk.  0 of the 14151 shipped boxes has a zero
+    extent on any axis, so nothing here has to survive a degenerate one.
+    """
+    bmap = bone_map(m, arm_obj)
+    _attach, boxes, names = accessory_objects(arm_obj)
+    out = []
+    for k in sorted(boxes):
+        recs = []
+        for obj in boxes[k]:
+            bi = _accessory_bone(obj, m, arm_obj, bmap, "hitbox")
+            local = obj.matrix_basis
+            mid = [local[r][3] / scale for r in range(3)]
+            half = [local.col[c].to_3d().length / scale for c in range(3)]
+            # mstudiobbox_t is an AABB in bone space and carries no rotation, so a turned
+            # empty would be written as its unturned self. 1e-3 is three orders above the
+            # 1e-6 the identity round trip costs and far below any deliberate turn.
+            turn = max(abs(local.col[c].to_3d()[r] / (half[c] * scale or 1.0)
+                           - (1.0 if r == c else 0.0))
+                       for c in range(3) for r in range(3))
+            if turn > 1e-3:
+                raise ValueError("hitbox %r is turned %.4f out of its bone's axes, and "
+                                 "mstudiobbox_t carries no rotation" % (obj.name, turn))
+            recs.append((bi, int(obj.get("vtmb_hitbox_group") or 0),
+                         tuple(a - b for a, b in zip(mid, half))
+                         + tuple(a + b for a, b in zip(mid, half))))
+        out.append((names.get(k, "default"), recs))
+    return out
+
+
+def apply_accessories(d, m, arm_obj, scale):
+    """Both record arrays back into the description, written only where they differ.
+
+    Comparison is against the packed float32 and not the Python float, the way
+    `apply_springbones` does it, so a record the user never touched cannot rewrite the
+    bytes it came from.
+    """
+    changed = 0
+    want = read_attachments(m, arm_obj, scale)
+    if len(want) != len(d.attachments):
+        d.attachments = d.attachments[:0]
+        for name, kind, bone, local in want:
+            build_mod.add_attachment(d, name, bone,
+                                     (local[0:4], local[4:8], local[8:12]), kind)
+        changed += len(want)
+    else:
+        for rec, (name, kind, bone, local) in zip(d.attachments, want):
+            if rec.name != name:
+                rec.name = name
+                changed += 1
+            have = struct.unpack_from("<ii", rec.raw, 4) + struct.unpack_from("<12f", rec.raw, 12)
+            if (have[0], have[1]) != (kind, bone) or not all(
+                    _same(a, b) for a, b in zip(have[2:], local)):
+                struct.pack_into("<ii12f", rec.raw, 4, kind, bone, *local)
+                changed += 1
+
+    want = read_hitboxsets(m, arm_obj, scale)
+    have = [(r.name, [(struct.unpack_from("<ii", x.raw, 0)
+                       + struct.unpack_from("<6f", x.raw, 8)) for x in r.kids])
+            for r in d.hitboxsets]
+    same = len(want) == len(have) and all(
+        wn == hn and len(wb) == len(hb)
+        and all((b, g) == (h[0], h[1]) and all(_same(x, y) for x, y in zip(v, h[2:]))
+                for (b, g, v), h in zip(wb, hb))
+        for (wn, wb), (hn, hb) in zip(want, have))
+    if not same:
+        d.hitboxsets = d.hitboxsets[:0]
+        for name, recs in want:
+            build_mod.add_hitbox(d, [(b, g, v[0:3], v[3:6]) for b, g, v in recs], name)
+        changed += sum(len(r) for _n, r in want)
     return changed
 
 
@@ -1449,6 +1603,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     d = build_mod.apply_anims(d, edits, source)
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0, "stale": 0,
+             "accessories": 0,
              "rebased": 0, "requantised": [], "root_turned": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj)}
     poses = read_bones(m, arm_obj, scale)
@@ -1465,7 +1620,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         scene["rebased"] = rebase["anims"]
         scene["requantised"] = rebase["widened"]
         scene["root_turned"] = [d.bones[k].name for k in rebase["root_turned"]]
-    for ref, name in sorted(read_materials(m, source).items()):
+    for ref, name in sorted(read_materials(m, source, skin_family(m, arm_obj)).items()):
         if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
             d.textures[ref].name = name
             scene["materials"] += 1
@@ -1480,6 +1635,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         have.add(name)
         scene["added_materials"].append(name)
     scene["springs"] = apply_springbones(d, m, arm_obj)
+    scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     scene["sequences"] = apply_sequences(d, arm_obj, [r.name for r in d.anims])
