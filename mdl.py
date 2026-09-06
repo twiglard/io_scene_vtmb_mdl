@@ -31,6 +31,7 @@ HDR_NUMFLEXDESC = 344
 HDR_NUMHITBOXSETS = 256
 HDR_NUMINCLUDEMODELS = 404
 HDR_NUMSPRINGBONES = 396
+HDR_NUMPOSEPARAMS = 384
 
 # Measured, not from Valve: the record is 116 bytes with the name offset at +0, and no
 # other stride parses the corpus. The 24 trailing -1s are the pose-parameter remap.
@@ -63,6 +64,13 @@ SEQ_EVENTINDEX = 0x18
 EVENT_STRIDE = 76
 EVENT_OPTIONS = 0x0c
 EVENT_OPTIONS_LEN = 64
+
+# mstudioposeparamdesc_t: int sznameindex (struct-relative), int flags, float start,
+# end, loop. 0 of these on 3994 of the 4445 corpus models, 2 on 449 and 4 on 2.
+POSEPARAM_STRIDE = 20
+SEQ_PARAMINDEX = 0x244
+SEQ_PARAMSTART = 0x24c
+SEQ_PARAMEND = 0x254
 
 MOVEMENT_STRIDE = 44
 
@@ -265,7 +273,17 @@ class Movement:
 
 class Seq:
     __slots__ = ("index", "label", "activity", "flags", "groupsize", "blends",
-                 "bbmin", "bbmax", "events")
+                 "bbmin", "bbmax", "events", "paramindex", "paramstart", "paramend")
+
+
+class PoseParam:
+    """One mstudioposeparamdesc_t -- a runtime input a sequence blends along.
+
+    `move_yaw` and `hit_yaw` on all 451 corpus models that carry any, plus `aim_yaw`
+    and `aim_pitch` on the two that carry four. `loop` is 0 for none, 360 for a
+    rotation.
+    """
+    __slots__ = ("index", "name", "flags", "start", "end", "loop")
 
 
 class Event:
@@ -359,6 +377,7 @@ class Mdl:
                       for i in range(numanim)]
         self.seqs = [self._read_seq(seqindex + i * SEQDESC_STRIDE, i)
                      for i in range(numseq)]
+        self._read_poseparams()
         self._read_materials()
         self._read_flexdescs()
         self._read_bodyparts()
@@ -423,7 +442,35 @@ class Mdl:
         s.blends = [[struct.unpack_from("<h", d, off + SEQ_ANIM + x * 0x20 + y * 2)[0]
                      for y in range(gy)] for x in range(gx)]
         s.events = self._read_events(off)
+        # Which pose parameter drives each blend axis, -1 for none -- which is what
+        # 13724 of the 14012 shipped sequences carry and the only value
+        # Studio_LocalPoseParameter short-circuits on.
+        s.paramindex = list(struct.unpack_from("<2i", d, off + SEQ_PARAMINDEX))
+        s.paramstart = list(struct.unpack_from("<2f", d, off + SEQ_PARAMSTART))
+        s.paramend = list(struct.unpack_from("<2f", d, off + SEQ_PARAMEND))
         return s
+
+    def _read_poseparams(self):
+        """studiohdr_t's mstudioposeparamdesc_t array, empty on 3994 of 4445 models.
+
+        A sequence names one of these by index, and Studio_LocalPoseParameter indexes
+        the array with that number and no comparison against numposeparameters, in all
+        three modules that carry the function -- so an out-of-range index is a read
+        past the array and nothing in the engine stops it.
+        """
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMPOSEPARAMS)
+        self.poseparams = []
+        for i in range(max(0, n)):
+            o = idx + i * POSEPARAM_STRIDE
+            if o + POSEPARAM_STRIDE > len(d):
+                break
+            pp = PoseParam()
+            pp.index = i
+            pp.name = self._cstr(o + struct.unpack_from("<i", d, o)[0])
+            pp.flags = struct.unpack_from("<i", d, o + 4)[0]
+            pp.start, pp.end, pp.loop = struct.unpack_from("<3f", d, o + 8)
+            self.poseparams.append(pp)
 
     def _read_events(self, off):
         """The sequence's mstudioevent_t array, empty on the 12862 sequences with none.

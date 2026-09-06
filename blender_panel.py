@@ -457,7 +457,7 @@ EVENT_HANDLERS = {
 }
 
 
-def _event_seq(arm_obj, act):
+def _action_seq(arm_obj, act):
     """(stash index, the sequence dict) whose first blend names this action, else (None, None).
 
     Chained actions belong to another file and no sequence here names them, which is why
@@ -471,12 +471,12 @@ def _event_seq(arm_obj, act):
     return None, None
 
 
-def _event_armature(context, act):
+def _action_armature(context, act):
     obj = context.object
-    if obj is not None and obj.type == "ARMATURE" and _event_seq(obj, act)[0] is not None:
+    if obj is not None and obj.type == "ARMATURE" and _action_seq(obj, act)[0] is not None:
         return obj
     for o in bpy.data.objects:
-        if o.type == "ARMATURE" and _event_seq(o, act)[0] is not None:
+        if o.type == "ARMATURE" and _action_seq(o, act)[0] is not None:
             return o
     return None
 
@@ -521,7 +521,7 @@ class VTMB_OT_add_event(bpy.types.Operator):
 
     def execute(self, context):
         act = panel_action(context)
-        arm_obj = _event_armature(context, act) if act else None
+        arm_obj = _action_armature(context, act) if act else None
         if act is None or arm_obj is None:
             self.report({"ERROR"}, "no imported sequence names this action")
             return {"CANCELLED"}
@@ -529,7 +529,7 @@ class VTMB_OT_add_event(bpy.types.Operator):
             self.report({"ERROR"}, "options is over 63 bytes and the field holds 63 "
                                    "plus a terminator")
             return {"CANCELLED"}
-        k, seq = _event_seq(arm_obj, act)
+        k, seq = _action_seq(arm_obj, act)
         span = max(1, int(act.get("vtmb_numframes") or 1) - 1)
         cycle = min(1.0, max(0.0, context.scene.frame_current / float(span)))
         events = [dict(x) for x in seq.get("events") or ()]
@@ -555,11 +555,11 @@ class VTMB_OT_remove_event(bpy.types.Operator):
 
     def execute(self, context):
         act = panel_action(context)
-        arm_obj = _event_armature(context, act) if act else None
+        arm_obj = _action_armature(context, act) if act else None
         if act is None or arm_obj is None:
             self.report({"ERROR"}, "no imported sequence names this action")
             return {"CANCELLED"}
-        k, seq = _event_seq(arm_obj, act)
+        k, seq = _action_seq(arm_obj, act)
         events = [dict(x) for x in seq.get("events") or ()]
         if not 0 <= self.index < len(events):
             self.report({"ERROR"}, "no event %d on this sequence" % self.index)
@@ -578,11 +578,11 @@ def draw_action_events(lay, context, act):
     Drawn from `vtmb_sequences` and never from the markers: a marker carries a name and a
     frame, so the stash is the only thing that can say what an event's options string was.
     """
-    arm_obj = _event_armature(context, act)
+    arm_obj = _action_armature(context, act)
     if arm_obj is None:
         lay.label(text="no imported sequence names this action", icon="INFO")
         return
-    _k, seq = _event_seq(arm_obj, act)
+    _k, seq = _action_seq(arm_obj, act)
     events = list(seq.get("events") or ())
     span = max(1, int(act.get("vtmb_numframes") or 1) - 1)
     if not events:
@@ -614,6 +614,152 @@ class VTMB_PT_action_events(bpy.types.Panel):
     def draw(self, context):
         self.layout.use_property_split = False
         draw_action_events(self.layout, context, panel_action(context))
+
+
+def _param_names(arm_obj):
+    return [str(p.get("name") or "") for p in arm_obj.get("vtmb_poseparams") or ()]
+
+
+def _param_rec(arm_obj, name):
+    for p in arm_obj.get("vtmb_poseparams") or ():
+        if str(p.get("name") or "") == name:
+            return dict(p)
+    return None
+
+
+def _write_params(arm_obj, index, params):
+    stash = [dict(x) for x in arm_obj.get("vtmb_sequences") or ()]
+    stash[index]["params"] = params
+    arm_obj["vtmb_sequences"] = stash
+
+
+class VTMB_OT_set_param(bpy.types.Operator):
+    bl_idname = "vtmb.set_param"
+    bl_label = "Set blend axis pose parameter"
+    bl_description = ("Name the pose parameter that drives one blend axis of the sequence "
+                      "this action belongs to. An empty name writes -1, which is what "
+                      "13724 of the 14012 shipped sequences carry")
+    bl_options = {"REGISTER", "UNDO"}
+
+    axis: bpy.props.IntProperty(name="Axis", default=0, min=0, max=1)
+    name: bpy.props.StringProperty(name="Pose parameter", default="")
+
+    def execute(self, context):
+        act = panel_action(context)
+        arm_obj = _action_armature(context, act) if act else None
+        if act is None or arm_obj is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        names = _param_names(arm_obj)
+        if self.name and self.name not in names:
+            self.report({"ERROR"}, "no pose parameter %r on this model -- it has %s"
+                        % (self.name, ", ".join(n for n in names if n) or "none"))
+            return {"CANCELLED"}
+        k, seq = _action_seq(arm_obj, act)
+        params = [dict(x) for x in seq.get("params") or ()]
+        while len(params) < 2:
+            params.append({"name": "", "start": 0.0, "end": 0.0})
+        rec = _param_rec(arm_obj, self.name) if self.name else None
+        # The sequence's range equals the parameter's own on all 288 shipped sequences
+        # that name one, so that is the default rather than zero.
+        params[self.axis] = {"name": self.name,
+                             "start": float(rec.get("start") or 0.0) if rec else 0.0,
+                             "end": float(rec.get("end") or 0.0) if rec else 0.0}
+        _write_params(arm_obj, k, params)
+        self.report({"INFO"}, "blend axis %d is driven by %s"
+                              % (self.axis, self.name or "nothing"))
+        return {"FINISHED"}
+
+
+def draw_action_params(lay, context, act):
+    """Which pose parameter drives each blend axis of this action's sequence.
+
+    Only an axis with more than one blend is drawn: a 1-wide axis has nothing to blend
+    between, and 13715 of the 14012 shipped sequences are (1, 1).
+    """
+    arm_obj = _action_armature(context, act)
+    if arm_obj is None:
+        lay.label(text="no imported sequence names this action", icon="INFO")
+        return
+    _k, seq = _action_seq(arm_obj, act)
+    names = [n for n in _param_names(arm_obj) if n]
+    if not names:
+        lay.label(text="this model carries no pose parameter", icon="INFO")
+        return
+    gs = [int(x) for x in seq.get("groupsize") or (1, 1)]
+    params = list(seq.get("params") or ())
+    drawn = 0
+    for axis in range(2):
+        if axis >= len(gs) or gs[axis] <= 1:
+            continue
+        drawn += 1
+        cur = dict(params[axis]) if axis < len(params) else {}
+        cur_name = str(cur.get("name") or "")
+        box = lay.box()
+        box.label(text="axis %d, %d blends" % (axis, gs[axis]))
+        row = box.row(align=True)
+        for name in [""] + names:
+            op = row.operator("vtmb.set_param", text=name or "none",
+                              depress=(name == cur_name))
+            op.axis = axis
+            op.name = name
+        if cur_name:
+            box.label(text="%s over %.1f to %.1f"
+                           % (cur_name, float(cur.get("start") or 0.0),
+                              float(cur.get("end") or 0.0)))
+    if not drawn:
+        lay.label(text="every blend axis is 1 wide, so no pose parameter drives this",
+                  icon="INFO")
+
+
+class VTMB_PT_action_params(bpy.types.Panel):
+    bl_label = "VTMB pose parameters"
+    bl_space_type = "DOPESHEET_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "VTMB"
+
+    @classmethod
+    def poll(cls, context):
+        return panel_action(context) is not None
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_action_params(self.layout, context, panel_action(context))
+
+
+def draw_armature_params(lay, arm_obj):
+    """The model's mstudioposeparamdesc_t array, which no export authors.
+
+    What reads `move_yaw` and `hit_yaw` at runtime is not located, so a name invented here
+    would drive nothing -- the array is displayed and carried, never written.
+    """
+    pps = list(arm_obj.get("vtmb_poseparams") or ())
+    if not pps:
+        lay.label(text="no pose parameters", icon="INFO")
+        return
+    box = lay.box()
+    for pp in pps:
+        row = box.row(align=True)
+        row.label(text=str(pp.get("name") or ""))
+        row.label(text="%.1f to %.1f" % (float(pp.get("start") or 0.0),
+                                         float(pp.get("end") or 0.0)))
+        row.label(text="loop %g" % float(pp.get("loop") or 0.0))
+
+
+class VTMB_PT_poseparams(bpy.types.Panel):
+    bl_label = "VTMB pose parameters"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_armature_params(self.layout, context.object)
 
 
 FLAGS_ATTR = "vtmb_bone_flags"
@@ -785,10 +931,10 @@ def _fallback_line(act):
 
 
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
-           VTMB_OT_add_event, VTMB_OT_remove_event,
+           VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
-           VTMB_PT_armature, VTMB_PT_actions, VTMB_PT_action,
-           VTMB_PT_action_events,
+           VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
+           VTMB_PT_action_events, VTMB_PT_action_params,
            VTMB_PT_bone_flags, VTMB_PT_bone]
 
 _PROPS = (

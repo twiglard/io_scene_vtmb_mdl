@@ -1081,6 +1081,24 @@ def apply_springbones(d, m, arm_obj):
     return changed
 
 
+def _apply_params(rec, params, names, where):
+    """One sequence's paramindex/paramstart/paramend, resolved back from names.
+
+    The resolve and its refusal live in `mdl_build` beside the rest of the record
+    layout, so a check can reach them without Blender.
+    """
+    if params is None:
+        return 0
+    idx, start, end = build_mod.encode_params(params, names, "sequence %r: " % where)
+    was = (struct.unpack_from("<2i", rec.raw, mdl_mod.SEQ_PARAMINDEX),
+           struct.unpack_from("<2f", rec.raw, mdl_mod.SEQ_PARAMSTART),
+           struct.unpack_from("<2f", rec.raw, mdl_mod.SEQ_PARAMEND))
+    struct.pack_into("<2i", rec.raw, mdl_mod.SEQ_PARAMINDEX, *idx)
+    struct.pack_into("<2f", rec.raw, mdl_mod.SEQ_PARAMSTART, *start)
+    struct.pack_into("<2f", rec.raw, mdl_mod.SEQ_PARAMEND, *end)
+    return 1 if was != (tuple(idx), tuple(start), tuple(end)) else 0
+
+
 def apply_sequences(d, arm_obj, anim_names):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
@@ -1098,6 +1116,7 @@ def apply_sequences(d, arm_obj, anim_names):
         raise ValueError("the armature carries %d sequences and the file has %d"
                          % (len(stash), len(d.seqs)))
     index = {n: k for k, n in enumerate(anim_names)}
+    pp = [r.name or "" for r in getattr(d, "poseparams", [])]
     n = 0
     for rec, s in zip(d.seqs, stash):
         label, activity = s.get("label"), s.get("activity")
@@ -1126,6 +1145,7 @@ def apply_sequences(d, arm_obj, anim_names):
                     n += 1
                 struct.pack_into("<h", rec.raw, at, a)
         n += _apply_events(rec, s.get("events"))
+        n += _apply_params(rec, s.get("params"), pp, rec.name)
     return n
 
 

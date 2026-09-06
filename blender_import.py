@@ -210,6 +210,9 @@ def build_armature(context, m, name, scale, root_motion=True):
     arm_obj["vtmb_includes"] = list(m.includes)
     # Per-model and not per-material, so nothing else in the scene can carry it back out.
     arm_obj["vtmb_cdtexture"] = list(m.material_paths)
+    arm_obj["vtmb_poseparams"] = [
+        {"name": pp.name, "flags": pp.flags, "start": pp.start, "end": pp.end,
+         "loop": pp.loop} for pp in m.poseparams]
     arm_obj["vtmb_sequences"] = sequence_stash(m)
     # The user's answer to "was the travel applied to the keys". The count that goes with
     # it is stamped in import_mdl, once the imported actions are known.
@@ -218,10 +221,11 @@ def build_armature(context, m, name, scale, root_motion=True):
 
 
 def sequence_stash(m):
-    """`arm["vtmb_sequences"]` for a file: label, activity, group size and the blend grid.
+    """`arm["vtmb_sequences"]` for a file: label, activity, group size, the blend grid,
+    the events and which pose parameter drives each blend axis.
 
-    Blends are stored as animation names because an index means nothing once the file is
-    re-emitted. Matched back by position, so anything that changes how many sequences the
+    Blends and pose parameters are stored as names because an index means nothing once the
+    file is re-emitted. Matched back by position, so anything that changes how many sequences the
     file has has to write this again -- `apply_sequences` refuses a stash claiming more
     sequences than are there.
     """
@@ -230,7 +234,12 @@ def sequence_stash(m):
              "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
                          for i in col] for col in s.blends],
              "events": [{"cycle": e.cycle, "event": e.event, "type": e.type,
-                         "options": e.options} for e in s.events]}
+                         "options": e.options} for e in s.events],
+             "params": [{"name": (m.poseparams[i].name
+                                  if 0 <= i < len(m.poseparams) else ""),
+                         "start": st, "end": en}
+                        for i, st, en in zip(s.paramindex, s.paramstart,
+                                             s.paramend)]}
             for s in m.seqs]
 
 

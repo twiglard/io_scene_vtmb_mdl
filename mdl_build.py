@@ -2203,6 +2203,35 @@ def add_sequence(d, label, anim, activity=None, flags=0):
     return len(d.seqs) - 1
 
 
+def encode_params(params, names, where=""):
+    """[{name, start, end}] x2 -> (paramindex, paramstart, paramend) for one seqdesc.
+
+    -1 is what 13724 of the 14012 shipped sequences carry at paramindex and the only
+    value Studio_LocalPoseParameter short-circuits on, so an axis naming nothing gets
+    it. A name the file does not carry is refused rather than written as -1: that
+    function compares no index against numposeparameters in any of the three modules
+    that carry it, so a wrong index reads past the array -- and 0 of 14012 shipped
+    sequences name a pose parameter their model does not have.
+
+    The array itself is carried through the rebuild and is not authored from a scene:
+    what reads `move_yaw` and `hit_yaw` at runtime is not located, so an invented name
+    would drive nothing.
+    """
+    idx, start, end = [-1, -1], [0.0, 0.0], [0.0, 0.0]
+    for k, p in enumerate(list(params or ())[:2]):
+        name = str(p.get("name") or "")
+        if not name:
+            continue
+        if name not in names:
+            raise Refused("%spose parameter %r on axis %d is not one the file carries -- "
+                          "it has %s"
+                          % (where, name, k, ", ".join(n for n in names if n) or "none"))
+        idx[k] = names.index(name)
+        start[k] = float(p.get("start") or 0.0)
+        end[k] = float(p.get("end") or 0.0)
+    return idx, start, end
+
+
 def encode_events(events, where=""):
     """[{cycle, event, type, options}] -> the 76-byte mstudioevent_t records.
 
