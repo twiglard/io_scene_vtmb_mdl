@@ -330,6 +330,12 @@ class _EditedBones(object):
     def __init__(self, m, d):
         self._m = m
         self.bones = build_mod._skeleton(d).bones
+        # {removed bone: its parent}, both file names, carried across a second wrap.
+        have = {b.name for b in self.bones}
+        self.gone = dict(getattr(m, "gone", {}))
+        for b in m.bones:
+            if b.name not in have:
+                self.gone[b.name] = m.bones[b.parent].name if b.parent >= 0 else None
 
     def __getattr__(self, name):
         return getattr(self._m, name)
@@ -1148,13 +1154,23 @@ def eyeball_objects(arm_obj):
 
 
 def _accessory_bone(obj, m, arm_obj, bmap, what):
-    """The file bone index an accessory empty is mounted on, refusing an unresolvable one."""
+    """The file bone index an accessory empty is mounted on.
+
+    An empty whose bone Blender deleted passes to the first surviving ancestor, which is
+    where `remove_bone` already put the file's own record.
+    """
     want = obj.parent_bone if obj.parent_type == "BONE" else ""
     if not want:
         raise ValueError("%s %r is not parented to a bone" % (what, obj.name))
     for b in m.bones:
         if bmap.get(b.name) == want:
             return b.index
+    gone = getattr(m, "gone", {})
+    name = want
+    while name in gone:
+        name = gone[name]
+        if name in bmap:
+            return next(b.index for b in m.bones if b.name == name)
     raise ValueError("%s %r is on bone %r, which is not one this model carries"
                      % (what, obj.name, want))
 
