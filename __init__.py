@@ -1197,6 +1197,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                       % (scene["bones"], scene["materials"], scene["sequences"]))
         if scene["springs"]:
             extra += "; retuned %d spring bone fields" % scene["springs"]
+        if scene.get("face"):
+            extra += ("; rewrote %d eyeball or mouth record%s"
+                      % (scene["face"], "" if scene["face"] == 1 else "s"))
+        if scene.get("flex") and scene["flex"][0] + scene["flex"][1]:
+            nc, nr, added = scene["flex"]
+            extra += ("; wrote %d flex controller%s and %d rule%s"
+                      % (nc, "" if nc == 1 else "s", nr, "" if nr == 1 else "s"))
+            if added:
+                extra += " (%d new flexdesc%s)" % (added, "" if added == 1 else "es")
         if scene["added_materials"]:
             extra += ("; added %d material%s: %s"
                       % (len(scene["added_materials"]),

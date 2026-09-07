@@ -7,6 +7,7 @@ evidence is in plans/todo-ghidra-vtmb-recon.md sections 19 and 21.
 
 import math
 import os
+import re
 import struct
 import sys
 
@@ -28,15 +29,142 @@ HDR_NUMCDTEXTURES = 300
 HDR_NUMSKINREF = 308
 HDR_NUMBODYPARTS = 320
 HDR_NUMFLEXDESC = 344
+HDR_NUMFLEXCONTROLLERS = 352
+HDR_NUMFLEXRULES = 360
 HDR_NUMHITBOXSETS = 256
 HDR_NUMATTACHMENTS = 328
 HDR_NUMINCLUDEMODELS = 404
 HDR_NUMSPRINGBONES = 396
 HDR_NUMPOSEPARAMS = 384
+HDR_NUMMOUTHS = 376
 
 # Measured, not from Valve: the record is 116 bytes with the name offset at +0, and no
 # other stride parses the corpus. The 24 trailing -1s are the pose-parameter remap.
 INCLUDE_STRIDE = 116
+
+FLEXCTRL_STRIDE = 20
+FLEXRULE_STRIDE = 12
+FLEXOP_STRIDE = 8
+
+# client.dll 100c3dd3 dispatches op-1 through the 7-entry table at 100c3ee8, so the numbering
+# is measured and not inherited from the 2003 tree.
+STUDIO_CONST, STUDIO_FETCH1, STUDIO_FETCH2 = 1, 2, 3
+STUDIO_ADD, STUDIO_SUB, STUDIO_MUL, STUDIO_DIV = 4, 5, 6, 7
+_BINOP = {STUDIO_ADD: "+", STUDIO_SUB: "-", STUDIO_MUL: "*", STUDIO_DIV: "/"}
+_PREC = {STUDIO_ADD: 1, STUDIO_SUB: 1, STUDIO_MUL: 2, STUDIO_DIV: 2}
+_OPOF = {v: k for k, v in _BINOP.items()}
+
+
+def flex_expr(ops, controllers, flexdescs):
+    """The op block as studiomdl's own QC expression, or None if the stack does not balance.
+
+    Option_Flexrule (studiomdl.cpp:2914) is the syntax: a bare identifier is a flex
+    controller, `%name` is a flexdesc, and precedence is +- 1, */ 2.
+    """
+    st = []
+    for op, raw in ops:
+        if op == STUDIO_CONST:
+            st.append((repr(round(struct.unpack("<f", struct.pack("<i", raw))[0], 6)), 3))
+        elif op == STUDIO_FETCH1:
+            if not 0 <= raw < len(controllers):
+                return None
+            st.append((controllers[raw].name, 3))
+        elif op == STUDIO_FETCH2:
+            if not 0 <= raw < len(flexdescs):
+                return None
+            st.append(("%" + flexdescs[raw], 3))
+        elif op in _BINOP:
+            if len(st) < 2:
+                return None
+            (rt, rp), (lt, lp) = st.pop(), st.pop()
+            p = _PREC[op]
+            # A right operand at equal precedence has to keep its parentheses: - and / are
+            # not associative, and + and * only look it up to float rounding.
+            st.append(("%s %s %s" % (("(%s)" % lt) if lp < p else lt, _BINOP[op],
+                                     ("(%s)" % rt) if rp <= p else rt), p))
+        else:
+            return None
+    return st[0][0] if len(st) == 1 else None
+
+
+_TOK = re.compile(r"\s*(%?[A-Za-z_][A-Za-z0-9_]*|[0-9.][0-9.eE+-]*|[()+*/-])")
+
+
+def parse_flex_expr(text, controllers, flexdescs):
+    """A QC expression back to [(op, raw)], raising ValueError with the offending token.
+
+    Names are matched case-insensitively, the way all three stricmp lookups in
+    Option_Flexrule are.
+    """
+    toks, i = [], 0
+    while i < len(text):
+        m = _TOK.match(text, i)
+        if not m:
+            if text[i:].strip():
+                raise ValueError("cannot read %r" % text[i:])
+            break
+        toks.append(m.group(1))
+        i = m.end()
+    ctl = {c.name.lower(): k for k, c in enumerate(controllers)}
+    fdx = {n.lower(): k for k, n in enumerate(flexdescs)}
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+
+    def atom():
+        t = peek()
+        if t is None:
+            raise ValueError("the expression ends where a value was expected")
+        pos[0] += 1
+        if t == "(":
+            v = expr(1)
+            if peek() != ")":
+                raise ValueError("unclosed (")
+            pos[0] += 1
+            return v
+        if t == "-":
+            # Unary minus: studiomdl has none, so it is written out as 0 - x.
+            return [(STUDIO_CONST, struct.unpack("<i", struct.pack("<f", 0.0))[0])]                 + atom() + [(STUDIO_SUB, 0)]
+        if t[0] == "%":
+            k = fdx.get(t[1:].lower())
+            if k is None:
+                raise ValueError("no flex named %r" % t[1:])
+            return [(STUDIO_FETCH2, k)]
+        if t[0].isdigit() or t[0] == ".":
+            return [(STUDIO_CONST, struct.unpack("<i", struct.pack("<f", float(t)))[0])]
+        k = ctl.get(t.lower())
+        if k is None:
+            raise ValueError("no flex controller named %r" % t)
+        return [(STUDIO_FETCH1, k)]
+
+    def expr(p):
+        out = atom() if p > 2 else expr(p + 1)
+        while peek() in _OPOF and _PREC[_OPOF[peek()]] == p:
+            op = _OPOF[toks[pos[0]]]
+            pos[0] += 1
+            out = out + (atom() if p > 1 else expr(p + 1)) + [(op, 0)]
+        return out
+
+    out = expr(1)
+    if pos[0] != len(toks):
+        raise ValueError("trailing %r" % " ".join(toks[pos[0]:]))
+    return out
+
+
+class FlexController:
+    __slots__ = ("index", "name", "type", "link", "min", "max")
+
+    def __repr__(self):
+        return "<FlexController %s %s>" % (self.type, self.name)
+
+
+class FlexRule:
+    __slots__ = ("index", "flex", "name", "ops", "expr")
+
+    def __repr__(self):
+        return "<FlexRule %s = %s>" % (self.name, self.expr)
+
 
 HITBOXSET_STRIDE = 12
 ATTACHMENT_STRIDE = 60
@@ -73,6 +201,22 @@ POSEPARAM_STRIDE = 20
 SEQ_PARAMINDEX = 0x244
 SEQ_PARAMSTART = 0x24c
 SEQ_PARAMEND = 0x254
+SEQ_ENTRYNODE = 0x270
+SEQ_ENTRYPHASE = 0x27c
+SEQ_NUMAUTOLAYERS = 0x294
+SEQ_STATREQUIRED = 0x2b8
+SEQ_NUMHITVOLUMES = 0x2bc
+SEQ_NUMKNOCKBACKS = 0x2c4
+SEQ_MELEERANGE = 0x2cc
+SEQ_SEQSELECTMASK = 0x2d4
+SEQ_SZDODGE = 0x2dc
+SEQ_SZBLOCK = 0x2e4
+SEQ_SZNAME2E8 = 0x2e8
+SEQ_SZNAME2EC = 0x2ec
+SEQ_CYCLEWINDOW = 0x2f0
+
+HITVOLUME_STRIDE = 24
+KNOCKBACK_STRIDE = 188
 
 MOVEMENT_STRIDE = 44
 
@@ -83,6 +227,8 @@ TEXTURE_STRIDE = 20
 BODYPART_STRIDE = 16
 MODEL_STRIDE = 224
 MESH_STRIDE = 60
+EYEBALL_STRIDE = 140
+MOUTH_STRIDE = 20
 MESH_NUMFLEXES = 0x10
 
 FLEX_STRIDE = 32
@@ -275,7 +421,31 @@ class Movement:
 
 class Seq:
     __slots__ = ("index", "label", "activity", "flags", "groupsize", "blends",
-                 "bbmin", "bbmax", "events", "paramindex", "paramstart", "paramend")
+                 "bbmin", "bbmax", "events", "paramindex", "paramstart", "paramend",
+                 "autolayers", "hitvolumes", "knockbacks", "entrynode", "exitnode",
+                 "nodeflags", "entryphase", "exitphase", "dodge", "block", "name2e8",
+                 "name2ec", "statrequired", "seqselectmask", "meleerange", "cyclewindow")
+
+
+class HitVolume:
+    """One of `numhitvolumes` axis-aligned boxes a melee sequence sweeps.
+
+    Read as AABB-vs-AABB overlap against the target's world box by
+    `CBaseCombatCharacter::ChooseMeleeAttackSequence`, vampire.dll 10347180.  About 14%
+    of the shipped records are axis-inverted and can never pass that test.
+    """
+    __slots__ = ("bbmin", "bbmax")
+
+
+class Knockback:
+    """One `mstudioknockback_t`, 188 bytes off `mstudioseqdesc_t` +0x2c4/+0x2c8.
+
+    `activities` is the 4x4 grid of activity-name strings at +0x78, each row cut to the
+    count at +0x28 + row*4, matching what `Studio_ResolveSequenceActivities_vtmb` walks.
+    `raw` is the whole record, because most of it has no scene representation and has to
+    go back out verbatim.
+    """
+    __slots__ = ("index", "bone", "cycleend", "counts", "activities", "raw")
 
 
 class PoseParam:
@@ -322,7 +492,39 @@ class VertAnim:
 class Model:
     __slots__ = ("index", "name", "nummeshes", "numvertices", "vertexbase",
                  "tangentbase", "filetype", "quant_offset", "quant_scale", "meshes",
-                 "cloths", "clothrows", "clothcols")
+                 "cloths", "clothrows", "clothcols", "eyeballs")
+
+
+class Eyeball:
+    """One mstudioeyeball_t.
+
+    `iris_name` and `glint_name` are the mstudiotexture_t names the two material indices
+    land on; a writer resolves them back by name. `lidflexes` is the eight lid indices
+    resolved through mstudioflexdesc_t, or None where all eight are 0.
+
+    Over the 602 shipped records not one of the eight is negative and none is partly
+    written: all eight are set on 392 records and all eight are 0 on 210. The two written
+    families are the right eye -- upperflexdesc (1, 2, 3), lowerflexdesc (5, 6, 7),
+    upperlidflexdesc 0, lowerlidflexdesc 4 -- and the left, the same eight plus 8. WHICH
+    EYEBALL SLOT CARRIES WHICH SIDE IS NOT FIXED: 158 models put the right eye first and 38
+    the left, so the side comes from the resolved names and never from the slot.
+    """
+    __slots__ = ("index", "name", "bone", "org", "zoffset", "radius", "up", "forward",
+                 "texture", "iris_material", "iris_name", "iris_scale", "glint_material",
+                 "glint_name", "upperflexdesc", "lowerflexdesc", "uppertarget",
+                 "lowertarget", "upperlidflexdesc", "lowerlidflexdesc", "lidflexes",
+                 "pitch", "yaw")
+
+
+class Mouth:
+    """The one mstudiomouth_t a model may carry -- nummouths is 0 or 1, never more.
+
+    `name` is the mstudioflexdesc_t the index lands on, which is `mouth` on 200 of 200
+    shipped records; the four whose index is 0 are models that list `mouth` first, not
+    models that left the field unwritten. `bone` resolves to `Bip01 Head` on 200 of 200 and
+    `forward` is (0, -1, 0) on 200 of 200.
+    """
+    __slots__ = ("bone", "forward", "flexdesc", "name")
 
 
 class Cloth:
@@ -405,7 +607,10 @@ class Mdl:
         self._read_poseparams()
         self._read_materials()
         self._read_flexdescs()
+        self._read_flexcontrollers()
+        self._read_flexrules()
         self._read_bodyparts()
+        self._read_mouth()
         self._read_hitboxsets()
         self._read_attachments()
         self._read_includes()
@@ -474,7 +679,77 @@ class Mdl:
         s.paramindex = list(struct.unpack_from("<2i", d, off + SEQ_PARAMINDEX))
         s.paramstart = list(struct.unpack_from("<2f", d, off + SEQ_PARAMSTART))
         s.paramend = list(struct.unpack_from("<2f", d, off + SEQ_PARAMEND))
+        s.entrynode, s.exitnode, s.nodeflags = struct.unpack_from("<3i", d, off + SEQ_ENTRYNODE)
+        s.entryphase, s.exitphase = struct.unpack_from("<2f", d, off + SEQ_ENTRYPHASE)
+        s.statrequired = struct.unpack_from("<i", d, off + SEQ_STATREQUIRED)[0]
+        s.seqselectmask = struct.unpack_from("<i", d, off + SEQ_SEQSELECTMASK)[0]
+        s.meleerange = list(struct.unpack_from("<2f", d, off + SEQ_MELEERANGE))
+        s.cyclewindow = list(struct.unpack_from("<3f", d, off + SEQ_CYCLEWINDOW))
+        # `> 0`, not `!= -1`: the engine guards with `if (-1 < value)`, so 0 passes there
+        # and dereferences the record's own first byte.
+        for name, at in (("dodge", SEQ_SZDODGE), ("block", SEQ_SZBLOCK),
+                         ("name2e8", SEQ_SZNAME2E8), ("name2ec", SEQ_SZNAME2EC)):
+            v = struct.unpack_from("<i", d, off + at)[0]
+            setattr(s, name, self._cstr(off + v) if v > 0 else None)
+        s.autolayers = self._read_autolayers(off)
+        s.hitvolumes = self._read_hitvolumes(off)
+        s.knockbacks = self._read_knockbacks(off)
         return s
+
+    def _read_autolayers(self, off):
+        """`int[numautolayers]`, each a sequence index this one drags along."""
+        d = self.d
+        n, idx = struct.unpack_from("<2i", d, off + SEQ_NUMAUTOLAYERS)
+        if not 0 < n < 64 or off + idx + n * 4 > len(d):
+            return []
+        return list(struct.unpack_from("<%di" % n, d, off + idx))
+
+    def _read_hitvolumes(self, off):
+        """Six floats per record, bbmin then bbmax.
+
+        Seven shipped sequences hold studiomdl's 768-byte write cursor in both the count
+        and the index and decode to denormals; all seven carry `numknockbacks` 0, which is
+        the same test vampire.dll 103ea982 puts in front of the only reader that is
+        bounded by it.
+        """
+        d = self.d
+        if struct.unpack_from("<i", d, off + SEQ_NUMKNOCKBACKS)[0] <= 0:
+            return []
+        n, idx = struct.unpack_from("<2i", d, off + SEQ_NUMHITVOLUMES)
+        if n <= 0 or off + idx + n * HITVOLUME_STRIDE > len(d):
+            return []
+        out = []
+        for k in range(n):
+            o = off + idx + k * HITVOLUME_STRIDE
+            hv = HitVolume()
+            hv.bbmin = struct.unpack_from("<3f", d, o)
+            hv.bbmax = struct.unpack_from("<3f", d, o + 12)
+            out.append(hv)
+        return out
+
+    def _read_knockbacks(self, off):
+        d = self.d
+        n, idx = struct.unpack_from("<2i", d, off + SEQ_NUMKNOCKBACKS)
+        if n <= 0 or off + idx + n * KNOCKBACK_STRIDE > len(d):
+            return []
+        out = []
+        for k in range(n):
+            o = off + idx + k * KNOCKBACK_STRIDE
+            kb = Knockback()
+            kb.index = k
+            kb.bone = struct.unpack_from("<i", d, o + 0x08)[0]
+            kb.cycleend = struct.unpack_from("<f", d, o + 0x04)[0]
+            kb.counts = list(struct.unpack_from("<4i", d, o + 0x28))
+            kb.activities = []
+            for g in range(4):
+                row = []
+                for t in range(4):
+                    v = struct.unpack_from("<i", d, o + 0x78 + (g * 4 + t) * 4)[0]
+                    row.append(self._cstr(o + v) if t < min(abs(kb.counts[g]), 4) else None)
+                kb.activities.append(row)
+            kb.raw = bytes(d[o:o + KNOCKBACK_STRIDE])
+            out.append(kb)
+        return out
 
     def _read_poseparams(self):
         """studiohdr_t's mstudioposeparamdesc_t array, empty on 3994 of 4445 models.
@@ -576,7 +851,62 @@ class Mdl:
             e.flexes = self._read_flexes(eo)
             m.meshes.append(e)
         self._read_cloths(off, m, meshindex)
+        self._read_eyeballs(off, m)
         return m
+
+    def _read_eyeballs(self, off, m):
+        """Every mstudioeyeball_t of one model, materials and lid flexes resolved by name."""
+        d = self.d
+        m.eyeballs = []
+        n, idx = struct.unpack_from("<2i", d, off + 0xc0)
+        for k in range(n):
+            eo = off + idx + k * EYEBALL_STRIDE
+            e = Eyeball()
+            e.index = k
+            sz = struct.unpack_from("<i", d, eo)[0]
+            e.name = self._cstr(eo + sz) if sz else ""
+            e.bone = struct.unpack_from("<i", d, eo + 0x04)[0]
+            e.org = struct.unpack_from("<3f", d, eo + 0x08)
+            e.zoffset, e.radius = struct.unpack_from("<2f", d, eo + 0x14)
+            e.up = struct.unpack_from("<3f", d, eo + 0x1c)
+            e.forward = struct.unpack_from("<3f", d, eo + 0x28)
+            e.texture, e.iris_material = struct.unpack_from("<2i", d, eo + 0x34)
+            e.iris_scale = struct.unpack_from("<f", d, eo + 0x3c)[0]
+            e.glint_material = struct.unpack_from("<i", d, eo + 0x40)[0]
+            e.iris_name = self._texname(e.iris_material)
+            e.glint_name = self._texname(e.glint_material)
+            e.upperflexdesc = struct.unpack_from("<3i", d, eo + 0x44)
+            e.lowerflexdesc = struct.unpack_from("<3i", d, eo + 0x50)
+            e.uppertarget = struct.unpack_from("<3f", d, eo + 0x5c)
+            e.lowertarget = struct.unpack_from("<3f", d, eo + 0x68)
+            e.upperlidflexdesc, e.lowerlidflexdesc =                 struct.unpack_from("<2i", d, eo + 0x74)
+            e.pitch = struct.unpack_from("<2f", d, eo + 0x7c)
+            e.yaw = struct.unpack_from("<2f", d, eo + 0x84)
+            ids = (list(e.upperflexdesc) + list(e.lowerflexdesc)
+                   + [e.upperlidflexdesc, e.lowerlidflexdesc])
+            # All eight zero is the only way a shipped record says "no lid flexes"; the
+            # right eye's upperlidflexdesc is a genuine 0, so a lone 0 is not absence.
+            e.lidflexes = None if not any(ids) else tuple(
+                self.flexdescs[i] if 0 <= i < len(self.flexdescs) else None for i in ids)
+            m.eyeballs.append(e)
+
+    def _texname(self, i):
+        return self.materials[i] if 0 <= i < len(self.materials) else None
+
+    def _read_mouth(self):
+        """The one mstudiomouth_t, or None. nummouths is 0 or 1 over the whole corpus."""
+        d = self.d
+        self.mouth = None
+        n, idx = struct.unpack_from("<2i", d, HDR_NUMMOUTHS)
+        if n <= 0:
+            return
+        w = Mouth()
+        w.bone = struct.unpack_from("<i", d, idx)[0]
+        w.forward = struct.unpack_from("<3f", d, idx + 4)
+        w.flexdesc = struct.unpack_from("<i", d, idx + 0x10)[0]
+        w.name = (self.flexdescs[w.flexdesc]
+                  if 0 <= w.flexdesc < len(self.flexdescs) else None)
+        self.mouth = w
 
     def _read_cloths(self, off, m, meshindex):
         """Every mstudiocloth_t of one model, and the per-mesh binding that names them.
@@ -640,6 +970,38 @@ class Mdl:
         self.flexdescs = [self._cstr(idx + i * 4
                                      + struct.unpack_from("<i", self.d, idx + i * 4)[0])
                           for i in range(n)]
+
+    def _read_flexcontrollers(self):
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMFLEXCONTROLLERS)
+        self.flexcontrollers = []
+        for i in range(n):
+            o = idx + i * FLEXCTRL_STRIDE
+            c = FlexController()
+            c.index = i
+            # Both string offsets are relative to the START of the record, which
+            # client.dll 100c435b reads that way for sznameindex.  A field-relative read
+            # shifts every name four characters and still decodes.
+            c.type = self._cstr(o + struct.unpack_from("<i", d, o)[0])
+            c.name = self._cstr(o + struct.unpack_from("<i", d, o + 4)[0])
+            c.link, c.min, c.max = struct.unpack_from("<iff", d, o + 8)
+            self.flexcontrollers.append(c)
+
+    def _read_flexrules(self):
+        d = self.d
+        n, idx = struct.unpack_from("<ii", d, HDR_NUMFLEXRULES)
+        self.flexrules = []
+        for i in range(n):
+            o = idx + i * FLEXRULE_STRIDE
+            r = FlexRule()
+            r.index = i
+            r.flex, numops, opindex = struct.unpack_from("<3i", d, o)
+            r.name = (self.flexdescs[r.flex]
+                      if 0 <= r.flex < len(self.flexdescs) else None)
+            r.ops = [struct.unpack_from("<2i", d, o + opindex + k * FLEXOP_STRIDE)
+                     for k in range(numops)]
+            r.expr = flex_expr(r.ops, self.flexcontrollers, self.flexdescs)
+            self.flexrules.append(r)
 
     def _read_flexes(self, mesh_off):
         """Every mstudioflex_t of one mesh, payload decoded."""

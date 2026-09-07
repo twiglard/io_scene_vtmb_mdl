@@ -218,18 +218,44 @@ def build_armature(context, m, name, scale, root_motion=True):
     # The user's answer to "was the travel applied to the keys". The count that goes with
     # it is stamped in import_mdl, once the imported actions are known.
     arm_obj["vtmb_root_motion"] = bool(root_motion)
+    # nummouths is 0 or 1 over the whole corpus.  The bone goes in by NAME and the flex by
+    # name too: the index is 16 on 196 of the 200 shipped records and 0 on 4 that simply
+    # list `mouth` first, so an index would say the wrong thing about either.
+    if m.mouth is not None and 0 <= m.mouth.bone < len(m.bones):
+        arm_obj["vtmb_mouth"] = {
+            "bone": m.bones[m.mouth.bone].name,
+            "forward": list(m.mouth.forward),
+            "flex": m.mouth.name or "",
+        }
+    # Both lists are studiomdl's own QC lines, which is the only syntax there is for
+    # either -- Option_Flexcontroller and Option_Flexrule, studiomdl.cpp:2875 and :2914.
+    # A controller is identified across models by its NAME alone: client.dll 100c4351
+    # looks each one up in a process-global name table and writes the row it lands in
+    # back into the record's `link`, which every shipped file leaves at -1.
+    arm_obj["vtmb_flexcontrollers"] = [_flexctrl_line(c) for c in m.flexcontrollers]
+    # A rule drives a FLEXDESC, not a shape key: one flexdesc is a flex record on every
+    # mesh that morphs, so the rule belongs to the model and is keyed by name here.
+    arm_obj["vtmb_flexrules"] = ["%s = %s" % (r.name, r.expr)
+                                 for r in m.flexrules if r.name and r.expr]
     return arm_obj
+
+
+def _flexctrl_line(c):
+    """`$flexcontroller` without the command word: `<type> [range <min> <max>] <name>`."""
+    rng = "" if (c.min, c.max) == (0.0, 1.0) else "range %g %g " % (c.min, c.max)
+    return "%s %s%s" % (c.type, rng, c.name)
 
 
 def sequence_stash(m):
     """`arm["vtmb_sequences"]` for a file: label, activity, group size, the blend grid,
-    the events and which pose parameter drives each blend axis.
+    the events, which pose parameter drives each blend axis, and the record's tail.
 
-    Blends and pose parameters are stored as names because an index means nothing once the
-    file is re-emitted. Matched back by position, so anything that changes how many sequences the
-    file has has to write this again -- `apply_sequences` refuses a stash claiming more
-    sequences than are there.
+    Blends, pose parameters, autolayers and a knockback's bone are stored as names because
+    an index means nothing once the file is re-emitted. Matched back by position, so
+    anything that changes how many sequences the file has has to write this again --
+    `apply_sequences` refuses a stash claiming more sequences than are there.
     """
+    labels = [x.label for x in m.seqs]
     return [{"label": s.label, "activity": s.activity,
              "groupsize": list(s.groupsize),
              "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
@@ -240,7 +266,23 @@ def sequence_stash(m):
                                   if 0 <= i < len(m.poseparams) else ""),
                          "start": st, "end": en}
                         for i, st, en in zip(s.paramindex, s.paramstart,
-                                             s.paramend)]}
+                                             s.paramend)],
+             "autolayers": [labels[i] if 0 <= i < len(labels) else "" for i in s.autolayers],
+             "hitvolumes": [{"bbmin": list(h.bbmin), "bbmax": list(h.bbmax)}
+                            for h in s.hitvolumes],
+             "knockbacks": [{"bone": (m.bones[k.bone].name
+                                      if 0 <= k.bone < len(m.bones) else ""),
+                             "cycleend": k.cycleend,
+                             "activities": [[x or "" for x in row] for row in k.activities]}
+                            for k in s.knockbacks],
+             "node": [s.entrynode, s.exitnode, s.nodeflags],
+             "phase": [s.entryphase, s.exitphase],
+             "dodge": s.dodge or "", "block": s.block or "",
+             "name2e8": s.name2e8 or "", "name2ec": s.name2ec or "",
+             "statrequired": s.statrequired,
+             "seqselectmask": s.seqselectmask,
+             "meleerange": list(s.meleerange),
+             "cyclewindow": list(s.cyclewindow)}
             for s in m.seqs]
 
 
@@ -544,7 +586,8 @@ def build_accessories(context, m, arm_obj, name, scale):
     """
     dbs = arm_obj.data.bones
     made = []
-    if not m.attachments and not m.hitboxsets:
+    eyes = any(mo.eyeballs for bp in m.bodyparts for mo in bp.models)
+    if not m.attachments and not m.hitboxsets and not eyes:
         return made
     coll = _accessory_collection(context, arm_obj, name)
     for a in m.attachments:
@@ -563,6 +606,14 @@ def build_accessories(context, m, arm_obj, name, scale):
         obj["vtmb_attachment_type"] = a.type
         obj["vtmb_attachment_index"] = a.index
         made.append(obj)
+    for bp in m.bodyparts:
+        for model in bp.models:
+            for e in model.eyeballs:
+                obj = _eyeball_empty(m, e, model, arm_obj, name, scale, dbs)
+                if obj is not None:
+                    coll.objects.link(obj)
+                    _bone_child(obj, arm_obj, dbs[m.bones[e.bone].name])
+                    made.append(obj)
     for hs in m.hitboxsets:
         root = bpy.data.objects.new("%s.%s" % (name, hs.name or "default"), None)
         root.empty_display_type = "PLAIN_AXES"
@@ -592,6 +643,51 @@ def build_accessories(context, m, arm_obj, name, scale):
             obj["vtmb_hitbox_index"] = x.index
             made.append(obj)
     return made
+
+
+def _eyeball_empty(m, e, model, arm_obj, name, scale, dbs):
+    """One mstudioeyeball_t as a SPHERE empty in its bone's space.
+
+    `up` and `forward` are orthonormal on 602 of 602 shipped records -- worst
+    |up . forward| 5.1e-08, worst ||v|| - 1 1.2e-07 -- so a basis (up x forward, up,
+    forward) is a rotation and the export reads the two vectors straight back out of the
+    matrix.  Everything else the record holds is a custom property: the two material names,
+    because a writer resolves them by name and an index would go stale the moment a slot
+    moves, and the eight lid flexes by name for the same reason.
+
+    zoffset is 0 on 602 of 602 and pitch/yaw on 602 of 602, so neither is drawn; the
+    export writes both as zero.
+    """
+    if not 0 <= e.bone < len(m.bones):
+        return None
+    bone = dbs.get(m.bones[e.bone].name)
+    if bone is None:
+        return None
+    obj = bpy.data.objects.new("%s.eye%d" % (name, e.index), None)
+    obj.empty_display_type = "SPHERE"
+    obj.empty_display_size = max(e.radius * scale, 1e-4)
+    # NOT normalised: the export reads these two columns straight back, so normalising
+    # here would rewrite every record with values a hair off the donor's. They are
+    # orthonormal on 602 of 602 shipped records anyway, worst ||v|| - 1 = 1.16e-07.
+    up = mathutils.Vector(e.up)
+    fw = mathutils.Vector(e.forward)
+    right = up.cross(fw)
+    rot = mathutils.Matrix((right, up, fw)).transposed().to_4x4()
+    obj.matrix_basis = (mathutils.Matrix.Translation(
+        [c * scale for c in e.org]) @ rot)
+    obj["vtmb_eyeball"] = e.index
+    obj["vtmb_eyeball_model"] = model.name
+    obj["vtmb_eyeball_radius"] = e.radius
+    obj["vtmb_eyeball_iris_scale"] = e.iris_scale
+    obj["vtmb_eyeball_iris"] = e.iris_name or ""
+    obj["vtmb_eyeball_glint"] = e.glint_name or ""
+    obj["vtmb_eyeball_uppertarget"] = list(e.uppertarget)
+    obj["vtmb_eyeball_lowertarget"] = list(e.lowertarget)
+    # All eight zero is the only shipped way of saying "no lid flexes"; the right eye's
+    # own upperlidflexdesc is a genuine 0, so a lone 0 is not absence.
+    obj["vtmb_eyeball_lidflexes"] = ["" if x is None else x
+                                     for x in (e.lidflexes or ())]
+    return obj
 
 
 def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):

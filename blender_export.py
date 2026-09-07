@@ -13,6 +13,7 @@ the model. A mesh that did not move takes the index-for-index patch instead.
 
 import math
 import os
+import re
 import struct
 
 import bpy
@@ -1128,6 +1129,24 @@ def accessory_objects(arm_obj):
     return attach, boxes, names
 
 
+def eyeball_objects(arm_obj):
+    """The eyeball empties under one armature, in the order the file will carry them.
+
+    Keyed on `vtmb_eyeball_model` because an eyeball belongs to one mstudiomodel_t and the
+    scene has no other way to say which; an empty the scene added carries no model name and
+    lands on the first model the export writes.
+    """
+    out = {}
+    for obj in arm_obj.children_recursive:
+        if obj.get("vtmb_eyeball") is None:
+            continue
+        out.setdefault(str(obj.get("vtmb_eyeball_model") or ""), []).append(obj)
+    big = 1 << 30
+    for k in out:
+        out[k].sort(key=lambda o: (int(o.get("vtmb_eyeball", big)), o.name))
+    return out
+
+
 def _accessory_bone(obj, m, arm_obj, bmap, what):
     """The file bone index an accessory empty is mounted on, refusing an unresolvable one."""
     want = obj.parent_bone if obj.parent_type == "BONE" else ""
@@ -1192,6 +1211,212 @@ def read_hitboxsets(m, arm_obj, scale):
                          + tuple(a + b for a, b in zip(mid, half))))
         out.append((names.get(k, "default"), recs))
     return out
+
+
+# Assigning `matrix_basis` decomposes to loc/quaternion/scale in float32 and recomposes on
+# read, which moves a direction cosine by up to 4.3e-06 on jeanette -- enough to flip the
+# sign of a component that is itself 2.2e-06. That is far below anything an eyeball's aim
+# can mean and far above ACC_EPS, so the two unit vectors get their own absolute bound;
+# without it every re-export rewrites every eyeball record it did not touch.
+DIR_EPS = 1e-5
+
+
+def _same_dir(a, b):
+    return abs(a - b) <= DIR_EPS
+
+
+def _material_index(d, name):
+    """The mstudiotexture_t slot named `name`, appended if the file carries none."""
+    for i, r in enumerate(d.textures):
+        if r.name == name:
+            return i
+    build_mod.add_material(d, name, None)
+    return len(d.textures) - 1
+
+
+_FLEXCTRL_RE = re.compile(
+    r"^\s*(\S+)\s+(?:range\s+(\S+)\s+(\S+)\s+)?(\S+)\s*$")
+
+
+def apply_flex(d, m, arm_obj):
+    """The flex controller and flex rule arrays, rebuilt from the armature's QC lines.
+
+    (controllers, rules, added flexdescs). Raises Refused naming the line that would not
+    parse, rather than dropping it: a rule that silently vanishes takes a facial
+    expression with it and nothing downstream can tell.
+
+    `link` is written -1 the way studiomdl/write.cpp:943 does. The engine patches it in
+    place on first use (client.dll 100c4351) from a process-global name table, so the
+    value in the file is never read and the NAME is what identifies the controller.
+    """
+    lines = [str(x) for x in (arm_obj.get("vtmb_flexcontrollers") or ())]
+    rules = [str(x) for x in (arm_obj.get("vtmb_flexrules") or ())]
+    if not lines and not rules:
+        return 0, 0, 0
+
+    ctls = []
+    for line in lines:
+        mo = _FLEXCTRL_RE.match(line)
+        if not mo:
+            raise build_mod.Refused("flex controller %r is not `<type> [range <min> <max>] <name>`"
+                          % line)
+        t, lo, hi, name = mo.groups()
+        try:
+            lo = 0.0 if lo is None else float(lo)
+            hi = 1.0 if hi is None else float(hi)
+        except ValueError:
+            raise build_mod.Refused("flex controller %r has a range that is not two numbers" % line)
+        raw = bytearray(20)
+        struct.pack_into("<iff", raw, 8, -1, lo, hi)
+        ctls.append(build_mod.Rec(raw, name, None, {"type": t}))
+
+    names = [c.name for c in ctls]
+    added = 0
+    recs = []
+    # A rule the scene did not touch keeps the donor's own op bytes, so an unedited export
+    # reproduces the uninitialised `d` the file carries instead of writing 0 over it.
+    donor = {}
+    for r in d.flexrules:
+        donor.setdefault((struct.unpack_from("<i", r.raw, 0)[0],
+                          _op_key(r.extra["ops"])), []).append(r.extra["ops"])
+    for line in rules:
+        if "=" not in line:
+            raise build_mod.Refused("flex rule %r is not `<flexdesc> = <expression>`" % line)
+        target, expr = line.split("=", 1)
+        target = target.strip()
+        if not target:
+            raise build_mod.Refused("flex rule %r names no flex" % line)
+        before = len(d.flexdescs)
+        flex = build_mod.flexdesc_index(d, target)
+        added += len(d.flexdescs) - before
+        try:
+            ops = mdl_mod.parse_flex_expr(
+                expr, [_Named(n) for n in names],
+                [r.name or "" for r in d.flexdescs])
+        except ValueError as e:
+            raise build_mod.Refused("flex rule %r: %s" % (line, e))
+        raw = bytearray(12)
+        struct.pack_into("<i", raw, 0, flex)
+        blob = bytearray()
+        for op, val in ops:
+            blob += struct.pack("<2i", op, val)
+        keep = donor.get((flex, _op_key(blob)))
+        recs.append(build_mod.Rec(raw, None, None,
+                                  {"ops": keep.pop(0) if keep else bytes(blob)}))
+
+    d.flexcontrollers = ctls
+    d.flexrules = recs
+    return len(ctls), len(recs), added
+
+
+def _op_key(blob):
+    """The op stream with `d` dropped on the four binary opcodes.
+
+    That field is uninitialised in every shipped file -- non-zero on 40 685 of 41 362 --
+    and `client.dll 100c3de6/df9/e0c/e1c` read `+0x00` only, so two blocks agreeing
+    everywhere else are the same rule.  Anomalies A10.
+    """
+    return tuple((op, 0 if 4 <= op <= 7 else val)
+                 for op, val in struct.iter_unpack("<2i", bytes(blob)))
+
+
+class _Named(object):
+    """What `mdl.parse_flex_expr` reads off a controller, without an Mdl to read it from."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+
+def apply_face(d, m, arm_obj, scale):
+    """The eyeball records and the one mouth record, written only where they differ.
+
+    Every index a scene holds is a NAME here and is resolved against this file: the two
+    materials against mstudiotexture_t, the eight lid flexes and the mouth's flex against
+    mstudioflexdesc_t, the mouth's bone against the bone array. The corpus is why -- the
+    mouth's flexdesc is 16 on 196 of 200 records and 0 on 4 that list `mouth` first, and
+    the eyeball's own upperlidflexdesc is a genuine 0 on the right eye, so a stored index
+    would say the wrong thing about either the moment a slot moves.
+
+    zoffset (+0x14) and pitch/yaw (+0x7c, +0x84) are left at whatever the donor holds:
+    they are 0 on 602 of 602 shipped records and the QC `eyeball` command has no token
+    that sets them, so the scene draws neither.
+    """
+    changed = 0
+    eyes = eyeball_objects(arm_obj)
+    # A model record carries no name of its own in the description, so the name comes off
+    # the parsed file walked beside it -- same file, same order.
+    for bp, dbp in zip(m.bodyparts, d.bodyparts):
+        for model, mr in zip(bp.models, dbp.kids):
+            recs = (mr.extra or {}).get("eyes") or []
+            want = eyes.get(model.name) or eyes.get("")
+            if not recs or not want:
+                continue
+            for rec, obj in zip(recs, want):
+                changed += _apply_eyeball(d, rec, obj, scale)
+    mouth = arm_obj.get("vtmb_mouth")
+    if mouth and d.mouths:
+        raw = d.mouths[0].raw
+        bone = str(mouth.get("bone") or "")
+        bi = next((b.index for b in m.bones if b.name == bone), None)
+        flex = str(mouth.get("flex") or "")
+        have = struct.unpack_from("<i3fi", raw, 0)
+        fwd = tuple(float(c) for c in (mouth.get("forward") or (0.0, -1.0, 0.0)))
+        fi = build_mod.flexdesc_index(d, flex) if flex else have[4]
+        if bi is None:
+            raise ValueError("the mouth is on bone %r, which is not one this model carries"
+                             % bone)
+        if (have[0] != bi or have[4] != fi
+                or not all(_same(a, b) for a, b in zip(have[1:4], fwd))):
+            struct.pack_into("<i3fi", raw, 0, bi, fwd[0], fwd[1], fwd[2], fi)
+            changed += 1
+    return changed
+
+
+def _apply_eyeball(d, rec, obj, scale):
+    raw = rec.raw
+    local = obj.matrix_basis
+    org = tuple(local[r][3] / scale for r in range(3))
+    up = tuple(local.col[1][:3])
+    fw = tuple(local.col[2][:3])
+    radius = float(obj.get("vtmb_eyeball_radius")
+                   or obj.empty_display_size / (scale or 1.0))
+    iris = _material_index(d, str(obj.get("vtmb_eyeball_iris") or ""))
+    glint = _material_index(d, str(obj.get("vtmb_eyeball_glint") or ""))
+    iscale = float(obj.get("vtmb_eyeball_iris_scale") or 0.0)
+    upt = [float(c) for c in (obj.get("vtmb_eyeball_uppertarget") or (0.0, 0.0, 0.0))]
+    lot = [float(c) for c in (obj.get("vtmb_eyeball_lowertarget") or (0.0, 0.0, 0.0))]
+    lids = [str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ())]
+    # A shipped record says "no lid flexes" by holding zero in all eight, never -1, so an
+    # empty scene list writes eight zeros and not a sentinel.
+    ids = ([build_mod.flexdesc_index(d, x) if x else 0 for x in lids]
+           if len(lids) == 8 else [0] * 8)
+    have = (struct.unpack_from("<3f", raw, 0x08) + struct.unpack_from("<f", raw, 0x18)
+            + struct.unpack_from("<3f", raw, 0x1c) + struct.unpack_from("<3f", raw, 0x28)
+            + struct.unpack_from("<i", raw, 0x38) + struct.unpack_from("<f", raw, 0x3c)
+            + struct.unpack_from("<i", raw, 0x40) + struct.unpack_from("<6i", raw, 0x44)
+            + struct.unpack_from("<3f", raw, 0x5c) + struct.unpack_from("<3f", raw, 0x68)
+            + struct.unpack_from("<2i", raw, 0x74))
+    want = (org + (radius,) + up + fw + (iris, iscale, glint)
+            + tuple(ids[:6]) + tuple(upt) + tuple(lot) + tuple(ids[6:]))
+    # 0-2 org, 3 radius, 4-6 up, 7-9 forward, 10 iris, 11 iris_scale, 12 glint,
+    # 13-18 the six lid flexes, 19-21 uppertarget, 22-24 lowertarget, 25-26 the two lids.
+    ints = (10, 12, 13, 14, 15, 16, 17, 18, 25, 26)
+    if all((a == b) if i in ints else
+           (_same_dir(a, b) if 4 <= i <= 9 else _same(a, b))
+           for i, (a, b) in enumerate(zip(have, want))):
+        return 0
+    struct.pack_into("<3f", raw, 0x08, *org)
+    struct.pack_into("<f", raw, 0x18, radius)
+    struct.pack_into("<3f", raw, 0x1c, *up)
+    struct.pack_into("<3f", raw, 0x28, *fw)
+    struct.pack_into("<ifi", raw, 0x38, iris, iscale, glint)
+    struct.pack_into("<6i", raw, 0x44, *ids[:6])
+    struct.pack_into("<3f", raw, 0x5c, *upt)
+    struct.pack_into("<3f", raw, 0x68, *lot)
+    struct.pack_into("<2i", raw, 0x74, *ids[6:])
+    return 1
 
 
 def apply_accessories(d, m, arm_obj, scale):
@@ -1273,6 +1498,14 @@ def apply_sequences(d, arm_obj, anim_names):
                          % (len(stash), len(d.seqs)))
     index = {n: k for k, n in enumerate(anim_names)}
     pp = [r.name or "" for r in getattr(d, "poseparams", [])]
+    # Taken from the STASH, not from the file: a scene that renamed a sequence has to be
+    # able to name it in another sequence's autolayer list under the new name.
+    labels = {}
+    for k, s in enumerate(stash):
+        labels.setdefault(s.get("label") or (d.seqs[k].name or ""), k)
+    for k, rec in enumerate(d.seqs):
+        labels.setdefault(rec.name or "", k)
+    bones = {r.name: k for k, r in enumerate(d.bones)}
     n = 0
     for rec, s in zip(d.seqs, stash):
         label, activity = s.get("label"), s.get("activity")
@@ -1302,6 +1535,118 @@ def apply_sequences(d, arm_obj, anim_names):
                 struct.pack_into("<h", rec.raw, at, a)
         n += _apply_events(rec, s.get("events"))
         n += _apply_params(rec, s.get("params"), pp, rec.name)
+        n += _apply_seq_tail(rec, s, labels, bones)
+    return n
+
+
+_SEQ_SCALARS = (("statrequired", "<i", mdl_mod.SEQ_STATREQUIRED),
+                ("seqselectmask", "<i", mdl_mod.SEQ_SEQSELECTMASK),
+                ("node", "<3i", mdl_mod.SEQ_ENTRYNODE),
+                ("phase", "<2f", mdl_mod.SEQ_ENTRYPHASE),
+                ("meleerange", "<2f", mdl_mod.SEQ_MELEERANGE),
+                ("cyclewindow", "<3f", mdl_mod.SEQ_CYCLEWINDOW))
+
+
+def _apply_seq_tail(rec, s, labels, bones):
+    """The sequence record past the blend grid, out of the stash. Returns what moved.
+
+    The four string fields and the three arrays go through `rec.extra`, which is where
+    `mdl_build` re-emits them from; the scalars are packed straight into the 764-byte
+    record, whose pointer words `mdl_build` zeroes and re-patches on its own.
+    """
+    n = 0
+    for key, fmt, at in _SEQ_SCALARS:
+        v = s.get(key)
+        if v is None:
+            continue
+        # a Blender ID property array is neither a list nor a tuple
+        v = list(v) if hasattr(v, "__len__") and not isinstance(v, (str, bytes)) else [v]
+        if len(v) != struct.calcsize(fmt) // 4:
+            raise build_mod.Refused("sequence %r: %s wants %d number(s), the scene has %d"
+                                    % (rec.name, key, struct.calcsize(fmt) // 4, len(v)))
+        v = [int(x) if fmt.endswith("i") else float(x) for x in v]
+        if list(struct.unpack_from(fmt, rec.raw, at)) != v:
+            n += 1
+        struct.pack_into(fmt, rec.raw, at, *v)
+
+    for key, extra in (("dodge", "dodge"), ("block", "block"),
+                       ("name2e8", "seq2e8"), ("name2ec", "seq2ec")):
+        v = s.get(key)
+        if v is None:
+            continue
+        v = str(v) or None
+        if rec.extra.get(extra) != v:
+            rec.extra[extra], n = v, n + 1
+
+    al = s.get("autolayers")
+    if al is not None:
+        out = []
+        for name in al:
+            if str(name) not in labels:
+                raise build_mod.Refused(
+                    "sequence %r auto-layers %r, which the file has no sequence called"
+                    % (rec.name, str(name)))
+            out.append(labels[str(name)])
+        if list(rec.extra.get("autolayers") or []) != out:
+            rec.extra["autolayers"], n = out, n + 1
+
+    hv = s.get("hitvolumes")
+    if hv is not None:
+        blob = bytearray()
+        for h in hv:
+            blob += struct.pack("<6f", *(list(h["bbmin"]) + list(h["bbmax"])))
+        if bytes(rec.extra.get("hitvolumes") or b"") != bytes(blob):
+            rec.extra["hitvolumes"], n = bytes(blob), n + 1
+
+    n += _apply_knockbacks(rec, s.get("knockbacks"), bones)
+    return n
+
+
+def _apply_knockbacks(rec, kbs, bones):
+    """Bone, cycle end and the 4x4 activity grid, into the donor's own 188-byte records.
+
+    The other 170 bytes have no scene representation, so a stash whose count differs from
+    the file's is refused rather than half-written -- a new record would go out as zeroes
+    and the engine walks it unconditionally.
+    """
+    if kbs is None:
+        return 0
+    have = rec.extra.get("knockbacks") or []
+    if len(kbs) != len(have):
+        raise build_mod.Refused(
+            "sequence %r carries %d knockback record(s) in the scene and %d in the file; "
+            "the rest of each record is not in the scene, so the count cannot change"
+            % (rec.name, len(kbs), len(have)))
+    n = 0
+    for k, (src, dst) in enumerate(zip(kbs, have)):
+        name = str(src.get("bone") or "")
+        if name not in bones:
+            raise build_mod.Refused(
+                "knockback %d of sequence %r drives bone %r, which the armature has not got"
+                % (k, rec.name, name))
+        if struct.unpack_from("<i", dst.raw, 0x08)[0] != bones[name]:
+            n += 1
+        struct.pack_into("<i", dst.raw, 0x08, bones[name])
+        ce = float(src.get("cycleend", 0.0))
+        if struct.unpack_from("<f", dst.raw, 0x04)[0] != ce:
+            n += 1
+        struct.pack_into("<f", dst.raw, 0x04, ce)
+        counts = struct.unpack_from("<4i", dst.raw, 0x28)
+        flat = list(dst.extra.get("names") or [None] * 16)
+        for g, row in enumerate(src.get("activities") or []):
+            for t, txt in enumerate(row):
+                at = g * 4 + t
+                allowed = t < min(abs(counts[g]), 4)
+                if bool(txt) and not allowed:
+                    raise build_mod.Refused(
+                        "knockback %d of sequence %r names activity %r in slot %d of group "
+                        "%d, which its own count of %d does not reach"
+                        % (k, rec.name, str(txt), t, g, counts[g]))
+                v = str(txt) or None if allowed else None
+                if flat[at] != v:
+                    n += 1
+                flat[at] = v
+        dst.extra["names"] = flat
     return n
 
 
@@ -1638,6 +1983,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         scene["added_materials"].append(name)
     scene["springs"] = apply_springbones(d, m, arm_obj)
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
+    scene["face"] = apply_face(d, m, arm_obj, scale)
+    scene["flex"] = apply_flex(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     scene["sequences"] = apply_sequences(d, arm_obj, [r.name for r in d.anims])

@@ -507,6 +507,135 @@ def draw_accessories(lay, context, arm_obj):
                   icon="MESH_CUBE")
 
 
+def draw_face(lay, context, arm_obj):
+    """The mouth and the eyeballs, both named rather than indexed.
+
+    Nothing here is editable in place: the mouth's bone is the empty's parent and the
+    eyeball's own numbers are on the eyeball, which VTMB_PT_eyeball draws.
+    """
+    mouth = arm_obj.get("vtmb_mouth")
+    if mouth:
+        lay.label(text="mouth: flex %r on %s"
+                       % (str(mouth.get("flex") or "?"), str(mouth.get("bone") or "?")),
+                  icon="USER")
+    else:
+        lay.label(text="no mouth", icon="INFO")
+    eyes = blender_export.eyeball_objects(arm_obj)
+    n = sum(len(v) for v in eyes.values())
+    if not n:
+        lay.label(text="no eyeball", icon="INFO")
+        return
+    for model in sorted(eyes):
+        for obj in eyes[model]:
+            lids = list(obj.get("vtmb_eyeball_lidflexes") or ())
+            side = ("left" if any("_left" in str(x) for x in lids)
+                    else "right" if any("_right" in str(x) for x in lids)
+                    else "no lid flexes")
+            lay.label(text="eye %d on %s: %s, iris %s"
+                           % (int(obj.get("vtmb_eyeball") or 0),
+                              obj.parent_bone or "no bone", side,
+                              str(obj.get("vtmb_eyeball_iris") or "?")),
+                      icon="HIDE_OFF")
+
+
+class VTMB_PT_face(bpy.types.Panel):
+    bl_label = "VTMB eyeballs and mouth"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_face(self.layout, context, context.object)
+
+
+def draw_eyeball(lay, obj):
+    lay.label(text="eyeball %d of model %r"
+                   % (int(obj.get("vtmb_eyeball") or 0),
+                      str(obj.get("vtmb_eyeball_model") or "")), icon="HIDE_OFF")
+    lay.label(text="bone: %s" % (obj.parent_bone or "not parented to a bone"))
+    lay.label(text="radius %.4f (the empty's display size)"
+                   % float(obj.get("vtmb_eyeball_radius") or 0.0))
+    lay.label(text="iris %s at scale %.4f"
+                   % (str(obj.get("vtmb_eyeball_iris") or "?"),
+                      float(obj.get("vtmb_eyeball_iris_scale") or 0.0)))
+    lay.label(text="glint %s" % str(obj.get("vtmb_eyeball_glint") or "?"))
+    lids = [str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ())]
+    if not lids:
+        lay.label(text="no lid flexes", icon="INFO")
+        return
+    box = lay.box()
+    box.label(text="lid flexes")
+    for label, name in zip(("upper lowerer", "upper neutral", "upper raiser",
+                            "lower lowerer", "lower neutral", "lower raiser",
+                            "upper lid", "lower lid"), lids):
+        box.label(text="%s: %s" % (label, name or "-"))
+
+
+class VTMB_PT_eyeball(bpy.types.Panel):
+    bl_label = "VTMB eyeball"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None
+                and context.object.get("vtmb_eyeball") is not None)
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_eyeball(self.layout, context.object)
+
+
+def draw_flex(lay, arm_obj):
+    """The flex controllers and the flex rules, as the QC lines they are.
+
+    Both are stored as text because studiomdl's own syntax is the only syntax either has
+    -- Option_Flexcontroller and Option_Flexrule, studiomdl.cpp:2875 and :2914 -- and an
+    ID-property string is editable in place where a parsed structure would not be.
+    """
+    ctls = [str(x) for x in (arm_obj.get("vtmb_flexcontrollers") or ())]
+    rules = [str(x) for x in (arm_obj.get("vtmb_flexrules") or ())]
+    if not ctls and not rules:
+        lay.label(text="no flex controllers", icon="INFO")
+        return
+    box = lay.box()
+    box.label(text="%d flex controller(s)" % len(ctls), icon="DRIVER")
+    by_type = {}
+    for line in ctls:
+        by_type.setdefault(line.split(None, 1)[0] if line else "?", []).append(line)
+    for t in sorted(by_type):
+        box.label(text="%s: %s" % (t, ", ".join(x.rsplit(None, 1)[-1]
+                                                for x in by_type[t])))
+    box = lay.box()
+    box.label(text="%d flex rule(s)" % len(rules), icon="SHAPEKEY_DATA")
+    for line in rules:
+        box.label(text=line)
+
+
+class VTMB_PT_flex(bpy.types.Panel):
+    bl_label = "VTMB flex controllers"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_flex(self.layout, context.object)
+
+
 class VTMB_PT_accessories(bpy.types.Panel):
     bl_label = "VTMB attachments and hitboxes"
     bl_space_type = "PROPERTIES"
@@ -991,6 +1120,85 @@ def draw_action_events(lay, context, act):
     lay.operator("vtmb.add_event", icon="ADD")
 
 
+FLT_MAX = 3.4028234663852886e+38
+
+
+def _melee_text(lo, hi):
+    """`(FLT_MIN, FLT_MAX)` is the unbounded default, on 13431 of 14012 sequences."""
+    if hi >= FLT_MAX:
+        return "unbounded"
+    return "%g .. %g" % (lo, hi)
+
+
+def draw_action_seqtail(lay, context, act):
+    """The sequence record past the blend grid: what drags along, what melee reads, and
+    the four activity/sequence names the load-time fixup resolves.
+
+    Read-only. Every field here is an authored number with no default a scene can supply,
+    so the panel says what the file holds and the export writes it back unchanged.
+    """
+    arm_obj = _action_armature(context, act)
+    if arm_obj is None:
+        lay.label(text="no imported sequence names this action", icon="INFO")
+        return
+    _k, seq = _action_seq(arm_obj, act)
+
+    al = [str(x) for x in seq.get("autolayers") or ()]
+    box = lay.box()
+    box.label(text="auto-layers: %d" % len(al))
+    for name in al:
+        box.label(text=name, icon="ACTION")
+
+    node = [int(x) for x in seq.get("node") or (0, 0, 0)]
+    phase = [float(x) for x in seq.get("phase") or (0.0, 0.0)]
+    box = lay.box()
+    box.label(text="transition node %d -> %d, flags %d" % tuple(node))
+    box.label(text="phase %g .. %g" % tuple(phase))
+
+    box = lay.box()
+    mr = [float(x) for x in seq.get("meleerange") or (0.0, 0.0)]
+    box.label(text="melee range: %s" % _melee_text(*mr))
+    mask = int(seq.get("seqselectmask", -1))
+    box.label(text="select mask: %s" % ("never" if mask == -1 else "0x%x" % mask))
+    st = int(seq.get("statrequired", -1))
+    box.label(text="stat required: %s" % ("none" if st < 0 else str(st)))
+    cw = [float(x) for x in seq.get("cyclewindow") or (0.0, 1.0, 1.0)]
+    box.label(text="cycle window %g .. %g, threshold %g" % tuple(cw))
+
+    names = [(k, str(seq.get(k) or "")) for k in ("dodge", "block", "name2e8", "name2ec")]
+    if any(v for _k2, v in names):
+        box = lay.box()
+        for key, v in names:
+            if v:
+                box.label(text="%s: %s" % (key, v))
+
+    kbs = list(seq.get("knockbacks") or ())
+    hvs = list(seq.get("hitvolumes") or ())
+    box = lay.box()
+    box.label(text="%d knockback(s), %d hit volume(s)" % (len(kbs), len(hvs)))
+    for i, k in enumerate(kbs):
+        acts = [str(x) for row in (k.get("activities") or ()) for x in row if x]
+        box.label(text="%d  %s  end %g  %s"
+                       % (i, str(k.get("bone") or "?"), float(k.get("cycleend") or 0.0),
+                          ", ".join(acts) if acts else "-"))
+
+
+class VTMB_PT_action_seqtail(bpy.types.Panel):
+    bl_label = "VTMB sequence tail"
+    bl_space_type = "DOPESHEET_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "VTMB"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return panel_action(context) is not None
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_action_seqtail(self.layout, context, panel_action(context))
+
+
 class VTMB_PT_action_events(bpy.types.Panel):
     bl_label = "VTMB events"
     bl_space_type = "DOPESHEET_EDITOR"
@@ -1326,8 +1534,9 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_set_skin_family, VTMB_PT_skin_families,
            VTMB_PT_cloth,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
+           VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
-           VTMB_PT_action_events, VTMB_PT_action_params,
+           VTMB_PT_action_events, VTMB_PT_action_params, VTMB_PT_action_seqtail,
            VTMB_PT_bone_flags, VTMB_PT_bone]
 
 _PROPS = (
