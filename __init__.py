@@ -1217,7 +1217,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 # The chain is the worst on a character: its animations live in the included files.
 SCRATCH_DROPS = (
     "collision and ragdoll -- both live in the sibling .phy, not written",
-    "cloth, flex descs, controllers, rules and every vertanim",
+    "flex descs, controllers, rules and every vertanim",
     "eyeballs, mouths and pose parameters",
     "spring bones, procedural bones, IK chains and bone controllers",
     "sequence events and autolayers",
@@ -1508,6 +1508,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                            + ("" if len(r["crowded"]) <= 3
                               else " and %d more mesh%s" % (len(r["crowded"]) - 3,
                                    "" if len(r["crowded"]) == 4 else "es"))))
+        for name, npin, nvert in r.get("cloths") or ():
+            self.report({"INFO"}, "%s: cloth over %d particles, %d of them pinned"
+                        % (name, nvert, npin))
         if r["dropped"]:
             self.report({"WARNING"}, "dropped %s"
                         % ", ".join("%s x%d" % (k, v)

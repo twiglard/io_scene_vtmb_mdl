@@ -249,6 +249,158 @@ class VTMB_PT_skin_families(bpy.types.Panel):
         draw_skin_families(self.layout, context.object)
 
 
+CLOTH = "vtmb_cloth"
+CLOTH_NUMBERS = (
+    ("sigma", "Sigma", 0.0, 1000.0,
+     "The stiffness the solver divides by. It is the one number the corpus gives no rule "
+     "for -- 118654 of 118654 springs fix the mass split and both spring groups follow "
+     "from the faces, so a preset supplies this and nothing derives it"),
+    ("slack", "Slack", 0.0, 4.0,
+     "The rest length as a fraction of the measured distance. Below 1 the sheet is pulled "
+     "taut, above 1 it hangs"),
+    ("scale", "Scale", 0.0, 1000.0,
+     "The object's own +0x00 float, which the solver multiplies its step by"),
+)
+CLOTH_CAP = 8192                # counting group members is O(verts) and draw() runs per redraw
+
+
+def _cloth_get(obj, key):
+    return bool(obj.get(key))
+
+
+def _cloth_set(obj, key, value):
+    if value:
+        obj[key] = True
+    elif key in obj:
+        del obj[key]
+
+
+_PRESET_ITEMS = []              # Blender frees a dynamic items list it does not own
+
+
+def _preset_names():
+    return [""] + sorted(blender_scratch.cloth_mod.PRESETS)
+
+
+def _cloth_preset_items(self, context):
+    del _PRESET_ITEMS[:]
+    _PRESET_ITEMS.append(("", "None", "The three numbers come from the overrides below, "
+                                      "or from cloth.resolve's own fallbacks"))
+    _PRESET_ITEMS.extend((k, k, "") for k in sorted(blender_scratch.cloth_mod.PRESETS))
+    return _PRESET_ITEMS
+
+
+def _preset_get(obj):
+    names = _preset_names()
+    v = str(obj.get("vtmb_cloth_preset") or "")
+    return names.index(v) if v in names else 0
+
+
+def _preset_set(obj, value):
+    names = _preset_names()
+    v = names[value] if 0 <= value < len(names) else ""
+    if v:
+        obj["vtmb_cloth_preset"] = v
+    elif "vtmb_cloth_preset" in obj:
+        del obj["vtmb_cloth_preset"]
+
+
+def _cloth_text(obj, key, value):
+    value = value.strip()
+    if value and value != blender_scratch.PIN_GROUP:
+        obj[key] = value
+    elif key in obj:
+        del obj[key]
+
+
+def _cloth_num_on(obj, k, value):
+    key = "vtmb_cloth_%s" % k
+    if not value:
+        if key in obj:
+            del obj[key]
+        return
+    if key in obj:
+        return
+    # Turning an override on seeds it with what the preset was already resolving to, so
+    # the number never jumps when the checkbox is ticked.
+    numbers = cloth_numbers(obj)[0]
+    at = [n[0] for n in CLOTH_NUMBERS].index(k)
+    obj[key] = float(numbers[at]) if numbers else 0.0
+
+
+def cloth_numbers(obj):
+    """(sigma, slack, scale) as the export will resolve them, and which of the three are
+    overridden on this object."""
+    over = tuple("vtmb_cloth_%s" % k in obj for k, _l, _lo, _hi, _d in CLOTH_NUMBERS)
+    preset = str(obj.get("vtmb_cloth_preset") or "") or None
+    if preset is not None and preset not in blender_scratch.cloth_mod.PRESETS:
+        return None, over
+    got = [obj.get("vtmb_cloth_%s" % k) for k, _l, _lo, _hi, _d in CLOTH_NUMBERS]
+    return blender_scratch.cloth_mod.resolve(preset, *got), over
+
+
+def cloth_pins(obj):
+    """(pinned, total) for the object's pin group, or None where it cannot be counted."""
+    me = obj.data
+    vg = obj.vertex_groups.get(str(obj.get("vtmb_cloth_pin_group") or
+                                   blender_scratch.PIN_GROUP))
+    if vg is None or len(me.vertices) > CLOTH_CAP:
+        return None
+    n = sum(1 for v in me.vertices if any(g.group == vg.index for g in v.groups))
+    return n, len(me.vertices)
+
+
+def draw_cloth(lay, obj):
+    lay.prop(obj, "vtmb_cloth_on")
+    if not obj.get(CLOTH):
+        return
+    lay.prop(obj, "vtmb_cloth_preset_name")
+    lay.prop(obj, "vtmb_cloth_pin_text")
+    lay.prop(obj, "vtmb_cloth_flip_on")
+    numbers, over = cloth_numbers(obj)
+    if numbers is None:
+        lay.label(text="preset %r is not one of the %d"
+                       % (str(obj.get("vtmb_cloth_preset")),
+                          len(blender_scratch.cloth_mod.PRESETS)), icon="ERROR")
+        return
+    for i, (k, label, _lo, _hi, _desc) in enumerate(CLOTH_NUMBERS):
+        row = lay.row(align=True)
+        row.prop(obj, "vtmb_cloth_%s_on" % k, text="")
+        if over[i]:
+            row.prop(obj, "vtmb_cloth_%s_num" % k, text=label)
+        else:
+            sub = row.row()
+            sub.enabled = False
+            sub.label(text="%s  %g" % (label, numbers[i]))
+    group = str(obj.get("vtmb_cloth_pin_group") or blender_scratch.PIN_GROUP)
+    pins = cloth_pins(obj)
+    if pins is None:
+        lay.label(text="no vertex group %r" % group, icon="ERROR")
+    elif pins[0] == 0:
+        lay.label(text="%r is empty -- every particle would be free" % group, icon="ERROR")
+    elif pins[0] == pins[1]:
+        lay.label(text="%r pins all %d -- nothing would move" % (group, pins[1]),
+                  icon="ERROR")
+    else:
+        lay.label(text="%d pinned, %d free" % (pins[0], pins[1] - pins[0]))
+
+
+class VTMB_PT_cloth(bpy.types.Panel):
+    bl_label = "VTMB cloth"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "MESH"
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_cloth(self.layout, context.object)
+
+
 def accessories_of(arm_obj):
     """(attachment empties, {set ordinal: [box empties]}, {set ordinal: name}) for drawing.
 
@@ -1172,6 +1324,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
            VTMB_OT_set_skin_family, VTMB_PT_skin_families,
+           VTMB_PT_cloth,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_PT_action_events, VTMB_PT_action_params,
@@ -1197,6 +1350,39 @@ def register_props():
             name=name, description=desc,
             get=(lambda k: lambda self: _text(self, k))(key),
             set=(lambda k: lambda self, v: _store(self, k, v))(key)))
+    bpy.types.Object.vtmb_cloth_on = bpy.props.BoolProperty(
+        name="Cloth", description="Export this mesh as a cloth object -- the model's "
+                                  "whole particle array, so it must use one material",
+        get=lambda self: _cloth_get(self, CLOTH),
+        set=lambda self, v: _cloth_set(self, CLOTH, v))
+    bpy.types.Object.vtmb_cloth_flip_on = bpy.props.BoolProperty(
+        name="Flip normals", description="Bit 15 of every particle index, which flips the "
+                                         "cloth normal the solver hands the draw path",
+        get=lambda self: _cloth_get(self, "vtmb_cloth_flip"),
+        set=lambda self, v: _cloth_set(self, "vtmb_cloth_flip", v))
+    bpy.types.Object.vtmb_cloth_preset_name = bpy.props.EnumProperty(
+        name="Preset", items=_cloth_preset_items,
+        description="One of the 17 (scale, s) pairs the shipped objects use. It supplies "
+                    "whichever of the three numbers is not overridden below",
+        get=lambda self: _preset_get(self),
+        set=lambda self, v: _preset_set(self, v))
+    bpy.types.Object.vtmb_cloth_pin_text = bpy.props.StringProperty(
+        name="Pin group", description="The vertex group naming the pinned particles. The "
+                                      "format takes the pin set as a COUNT and the array "
+                                      "is ordered pinned-first, so the export reorders "
+                                      "the mesh's vertices and nothing else marks a pin",
+        get=lambda self: str(self.get("vtmb_cloth_pin_group") or blender_scratch.PIN_GROUP),
+        set=lambda self, v: _cloth_text(self, "vtmb_cloth_pin_group", v))
+    for _k, _label, _lo, _hi, _desc in CLOTH_NUMBERS:
+        setattr(bpy.types.Object, "vtmb_cloth_%s_on" % _k, bpy.props.BoolProperty(
+            name=_label, description="Override the preset's %s" % _k,
+            get=(lambda k: lambda self: "vtmb_cloth_%s" % k in self)(_k),
+            set=(lambda k: lambda self, v: _cloth_num_on(self, k, v))(_k)))
+        setattr(bpy.types.Object, "vtmb_cloth_%s_num" % _k, bpy.props.FloatProperty(
+            name=_label, description=_desc, min=_lo, max=_hi,
+            get=(lambda k: lambda self: float(self.get("vtmb_cloth_%s" % k) or 0.0))(_k),
+            set=(lambda k: lambda self, v: self.__setitem__("vtmb_cloth_%s" % k,
+                                                            float(v)))(_k)))
     bpy.types.Object.vtmb_action_index = bpy.props.IntProperty(
         name="Action", default=0, min=0,
         description="Which of the blend's actions the VTMB animations list is on. It "
@@ -1233,6 +1419,13 @@ def unregister_props():
             delattr(bpy.types.Object, attr)
     if hasattr(bpy.types.Object, "vtmb_action_index"):
         del bpy.types.Object.vtmb_action_index
+    names = ["vtmb_cloth_on", "vtmb_cloth_flip_on", "vtmb_cloth_preset_name",
+             "vtmb_cloth_pin_text"]
+    for k, _l, _lo, _hi, _d in CLOTH_NUMBERS:
+        names += ["vtmb_cloth_%s_on" % k, "vtmb_cloth_%s_num" % k]
+    for attr in names:
+        if hasattr(bpy.types.Object, attr):
+            delattr(bpy.types.Object, attr)
     for attr in ("vtmb_root_motion_choice", "vtmb_loops", "vtmb_activity_text"):
         if hasattr(bpy.types.Action, attr):
             delattr(bpy.types.Action, attr)

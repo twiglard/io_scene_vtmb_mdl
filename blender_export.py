@@ -1169,9 +1169,11 @@ def read_hitboxsets(m, arm_obj, scale):
     bmap = bone_map(m, arm_obj)
     _attach, boxes, names = accessory_objects(arm_obj)
     out = []
-    for k in sorted(boxes):
+    # A set with no boxes is still a set: 358 of the 4445 shipped models carry exactly one
+    # and it is empty, so keying off `boxes` alone drops it and numhitboxsets goes to 0.
+    for k in sorted(set(boxes) | set(names)):
         recs = []
-        for obj in boxes[k]:
+        for obj in boxes.get(k, ()):
             bi = _accessory_bone(obj, m, arm_obj, bmap, "hitbox")
             local = obj.matrix_basis
             mid = [local[r][3] / scale for r in range(3)]
@@ -1231,7 +1233,7 @@ def apply_accessories(d, m, arm_obj, scale):
         d.hitboxsets = d.hitboxsets[:0]
         for name, recs in want:
             build_mod.add_hitbox(d, [(b, g, v[0:3], v[3:6]) for b, g, v in recs], name)
-        changed += sum(len(r) for _n, r in want)
+        changed += sum(len(r) for _n, r in want) or 1
     return changed
 
 

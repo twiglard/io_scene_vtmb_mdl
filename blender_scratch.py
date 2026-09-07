@@ -20,6 +20,7 @@ import bpy  # noqa: F401
 # Package-only, like blender_export, which it reuses: both are bpy-side and neither is
 # imported flat by a check script.
 from . import blender_export as export_mod
+from . import cloth as cloth_mod
 from . import mdl as mdl_mod
 from . import mdl_build as build_mod
 from . import mdl_write as write_mod
@@ -328,6 +329,67 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why):
             for ri in range(len(runs))], kept, added
 
 
+PIN_GROUP = "vtmb_pinned"
+
+
+def cloth_params(obj):
+    """(preset, sigma, slack, scale, pin group) for a mesh marked as cloth, else None."""
+    if not obj.get("vtmb_cloth"):
+        return None
+    preset = str(obj.get("vtmb_cloth_preset") or "") or None
+    if preset is not None and preset not in cloth_mod.PRESETS:
+        raise Refused("%s names cloth preset %r, which is not one of the 17"
+                      % (obj.name, preset))
+    return (preset, obj.get("vtmb_cloth_sigma"), obj.get("vtmb_cloth_slack"),
+            obj.get("vtmb_cloth_scale"),
+            str(obj.get("vtmb_cloth_pin_group") or PIN_GROUP))
+
+
+def pin_first(obj, verts, faces, group, scale=1.0):
+    """(verts, faces, npin) reordered so the pinned particles come first.
+
+    cloth_mod.generate takes the pin set as a count and nothing else marks a pin, so the
+    order is the only channel a mesh has into it.  split_mesh drops the Blender vertex
+    index -- a seam duplicates a vertex -- so membership is carried by position, and two
+    vertices sharing one position while disagreeing about the group are refused rather
+    than resolved.
+    """
+    vg = obj.vertex_groups.get(group)
+    if vg is None:
+        raise Refused("%s is marked as cloth and carries no vertex group %r naming the "
+                      "pinned particles" % (obj.name, group))
+    pinned = set()
+    for v in obj.data.vertices:
+        if any(g.group == vg.index for g in v.groups):
+            pinned.add((round(v.co.x / scale, 5), round(v.co.y / scale, 5),
+                        round(v.co.z / scale, 5)))
+    if not pinned:
+        raise Refused("%s's vertex group %r is empty, so every particle would be free "
+                      "and the object would fall away" % (obj.name, group))
+    key = [tuple(round(c, 5) for c in v[0]) in pinned for v in verts]
+    order = ([i for i in range(len(verts)) if key[i]]
+             + [i for i in range(len(verts)) if not key[i]])
+    npin = sum(key)
+    if npin == len(verts):
+        raise Refused("%s pins every one of its %d particles, so nothing would move"
+                      % (obj.name, npin))
+    at = {o: i for i, o in enumerate(order)}
+    return ([verts[o] for o in order],
+            [tuple(at[c] for c in f) for f in faces], npin)
+
+
+def add_cloth(d, obj, verts, faces, npin, flip=False):
+    """Generate this model's cloth object and hang it off the model's one mesh."""
+    preset, sigma, slack, cscale, _g = cloth_params(obj)
+    c = cloth_mod.generate([v[0] for v in verts], faces, npin,
+                           pv=list(range(len(verts))), preset=preset,
+                           sigma=sigma, slack=slack, scale=cscale)
+    blob = cloth_mod.pack(c)
+    mr = d.bodyparts[-1].kids[-1]
+    mr.extra["cloth"] = cloth_mod.region(blob, len(verts), c.numparticles, flip)
+    return c, blob
+
+
 def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     """One bodypart per object, holding one model whose meshes are its material slots.
 
@@ -337,7 +399,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     """
     slot_of = {}
     total_unskinned = total_kept = 0
-    crowded = []
+    crowded, cloths = [], []
     for obj in mesh_objs:
         runs, unskinned, kept, _why = split_mesh(obj, bone_index, scale)
         total_unskinned += unskinned
@@ -352,11 +414,24 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
             if name not in slot_of:
                 slot_of[name] = build_mod.add_material(d, name)
             meshes.append((slot_of[name], verts, faces))
+        cloth = cloth_params(obj)
+        if cloth is not None:
+            if len(meshes) != 1:
+                raise Refused("%s is marked as cloth and uses %d materials -- a cloth "
+                              "object spans one model's whole particle array, so the "
+                              "mesh has to be one material" % (obj.name, len(meshes)))
+            slot, cverts, cfaces = meshes[0]
+            cverts, cfaces, npin = pin_first(obj, cverts, cfaces, cloth[4], scale)
+            meshes = [(slot, cverts, cfaces)]
         if meshes:
             build_mod.add_model(d, meshes,
                                 bodypart=obj.get("vtmb_bodypart") or obj.name,
                                 model=obj.get("vtmb_model") or obj.name + ".smd")
-    return list(d.faces), total_unskinned, total_kept, crowded
+            if cloth is not None:
+                add_cloth(d, obj, cverts, cfaces, npin,
+                          bool(obj.get("vtmb_cloth_flip")))
+                cloths.append((obj.name, npin, len(cverts)))
+    return list(d.faces), total_unskinned, total_kept, crowded, cloths
 
 
 _ARM = ("upperarm", "forearm", "hand", "finger", "thumb")
@@ -564,13 +639,13 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
-    faces, unskinned, kept, crowded = add_meshes(d, mesh_objs, bone_index, scale)
+    faces, unskinned, kept, crowded, cloths = add_meshes(d, mesh_objs, bone_index, scale)
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
     add_attachments(d, arm_obj, bone_index, scale)
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
-    return d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable
+    return d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths
 
 
 def _set_hull(d, lo, hi):
@@ -632,7 +707,7 @@ def write(d, faces, path, checksum):
 
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
-    d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable = build(
+    d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths = build(
         context, arm_obj, mesh_objs, actions, embedded_name(path), **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
@@ -646,4 +721,5 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16
                                for bp in d.bodyparts for x in bp.kids),
             "kept": kept, "crowded": crowded,
-            "unskinned": unskinned, "dropped": dict(d.dropped)}
+            "unskinned": unskinned, "dropped": dict(d.dropped),
+            "cloths": cloths}

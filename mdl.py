@@ -300,7 +300,7 @@ class Event:
 
 class Mesh:
     __slots__ = ("index", "material", "numvertices", "vertexoffset", "materialtype",
-                 "materialparam", "flexes", "cloth")
+                 "materialparam", "flexes", "cloth", "clothbind")
 
 
 class Flex:
@@ -321,7 +321,26 @@ class VertAnim:
 
 class Model:
     __slots__ = ("index", "name", "nummeshes", "numvertices", "vertexbase",
-                 "tangentbase", "filetype", "quant_offset", "quant_scale", "meshes")
+                 "tangentbase", "filetype", "quant_offset", "quant_scale", "meshes",
+                 "cloths", "clothrows", "clothcols")
+
+
+class Cloth:
+    """One mstudiocloth_t: the 0x5c header's numbers, its springs and its particle map.
+
+    `pv` is the +0x10 block, one MODEL-local vertex index per particle. It inverts the
+    meshes' +0x34 exactly: over the corpus's 150 objects, every one of the 25 564 particles
+    some vertex names has that vertex in `pv`. The other 2471 particles are named by no
+    vertex, 2297 of them pinned, so the pinned set is NOT recoverable as a vertex group.
+
+    Particles are ordered pinned-first and nothing else marks a pin, so particle `p` is
+    pinned exactly when `p < numfixed` (todo-vtmb-cloth-solver.md section 1.1).
+
+    A spring is `(a, b, w0, w1, rest2)`. `sigma` is `(w0 - w1) / 2` and the group-1 slack is
+    `rest2` over the squared rest separation -- `cloth.recover` does both.
+    """
+    __slots__ = ("slot", "row", "col", "scale", "numparticles", "numfixed", "numfree",
+                 "numsprings", "ns0", "ns1", "pv", "springs")
 
 
 class BodyPart:
@@ -553,9 +572,68 @@ class Mdl:
             # particle index, cloth normal index.  All three are 0 on a mesh without cloth,
             # and the .vtx strip group of one that has them must carry SG_IS_CLOTH.
             e.cloth = all(struct.unpack_from("<3i", d, eo + 0x30))
+            e.clothbind = None
             e.flexes = self._read_flexes(eo)
             m.meshes.append(e)
+        self._read_cloths(off, m, meshindex)
         return m
+
+    def _read_cloths(self, off, m, meshindex):
+        """Every mstudiocloth_t of one model, and the per-mesh binding that names them.
+
+        `mstudiomodel_t+0xcc` is a rows x cols table of MODEL-relative offsets and +0xc8 is
+        cols. The table stores no length, so the first object it points at bounds it and the
+        row count falls out of that (anomalies section B10). A slot is `row * cols + col`,
+        where `col` is the owner byte a mesh's +0x30 array holds -- 150 of 150 shipped
+        objects agree, read the other way round 60 do.
+
+        A mesh's three arrays are `rows * numvertices` entries laid out row-major, and the
+        0x8000 bit on a +0x34 entry is per VERTEX and not per mesh: 30 361 entries carry it
+        against 25 367 that do not.
+        """
+        d = self.d
+        m.cloths, m.clothrows, m.clothcols = [], 0, 0
+        cols, tbloff = struct.unpack_from("<2i", d, off + 0xc8)
+        if cols <= 0 or tbloff <= 0:
+            return
+        tbl, offs, k = off + tbloff, [], 0
+        while True:
+            v = struct.unpack_from("<i", d, tbl + k * 4)[0]
+            if v and tbl < off + v < len(d) - 0x5c:
+                offs.append((k, off + v))
+            k += 1
+            if k > 512 or (offs and tbl + k * 4 >= min(a for _k, a in offs)):
+                break
+        if not offs:
+            return
+        rows = ((min(a for _k, a in offs) - tbl) // 4) // cols
+        m.clothrows, m.clothcols = rows, cols
+        for k, at in offs:
+            c = Cloth()
+            c.slot, c.row, c.col = k, k // cols, k % cols
+            c.scale = struct.unpack_from("<f", d, at)[0]
+            c.numparticles, c.numfixed, c.numfree, pvoff =                 struct.unpack_from("<4i", d, at + 0x04)
+            c.numsprings, c.ns0, c.ns1, spoff = struct.unpack_from("<4i", d, at + 0x14)
+            c.pv = list(struct.unpack_from("<%dH" % c.numparticles, d, at + pvoff))                 if pvoff else []
+            c.springs = [struct.unpack_from("<2H3f", d, at + spoff + q * 16)
+                         for q in range(c.ns0 + c.ns1)] if spoff else []
+            m.cloths.append(c)
+        for k, e in enumerate(m.meshes):
+            eo = off + meshindex + k * MESH_STRIDE
+            own, par = struct.unpack_from("<2i", d, eo + 0x30)
+            if not own or not par:
+                continue
+            n = e.numvertices
+            e.clothbind = []
+            for r in range(rows):
+                row = {}
+                for v in range(n):
+                    col = d[eo + own + r * n + v]
+                    if col == 0xff:
+                        continue
+                    raw = struct.unpack_from("<H", d, eo + par + (r * n + v) * 2)[0]
+                    row[v] = (col, raw & 0x7fff, bool(raw & 0x8000))
+                e.clothbind.append(row)
 
     def _read_flexdescs(self):
         n, idx = struct.unpack_from("<ii", self.d, HDR_NUMFLEXDESC)

@@ -13,6 +13,7 @@ import zlib
 import bpy
 import mathutils
 
+from . import cloth as cloth_mod
 from . import mdl as mdl_mod
 from . import paths as paths_mod
 from . import tth as tth_mod
@@ -628,6 +629,7 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
 
     objs = []
     skin_mats = {}
+    cloth_notes = []
     nkeys = nflexrec = nflexdrop = 0
     for gi, (bp, model) in enumerate(models):
         faces = faces_by_model.get(gi)
@@ -733,6 +735,7 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
                 for bone, weight in zip(v_.bones[:n_], v_.weights[:n_]):
                     if weight > 0.0 and 0 <= bone < len(m.bones):
                         groups[m.bones[bone].name].add([vi], weight, "REPLACE")
+        cloth_notes += _stamp_cloth(obj, model, verts)
         if with_flexes:
             k, r, dropped = build_shape_keys(obj, model, scale)
             nkeys += k
@@ -755,7 +758,77 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
                 % (nkeys, nflexrec))
         if nflexdrop:
             note += ", and %d record(s) named a vertex or a direction this file does "                     "not hold" % nflexdrop
+    if cloth_notes:
+        note = "; ".join(([note] if note else []) + cloth_notes)
     return objs, note
+
+
+PIN_GROUP = "vtmb_pinned"
+
+
+def _stamp_cloth(obj, model, verts):
+    """The model's row-0 cloth object put on the mesh object, and what would not fit.
+
+    Row 0 is what the importer draws, and 59 of the 60 shipped cloth models carry exactly
+    one object there. `scale` is exact, `slack` is the median group-1 ratio and reproduces a
+    preset's `s` to 3.8e-07 over 142 objects, and `(scale, slack)` names one of the 17
+    presets or none, that pair being unique over them.
+
+    Three things cannot be represented and are returned rather than dropped in silence: a
+    pinned particle no vertex names (2297 over the corpus against 2614 that are named), a
+    per-vertex flip bit where the writer has one flag per mesh (mixed within 62 of the 84
+    shipped meshes), and a sigma that varies across the object (39 of 150).
+    """
+    row0 = [c for c in model.cloths if c.row == 0]
+    if not row0:
+        return []
+    out = []
+    if len(row0) > 1:
+        out.append("%s carries %d cloth objects in row 0 and the exporter writes one, so "
+                   "only the first is in the scene" % (obj.name, len(row0)))
+    c = row0[0]
+    obj["vtmb_cloth"] = 1
+    pos = [verts[v].pos if v < len(verts) else (0.0, 0.0, 0.0) for v in c.pv]
+    r = cloth_mod.recover(c.scale, c.springs, c.ns0, pos if c.pv else None)
+    if r.preset is not None:
+        obj["vtmb_cloth_preset"] = r.preset
+    else:
+        obj["vtmb_cloth_scale"] = c.scale
+        if r.slack is not None:
+            obj["vtmb_cloth_slack"] = r.slack
+    if r.sigma is not None and not r.uniform:
+        out.append("%s: sigma runs %.4f to %.4f across the object and one number is what "
+                   "the scene holds, so a re-export writes %.4f everywhere"
+                   % (obj.name, r.sigma_min, r.sigma, r.sigma))
+    if r.sigma is not None and (r.preset is None or not r.uniform):
+        obj["vtmb_cloth_sigma"] = r.sigma
+    # The mesh binding is what says which vertices are particles at all; c.pv is the
+    # inverse and names one vertex per particle where a seam has several.
+    pinned, flips = set(), set()
+    for e in model.meshes:
+        if not e.clothbind:
+            continue
+        for v, (col, part, flip) in e.clothbind[0].items():
+            if col != c.col:
+                continue
+            flips.add(flip)
+            if part < c.numfixed:
+                pinned.add(e.vertexoffset + v)
+    obj["vtmb_cloth_pin_group"] = PIN_GROUP
+    vg = obj.vertex_groups.new(name=PIN_GROUP)
+    if pinned:
+        vg.add(sorted(pinned), 1.0, "REPLACE")
+    named = len(set(c.pv[p] for p in range(c.numfixed)) & pinned)
+    if named < c.numfixed:
+        out.append("%s: %d of %d pinned particles are named by no vertex and a vertex "
+                   "group cannot hold them, so a re-export pins %d"
+                   % (obj.name, c.numfixed - named, c.numfixed, named))
+    if flips == {True}:
+        obj["vtmb_cloth_flip"] = 1
+    elif len(flips) > 1:
+        out.append("%s: the +0x34 flip bit is set on some vertices and clear on others, "
+                   "and the writer has one flag per mesh" % obj.name)
+    return out
 
 
 def _bind_slot(arm_obj, action):
