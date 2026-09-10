@@ -1321,8 +1321,42 @@ def new_materials(m, source):
     return out
 
 
+def spring_endbone(k, start, end, m):
+    """The `mstudiospringbone_t.endbone` a named end bone resolves to, or a refusal.
+
+    -1 is the sentinel and the only value 600 of 600 shipped records carry: the chain
+    descends first-child from its start bone, `client.dll 0x100ac243`. A name takes the
+    other branch, `0x100ac1dd`, which scans candidate bone indices from `numbones - 1`
+    downward and appends one whenever it equals the current tail's parent, ending at
+    `candidate < startbone` with no test that the start bone was ever reached. So the walk
+    succeeds exactly when the start bone is the end bone or an ancestor of it, and on
+    anything else the engine builds a chain the start bone is not in -- silently. That is
+    refused here rather than written.
+    """
+    for b in m.bones:
+        if b.name == end:
+            j = b.index
+            break
+    else:
+        raise build_mod.Refused(
+            "spring bone chain %d ends at %r, which the file has no bone called. Empty "
+            "means the chain runs to the leaf; delete the property and the file's own "
+            "end bone is kept" % (k, end))
+    up, steps = j, 0
+    while up >= 0 and up != start and steps <= len(m.bones):
+        up = m.bones[up].parent
+        steps += 1
+    if up != start:
+        raise build_mod.Refused(
+            "spring bone chain %d starts at %r and ends at %r, which is not below it. The "
+            "engine walks up from the end bone and stops at the start bone's index, so "
+            "the chain it builds would not contain %r"
+            % (k, m.bones[start].name, end, m.bones[start].name))
+    return j
+
+
 def apply_springbones(d, m, arm_obj):
-    """Retuned spring-bone floats out of the pose bones, back into the 28-byte records.
+    """(fields retuned, chains given a named end bone), out of the pose bones.
 
     Matched on the record ordinal the import stamped rather than on the bone, because a
     chain is identified by its ordinal everywhere the engine touches it -- the disable
@@ -1337,15 +1371,26 @@ def apply_springbones(d, m, arm_obj):
         k = pb.get("vtmb_spring_index")
         if k is not None:
             stamped.setdefault(int(k), pb)
-    names = {b.name: b.index for b in m.bones}
-    changed = 0
+    changed = named = 0
     for k, r in enumerate(d.springbones):
         pb = stamped.get(k)
         if pb is None:
             continue
+        have = struct.unpack_from("<i", r.raw, 0x04)[0]
         end = pb.get("vtmb_spring_end")
-        want = names.get(end, -1) if end else -1
-        if struct.unpack_from("<i", r.raw, 0x04)[0] != want:
+        if end is None:
+            # The scene never said, which is what a .blend predating the property and a
+            # deleted key both look like. Carry the file's own, the rule the five floats
+            # below already follow -- writing -1 here would repoint the chain at the leaf.
+            want = have
+        elif end:
+            # +0x00 carries the start bone as -1-bone when the chain starts disabled.
+            v = struct.unpack_from("<i", r.raw, 0x00)[0]
+            want = spring_endbone(k, v if v >= 0 else -1 - v, end, m)
+            named += 1
+        else:
+            want = -1
+        if have != want:
             struct.pack_into("<i", r.raw, 0x04, want)
             changed += 1
         for at, key in ((0x08, "vtmb_spring_unk08"), (0x0c, "vtmb_spring_gravity"),
@@ -1358,7 +1403,7 @@ def apply_springbones(d, m, arm_obj):
             if bytes(r.raw[at:at + 4]) != packed:
                 r.raw[at:at + 4] = packed
                 changed += 1
-    return changed
+    return changed, named
 
 
 # An accessory matrix survives Blender as the object's loc/rot/scale, so reading one back
@@ -2528,7 +2573,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     d = build_mod.apply_anims(d, edits, source)
 
-    scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0, "stale": 0,
+    scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0,
+             "spring_ends": 0, "stale": 0,
              "accessories": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
@@ -2567,7 +2613,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.add_material(d, name, None)
         have.add(name)
         scene["added_materials"].append(name)
-    scene["springs"] = apply_springbones(d, m, arm_obj)
+    scene["springs"], scene["spring_ends"] = apply_springbones(d, m, arm_obj)
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     scene["face"] = apply_face(d, m, arm_obj, scale)
     scene["flex"] = apply_flex(d, m, arm_obj)

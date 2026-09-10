@@ -1339,6 +1339,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                       % (scene["bones"], scene["materials"], scene["sequences"]))
         if scene["springs"]:
             extra += "; retuned %d spring bone fields" % scene["springs"]
+        if scene.get("spring_ends"):
+            self.report({"INFO"}, "%d spring bone chain%s given a named end bone. 0 of the "
+                                  "600 shipped records name one -- they all run to the "
+                                  "leaf -- so this takes a path no shipped file takes"
+                        % (scene["spring_ends"],
+                           "" if scene["spring_ends"] == 1 else "s"))
         if scene.get("face"):
             extra += ("; rewrote %d eyeball or mouth record%s"
                       % (scene["face"], "" if scene["face"] == 1 else "s"))
