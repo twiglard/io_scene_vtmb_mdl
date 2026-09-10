@@ -538,6 +538,31 @@ def _dead_loops(me):
     return out
 
 
+def uv_layer_of(obj):
+    """(the layer holding the file's UVs, the layers ignored, the import's layer if it is
+    no longer the first).
+
+    The format stores one UV per vertex, so a second layer is a Blender-side working set
+    and cannot reach the file. The first layer is the file's: the import made it on a fresh
+    mesh and Blender has no operator that reorders UV layers, only ones that append and
+    delete. The active layer is not it -- `mesh.uv_texture_add`, which the + button in the
+    UV Maps panel runs, makes the layer it adds active.
+
+    `vtmb_uv_layer` is not resolved through, only compared: the same operator names its
+    layer `UVMap` too, so once the import's layer has been renamed the stamp matches the
+    new one instead. It answers whether the import's layer is still the first, and a
+    mismatch is a rename or a delete either way.
+    """
+    me = obj.data
+    layers = list(me.uv_layers)
+    if not layers:
+        return None, [], None
+    use = layers[0]
+    want = obj.get("vtmb_uv_layer")
+    lost = None if want is None or str(want) == use.name else str(want)
+    return use, [x.name for x in layers[1:]], lost
+
+
 def _one_uv(me, count, uv_layer):
     """One UV per vertex, refusing a vertex whose loops disagree.
 
@@ -686,7 +711,7 @@ def read_mesh(obj, model, bone_index, fields):
     uvs = normals = [None] * n
     edited = blind = 0
     if "uvs" in fields:
-        uv_layer = me.uv_layers.active
+        uv_layer = uv_layer_of(obj)[0]
         if uv_layer is None:
             raise ValueError("%s has no UV layer" % obj.name)
         uvs = _one_uv(me, n, uv_layer)
@@ -789,7 +814,7 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
         return True
     if "uvs" not in fields:
         return False
-    uv = me.uv_layers.active
+    uv = uv_layer_of(obj)[0]
     if uv is None:
         return False
     per = _per_vertex(me, model.numvertices, lambda l: tuple(uv.data[l.index].uv))
@@ -797,7 +822,8 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
                for vs in per)
 
 
-def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals")):
+def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
+                 donor_tris=None):
     """One model's geometry replaced from the scene, its per-mesh triangles and its edits.
 
     Refuses a renumbering the file cannot absorb rather than dropping what it would break:
@@ -825,7 +851,8 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals")):
             raise ValueError(
                 "%s: the file's own vertex numbering could not be recovered -- %s -- and "
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
-    faces = build_mod.replace_model(d, bi, mi, [(None, v, f) for _slot, v, f in runs])
+    faces, edits["tangents"] = build_mod.replace_model(
+        d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris)
     return faces, unskinned, kept, edits
 
 
@@ -967,15 +994,15 @@ def stale_stash(m, source):
 def read_meshes(m, source, fields):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
-    fifth bone group no record can hold, and the vertices whose normal moved by more than the
+    fifth bone group no record can hold, the vertices whose normal moved by more than the
     round trip's own error and less than `NORMAL_EPS`, which are written from the stash and
-    so lose the edit."""
+    so lose the edit, the UV layers no model wrote, and the donor's own triangles."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
     donor_faces = _donor_faces(source, m)
     edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
     blind_normals = 0
-    crowded = []
+    crowded, uv_spare = [], []
     for bi, mi, _bp, mo in mesh_mod.models_of(m):
         ok, no = mesh_mod.supported(mo.filetype, fields)
         obj = found.get((bi, mi))
@@ -983,6 +1010,11 @@ def read_meshes(m, source, fields):
             missing.append(mo.name)
             unsupported |= set(no)
             continue
+        # Before the rebuild branch below, which would report nothing for a model that
+        # took the split path.
+        used, spare, lost = uv_layer_of(obj)
+        if spare or lost:
+            uv_spare.append((obj.name, used.name, spare, lost))
         over = crowded_vertices(obj, bone_index)
         if over:
             crowded.append((obj.name, over))
@@ -997,7 +1029,7 @@ def read_meshes(m, source, fields):
             renormals += n
             blind_normals += nb
     return (edits, rebuild, missing, sorted(unsupported), renormals, crowded,
-            blind_normals)
+            blind_normals, uv_spare, donor_faces)
 
 
 def named_index(anim_names, action):
@@ -2567,26 +2599,37 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
-            "rebuilt_uvs": 0, "rebuilt_added": 0,
+            "rebuilt_uvs": 0, "rebuilt_added": 0, "uv_spare": [], "tangents": 0,
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stale_stash": stale_stash(m, source)}
     revised = {}
     if mesh_fields:
         cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
-            mesh["crowded"], mesh["blind_normals"] = read_meshes(m, source, mesh_fields)
+            mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces = \
+            read_meshes(m, source, mesh_fields)
         if not cells and not rebuild and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
         for (bi, mi), verts in sorted(cells.items()):
             rec = d.bodyparts[bi].kids[mi]
-            rec.extra["verts"], n = mesh_mod.pack_model(
-                m.bodyparts[bi].models[mi], verts, mesh_fields, rec.extra["verts"])
+            mo = m.bodyparts[bi].models[mi]
+            was_vb = rec.extra["verts"]
+            rec.extra["verts"], n = mesh_mod.pack_model(mo, verts, mesh_fields, was_vb)
+            # _must_rebuild sends every changed triangle set to the rebuild, so on this
+            # path the donor's triangles are still the written vertices' own.
+            tri = donor_faces.get((bi, mi))
+            rec.extra["tangents"], t = build_mod.retangent_block(
+                mo.filetype, was_vb, rec.extra["verts"], rec.extra.get("tangents") or b"",
+                tri.elements() if tri else (), mo.quant_offset, mo.quant_scale)
             mesh["verts"] += n
+            mesh["tangents"] += t
         mesh["models"] = len(cells)
         bone_index = {b.name: b.index for b in m.bones}
         for (bi, mi), obj in sorted(rebuild.items()):
             was = m.bodyparts[bi].models[mi].numvertices
-            faces, unskinned, kept, edits = rebuild_cell(d, obj, bi, mi, bone_index,
-                                                         mesh_fields)
+            tri = donor_faces.get((bi, mi))
+            faces, unskinned, kept, edits = rebuild_cell(
+                d, obj, bi, mi, bone_index, mesh_fields,
+                list(tri.elements()) if tri else None)
             for k, tris in enumerate(faces):
                 revised[(bi, mi, k)] = tris
             now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
@@ -2599,6 +2642,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             mesh["blind_normals"] += edits["blind"]
             mesh["rebuilt_uvs"] += edits["uvs"]
             mesh["rebuilt_added"] += edits["added"]
+            mesh["tangents"] += edits["tangents"]
 
     if write_flexes:
         # After the geometry, because add_flex bounds every key against the mesh's

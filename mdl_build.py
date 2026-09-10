@@ -1670,8 +1670,8 @@ def clear_flexes(d, bi, mi):
     return n
 
 
-def _tangents(verts, tris):
-    """One `mstudiotangent_t` per vertex, off the mesh's own triangles.
+def _tangent_basis(verts, tris):
+    """One (x, y, z, w) per vertex, None where no triangle gave a usable UV basis.
 
     The array is read: `R_AddVertexToMesh` StudioRender.dll:0x2c013ca3 copies all sixteen
     bytes into the hardware vertex buffer for every vertex of every model, outside every
@@ -1706,13 +1706,155 @@ def _tangents(verts, tris):
         d = n[0] * r[0] + n[1] * r[1] + n[2] * r[2]
         t = _unit((r[0] - n[0] * d, r[1] - n[1] * d, r[2] - n[2] * d))
         if t is None:
-            out.append(_perp(n) + (1.0,))
+            out.append(None)
             continue
         cx = (n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2],
               n[0] * t[1] - n[1] * t[0])
         h = cx[0] * r[3] + cx[1] * r[4] + cx[2] * r[5]
         out.append(t + (-1.0 if h < 0.0 else 1.0,))
     return out
+
+
+def _tangents(verts, tris):
+    """One `mstudiotangent_t` per vertex, off the mesh's own triangles.
+
+    The array is read: `R_AddVertexToMesh` StudioRender.dll:0x2c013ca3 copies all sixteen
+    bytes into the hardware vertex buffer for every vertex of every model, outside every
+    filetype and material branch. `w` is the bitangent handedness, which the corpus carries
+    negative on 3 814 304 of 5 815 551 records, so a constant 1.0 is wrong on two thirds of
+    them.
+
+    A vertex no triangle with a usable UV determinant reaches gets an arbitrary
+    perpendicular, which is all a from-scratch write has to give it. A rewrite of an
+    existing file keeps the file's own vector there instead -- `retangent_block`.
+    """
+    return [b if b is not None else _perp(_unit(v[1]) or (0.0, 0.0, 1.0)) + (1.0,)
+            for v, b in zip(verts, _tangent_basis(verts, tris))]
+
+
+# Which bytes of a vertex record a tangent is computed from. filetype 0 keeps its skinning
+# in the first twelve; 1 and 2 carry nothing but position, normal and UV.
+_GEOM_SPAN = {0: (12, 44), 1: (0, 12), 2: (0, 8)}
+
+
+def moved_vertices(filetype, donor, new, n):
+    """Which of `n` written vertices differ from the donor in position, normal or UV.
+
+    The written bytes and not the scene values, so a move the model's own quantisation
+    cannot express does not count, and neither does a field the export was not asked for.
+    A vertex the donor block is too short to hold counts as moved.
+    """
+    lo, hi = _GEOM_SPAN[filetype]
+    stride = M.VERTEX_STRIDE[filetype]
+    out = set()
+    for i in range(n):
+        o = i * stride
+        if o + hi > len(donor) or new[o + lo:o + hi] != donor[o + lo:o + hi]:
+            out.add(i)
+    return out
+
+
+def _ring(moved, tris, n):
+    """`moved` plus every vertex sharing a triangle with one of them."""
+    out = set(moved)
+    for t in tris:
+        if any(x in moved for x in t):
+            out.update(x for x in t if 0 <= x < n)
+    return out
+
+
+def retangent_block(filetype, donor_vb, new_vb, donor_tb, tris,
+                    quant_offset=None, quant_scale=None, also=()):
+    """(the model's tangent block, how many records it rewrote).
+
+    A tangent is a function of the geometry, so an edit stales it -- and not only on the
+    vertex that moved. `dP/du` is accumulated over the triangles a vertex belongs to, so
+    every corner of a triangle one end of which moved is stale too, which is what `_ring`
+    adds.
+
+    Every other vertex keeps the file's own vector, and a wholesale rewrite is not
+    available: the shipped array reproduces from the UVs on some models and not on others
+    -- dot above 0.99 on 95.9% of `andrei`'s 2477 vertices, 50.8% of
+    `blueblood_female`'s 9129 and 0.0% of `tray`'s 142 -- so rewriting an untouched
+    vertex replaces a shipped vector with a different one for no reason.
+    `plans/tangent-basis.py` has the corpus measurement.
+
+    `also` is the vertices a changed triangle set stales, which moves no vertex byte. They
+    are not `_ring`-expanded: dropping a triangle changes the accumulation of its own three
+    corners and of nothing else.
+    """
+    stride = M.VERTEX_STRIDE.get(filetype)
+    n = len(new_vb) // stride if stride else 0
+    tris = list(tris)
+    if not n or len(donor_tb) < n * 16 or not tris:
+        return donor_tb, 0
+    want = _ring(moved_vertices(filetype, donor_vb, new_vb, n), tris, n) | \
+        {x for x in also if 0 <= x < n}
+    if not want:
+        return donor_tb, 0
+    vs = M.decode_vertices(filetype, new_vb, 0, n, quant_offset, quant_scale)
+    got = _tangent_basis([(v.pos, v.normal, v.uv, ()) for v in vs], tris)
+    out, done = bytearray(donor_tb), 0
+    for i in sorted(want):
+        # None is a vertex every triangle of which has a zero UV determinant, or which no
+        # triangle reaches at all. The file's vector stands rather than an invented one.
+        if got[i] is None:
+            continue
+        b = struct.pack("<4f", *got[i])
+        if bytes(out[i * 16:i * 16 + 16]) != b:
+            out[i * 16:i * 16 + 16] = b
+            done += 1
+    return bytes(out), done
+
+
+def _canon3(t):
+    """A triangle rotated to start at its lowest corner: rotation-blind, winding-keeping."""
+    t = tuple(t)
+    i = t.index(min(t))
+    return t[i:] + t[:i]
+
+
+def _face_moved(old_tris, tris, was, new_n):
+    """Corners of every triangle this mesh gained or lost, in the new numbering.
+
+    `old_tris` is model-local, so a triangle is this mesh's when all three corners fall in
+    its donor run, and re-bases on it. Multiplicity counts -- 11 shipped models carry a
+    repeated triangle.
+    """
+    old_n, old_off = was
+    a, b = {}, {}
+    for t in old_tris:
+        if all(old_off <= x < old_off + old_n for x in t):
+            k = _canon3(tuple(x - old_off for x in t))
+            a[k] = a.get(k, 0) + 1
+    for t in tris:
+        k = _canon3(t)
+        b[k] = b.get(k, 0) + 1
+    out = set()
+    for k in set(a) | set(b):
+        if a.get(k, 0) != b.get(k, 0):
+            out.update(x for x in k if 0 <= x < new_n)
+    return out
+
+
+def _retangent_run(ptb, pvb, old_vb, old_tb, was, new_n, tris, old_tris=None):
+    """Rewrite one mesh run's tangents: the donor's, patched where the edit reached.
+
+    `_pack_verts` has already put a fresh accumulation in `ptb`, which is right for a
+    from-scratch write and wrong here -- it disagrees with the shipped vector on most
+    models, and where the UV basis is degenerate it is an arbitrary perpendicular. So the
+    donor's run goes back underneath and `retangent_block` patches over it.
+    """
+    old_n, old_off = was
+    keep = max(0, min(old_n, new_n, len(old_tb) // 16 - old_off))
+    base = bytearray(ptb)
+    base[:keep * 16] = old_tb[old_off * 16:(old_off + keep) * 16]
+    out, n = retangent_block(0, old_vb[old_off * 44:(old_off + keep) * 44],
+                             bytes(pvb), bytes(base), tris,
+                             also=() if old_tris is None
+                             else _face_moved(old_tris, tris, was, new_n))
+    ptb[:] = out
+    return n
 
 
 def _pack_verts(verts, tris=()):
@@ -1796,14 +1938,13 @@ def _skin_key(rec, at):
     return sorted(zip(struct.unpack_from("<4h", rec, at + 4)[:n], w[:n]))
 
 
-def _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was, new_n):
+def _carry_vertex_fields(pvb, old_vb, was, new_n):
     """Give each vertex an edit did not add its donor `bonecountcode` and tangent back.
 
     Only `code % 5` is read, and the high bits are never zero for a given count and mean
     something unread, so `mesh_write.count_code` keeps them and `_pack_verts` cannot --
-    it has no donor to keep them from. The tangent is the same case from the other side:
-    `_perp` returns an arbitrary perpendicular, ignoring the UV a real tangent basis is
-    built against, so the file's own vector is better wherever there is one.
+    it has no donor to keep them from. The tangent is `_retangent_run`'s, which needs the
+    fresh accumulation this leaves alone.
     """
     old_n, old_off = was
     for j in range(min(old_n, new_n)):
@@ -1819,9 +1960,6 @@ def _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was, new_n):
             pvb[at:at + 12] = old_vb[src:src + 12]
         else:
             pvb[at + 3] = (old_vb[src + 3] - old_vb[src + 3] % 5) + pvb[at + 3] % 5
-        t = (old_off + j) * 16
-        if t + 16 <= len(old_tb):
-            ptb[j * 16:(j + 1) * 16] = old_tb[t:t + 16]
 
 
 def set_model_name(d, bi, mi, name):
@@ -1839,7 +1977,7 @@ def set_model_name(d, bi, mi, name):
     r.raw[0:128] = b + b"\x00" * (128 - len(b))
 
 
-def replace_model(d, bi, mi, meshes, keep_center=True):
+def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None):
     """Rewrite one existing model's geometry, keeping everything else its records carry.
 
     `meshes` is `add_model`'s -- [(material, verts, faces), ...] -- one entry per mesh the
@@ -1850,7 +1988,7 @@ def replace_model(d, bi, mi, meshes, keep_center=True):
     Flexes, eyeballs, materialtype, meshid and the mesh centre stay with the record they
     were read from. `mstudiomesh_t.center` is not the centroid over the corpus, and
     `boundingradius` is 0.0 on every shipped record, so neither is refitted.
-    Returns the per-mesh face lists, for the .vtx the caller then has to write.
+    Returns the per-mesh face lists and how many tangents were rewritten.
     """
     mr = d.bodyparts[bi].kids[mi]
     if len(meshes) != len(mr.kids):
@@ -1864,11 +2002,13 @@ def replace_model(d, bi, mi, meshes, keep_center=True):
     old_ft = struct.unpack_from("<i", mr.raw, 0x9c)[0]
     old_vb = mr.extra.get("verts") or b""
     old_tb = mr.extra.get("tangents") or b""
-    vb, tb, offset, faces = bytearray(), bytearray(), 0, []
+    vb, tb, offset, faces, retang = bytearray(), bytearray(), 0, [], 0
     for k, (material, verts, tris) in enumerate(meshes):
         pvb, ptb = _pack_verts(verts, tris)
         if old_ft == 0:
-            _carry_vertex_fields(pvb, ptb, old_vb, old_tb, was[k], len(verts))
+            _carry_vertex_fields(pvb, old_vb, was[k], len(verts))
+            retang += _retangent_run(ptb, pvb, old_vb, old_tb, was[k], len(verts),
+                                     tris, donor_tris)
         vb += pvb
         tb += ptb
         raw = mr.kids[k].raw
@@ -1890,7 +2030,7 @@ def replace_model(d, bi, mi, meshes, keep_center=True):
     # 44-byte records are filetype 0 whatever the donor was: 1 and 2 carry no weight or
     # bone field at all, so a quantised donor gains skinning here rather than losing it.
     struct.pack_into("<i", mr.raw, 0x9c, 0)
-    return faces
+    return faces, retang
 
 
 def _unit(v):

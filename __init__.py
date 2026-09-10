@@ -1054,6 +1054,24 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "for a seam or a hard edge"
                         % (mesh["rebuilt_added"],
                            "vertex" if mesh["rebuilt_added"] == 1 else "vertices"))
+        if mesh.get("tangents"):
+            self.report({"INFO"}, "%d tangent%s recomputed, on the vertices that moved "
+                                  "and their triangle neighbours. Everything else keeps "
+                                  "the vector the file shipped"
+                        % (mesh["tangents"], "" if mesh["tangents"] == 1 else "s"))
+        for name, used, spare, lost in mesh.get("uv_spare") or ():
+            if spare:
+                self.report({"INFO"}, "%s: the file's UVs were written from %r and %s "
+                                      "ignored. The format stores one UV per vertex, so "
+                                      "a second layer cannot reach the file"
+                            % (name, used,
+                               "%r was" % spare[0] if len(spare) == 1
+                               else "%d other layers were" % len(spare)))
+            if lost:
+                self.report({"WARNING"},
+                            "%s: the import put the file's UVs in %r, which is no longer "
+                            "the mesh's first UV layer -- it was renamed or deleted. %r "
+                            "was written instead" % (name, lost, used))
         if mesh["crowded"]:
             total = sum(k for _n, k in mesh["crowded"])
             self.report({"WARNING"}, "%d vertex%s carr%s a fifth vertex group, which no "
@@ -1562,9 +1580,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             if not meshes:
                 box.label(text="a skeleton with no mesh is written and draws nothing",
                           icon="INFO")
-            no_uv = [o.name for o in meshes if not o.data.uv_layers.active]
+            no_uv = [o.name for o in meshes
+                     if blender_export.uv_layer_of(o)[0] is None]
             if no_uv:
                 _pair(box, "no UV layer", ", ".join(no_uv[:3]), icon="ERROR")
+            spare = sorted({n for o in meshes
+                            for n in blender_export.uv_layer_of(o)[1]})
+            if spare:
+                _pair(box, "UV layers not written", ", ".join(spare[:3]), icon="INFO")
+            lost = sorted({blender_export.uv_layer_of(o)[2] for o in meshes} - {None})
+            if lost:
+                _pair(box, "UV layer gone", ", ".join(lost[:3]), icon="ERROR")
 
         box = _section(lay, "vtmb_s_anims", "Animations", icon="ACTION")
         if box is not None:

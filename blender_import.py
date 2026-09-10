@@ -808,6 +808,9 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # slot index alone is stale the moment a slot is reordered or deleted, and 1686 of
         # the corpus's 4567 models carry two or more.
         obj["vtmb_slot_mats"] = [mm.name if mm else "" for mm in me.materials]
+        # The + button in the UV Maps panel makes the layer it adds active, so reading the
+        # active layer on export wrote whichever one was selected.
+        obj["vtmb_uv_layer"] = uv.name
         for fam in range(len(m.skins) or 1):
             row = m.skins[fam] if fam < len(m.skins) else None
             for r, j in slots.items():

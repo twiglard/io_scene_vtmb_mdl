@@ -245,6 +245,53 @@ _VERTANIM0 = struct.Struct("<hh3fHBB")
 _VERTANIM1 = struct.Struct("<hHHBB")
 
 VERTEX_STRIDE = {0: 44, 1: 12, 2: 8}
+
+
+def decode_vertices(filetype, d, base, n, quant_offset=None, quant_scale=None):
+    """`n` vertices decoded out of a raw block, wherever it is held.
+
+    `Mdl.vertices` reads a file through this, and a writer reads back a block it
+    has just packed through the same code, so a field re-derived from the written
+    bytes cannot come off a different decoding from the one the engine will do.
+    """
+    stride = VERTEX_STRIDE.get(filetype)
+    if stride is None:
+        raise ValueError("unknown vertex filetype %d" % filetype)
+    out = []
+    for i in range(n):
+        o = base + i * stride
+        v = Vertex()
+        if filetype == 0:
+            w = d[o:o + 3]
+            # Four bones: the fourth weight is not stored, it is the shortfall, and
+            # byte +3 % 5 is how many of the four count (StudioRender+0x172b9).
+            v.numbones = d[o + 3] % 5
+            v.weights = [x / 255.0 for x in w] + [(255 - sum(w)) / 255.0]
+            v.bones = list(struct.unpack_from("<4h", d, o + 4))
+            v.pos = struct.unpack_from("<3f", d, o + 12)
+            v.normal = struct.unpack_from("<3f", d, o + 24)
+            v.uv = struct.unpack_from("<2f", d, o + 36)
+        else:
+            q = struct.unpack_from("<3H", d, o) if filetype == 1 \
+                else struct.unpack_from("<3B", d, o)
+            nrm = QUANT_NORM[filetype]
+            v.pos = tuple(quant_offset[c] + q[c] * nrm * quant_scale[c]
+                          for c in range(3))
+            # An index into one of StudioRender's two tables, not a vector. Out of
+            # range is a file this will not invent a normal for, and (0,0,1) is what
+            # every one of these read before the tables were known.
+            raw = (struct.unpack_from("<H", d, o + 6)[0]
+                   if filetype == 1 else d[o + 3])
+            v.normal = NT.decode(filetype, raw) or (0.0, 0.0, 1.0)
+            uv = struct.unpack_from("<2H", d, o + 8) if filetype == 1 \
+                else struct.unpack_from("<2H", d, o + 4)
+            v.uv = (uv[0] / 65535.0, uv[1] / 65535.0)
+            v.bones, v.weights = [0] * 4, [1.0, 0.0, 0.0, 0.0]
+            v.numbones = 1
+        out.append(v)
+    return out
+
+
 # What a packed position scalar is multiplied by before the model's own quant_scale.
 # filetype 2's byte goes through g_byteToFloatTable (i/255) at StudioRender.dll 0x2c013be7,
 # filetype 1's ushort is FILDed raw at 0x2c013ac8, so only filetype 2's scale is an extent.
@@ -1135,38 +1182,9 @@ class Mdl:
                 v.uv = t[14:16]
                 out.append(v)
             return out
-        for i in range(model.numvertices):
-            o = model.vertexbase + i * stride
-            v = Vertex()
-            if model.filetype == 0:
-                w = d[o:o + 3]
-                # Four bones: the fourth weight is not stored, it is the shortfall, and
-                # byte +3 % 5 is how many of the four count (StudioRender+0x172b9).
-                v.numbones = d[o + 3] % 5
-                v.weights = [x / 255.0 for x in w] + [(255 - sum(w)) / 255.0]
-                v.bones = list(struct.unpack_from("<4h", d, o + 4))
-                v.pos = struct.unpack_from("<3f", d, o + 12)
-                v.normal = struct.unpack_from("<3f", d, o + 24)
-                v.uv = struct.unpack_from("<2f", d, o + 36)
-            else:
-                q = struct.unpack_from("<3H", d, o) if model.filetype == 1 \
-                    else struct.unpack_from("<3B", d, o)
-                nrm = QUANT_NORM[model.filetype]
-                v.pos = tuple(model.quant_offset[c] + q[c] * nrm * model.quant_scale[c]
-                              for c in range(3))
-                # An index into one of StudioRender's two tables, not a vector. Out of
-                # range is a file this will not invent a normal for, and (0,0,1) is what
-                # every one of these read before the tables were known.
-                raw = (struct.unpack_from("<H", d, o + 6)[0]
-                       if model.filetype == 1 else d[o + 3])
-                v.normal = NT.decode(model.filetype, raw) or (0.0, 0.0, 1.0)
-                uv = struct.unpack_from("<2H", d, o + 8) if model.filetype == 1 \
-                    else struct.unpack_from("<2H", d, o + 4)
-                v.uv = (uv[0] / 65535.0, uv[1] / 65535.0)
-                v.bones, v.weights = [0] * 4, [1.0, 0.0, 0.0, 0.0]
-                v.numbones = 1
-            out.append(v)
-        return out
+        return decode_vertices(model.filetype, d, model.vertexbase,
+                               model.numvertices, model.quant_offset,
+                               model.quant_scale)
 
     def extract(self, off, frame):
         """One int16 out of an RLE channel. num.total is a byte, so runs cap at 255."""

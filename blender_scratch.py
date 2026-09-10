@@ -239,7 +239,7 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
     me = obj.data
     if not me.polygons:
         raise Refused("%s has no faces" % obj.name)
-    uv_layer = me.uv_layers.active
+    uv_layer = export_mod.uv_layer_of(obj)[0]
     if uv_layer is None:
         raise Refused("%s has no UV layer" % obj.name)
     me.calc_loop_triangles()
