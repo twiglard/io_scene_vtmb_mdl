@@ -34,6 +34,10 @@ BONE_FLAGS = build_mod.BONE_USED
 # Splitting key resolution. Two loops of one vertex that agree to this are one file vertex.
 NORMAL_Q = 1e-5
 UV_Q = 1e-6
+
+# `blind` is the normals that moved past the round trip's own error and not past
+# NORMAL_EPS: written from the file, so the edit is lost. Same band the in-place path reports.
+NO_EDITS = (("uvs", 0), ("normals", 0), ("blind", 0), ("added", 0))
 # An original that has not been moved sits exactly on its imported position -- float32 both
 # sides -- so this is slack, not licence to have moved.
 HOME_TOL = 1e-3
@@ -177,6 +181,10 @@ def original_runs(obj, me, why=None):
         why.append("the object carries no vtmb_orig tags, so no vertex of the scene can "
                    "be matched to one of the file's")
         return None
+    # The stamped slot resolved to where that material sits now, because the run is
+    # matched against a polygon's live `material_index` below and Blender renumbers slots
+    # on a reorder or a delete.
+    moves = export_mod.slot_moves(obj)[0]
     runs, at, slots = [], 0, set()
     for slot, n in spec:
         members = [ident.get(at + k) for k in range(int(n))]
@@ -185,11 +193,17 @@ def original_runs(obj, me, why=None):
             why.append("file vertex %d is claimed by no vertex of the scene, so it was "
                        "deleted or its tag was lost" % lost)
             return None
-        if int(slot) in slots:
-            why.append("material slot %d names two of the file's meshes" % int(slot))
+        here = int(slot) if moves is None else moves.get(int(slot))
+        if here is None:
+            why.append("the material slot one of the file's meshes was imported into is "
+                       "no longer in the scene, so a vertex added to that mesh could not "
+                       "be placed")
             return None
-        slots.add(int(slot))
-        runs.append((int(slot), members))
+        if here in slots:
+            why.append("material slot %d names two of the file's meshes" % here)
+            return None
+        slots.add(here)
+        runs.append((here, members))
         at += int(n)
     return runs
 
@@ -206,15 +220,21 @@ def wound(corners):
     return tuple(reversed(corners))
 
 
-def split_mesh(obj, bone_index, scale=1.0):
-    """([(material slot, verts, faces), ...], unskinned, kept, why) per distinct corner.
+def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
+    """([(material slot, verts, faces), ...], unskinned, kept, why, edits) per corner.
 
     The format stores one normal, one UV and one skin per vertex, so a seam or a hard edge
     is spelled by duplicating the vertex. `kept` counts the originals written back into
     their own mesh in file order; it is 0 when the partition had to be rebuilt from the
     material slots instead, which puts every vertex in triangle-visit order. `why` names
     the one condition that forced that, and is None where it did not happen -- eight
-    separate ones reach it and the caller refuses on the wrong one otherwise.
+    separate ones reach it and the caller refuses on the wrong one otherwise. `edits` is
+    what the scene moved on the originals, in the keys of NO_EDITS, and is all zero on the
+    rebuilt partition, which has no original to compare against.
+
+    `fields` is the export's own, so an original keeps what was imported for any field the
+    scene was not asked to supply. A vertex that has no original takes Blender's whatever
+    is asked, there being nothing else to take.
     """
     me = obj.data
     if not me.polygons:
@@ -250,9 +270,9 @@ def split_mesh(obj, bone_index, scale=1.0):
         runs = original_runs(obj, me, why)
         if runs is not None:
             out = _split_preserved(me, runs, stash, uvs, normals, uv_layer,
-                                   rec, key_of, why)
+                                   rec, key_of, why, fields)
             if out is not None:
-                return out[0], unskinned, out[1], None
+                return out[0], unskinned, out[1], None, out[2]
 
     per_slot = {}
     for tri in me.loop_triangles:
@@ -270,63 +290,147 @@ def split_mesh(obj, bone_index, scale=1.0):
             corners.append(at)
         faces.append(wound(corners))
     return ([(k, per_slot[k][0], per_slot[k][1]) for k in sorted(per_slot)],
-            unskinned, 0, why[0] if why else "the file's partition was not recoverable")
+            unskinned, 0, why[0] if why else "the file's partition was not recoverable",
+            dict(NO_EDITS))
 
 
-def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why):
+def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, fields):
     """Every original vertex back in its own slot, then whatever an edit added after it.
 
     A vertex with no original of its own is placed in the run its triangle's material slot
     names, and takes Blender's own normal: `stash` and `uvs` are indexed by Blender vertex
     and an edit copies or interpolates them, so they belong to nobody but the original.
     None when a triangle straddles two runs, which cannot be written without renumbering.
+
+    An original carries what the scene says about it for the fields the export asked for,
+    and both halves of that had to be read the same way in the two passes: writing the
+    stash into the file's own vertex and then keying the triangle off Blender's corner put
+    a moved UV on a key no slot held, so the edit arrived as a second vertex appended
+    behind the first and the file's own one was left drawn by nothing.
     """
+    take_uv, take_normal = "uvs" in fields, "normals" in fields
+    dead = export_mod._dead_loops(me)
+    corners_of = {}
+    for tri in me.loop_triangles:
+        for li in tri.loops:
+            corners_of.setdefault(me.loops[li].vertex_index, []).append(li)
+
+    def averaged(vi):
+        """(the normal every quiet corner of an original resolves to, how far it moved).
+
+        Averaged rather than read per corner, which is what the in-place path does and for
+        the same reason: a custom split normal round-trips through two 16-bit angles and
+        comes back up to 9.2e-03 out, differing between loops of one vertex, so reading
+        the corners raw would split every edited vertex into one copy per corner. Corners
+        on a face with no area are left out -- BUGS 39 is what averaging them costs.
+
+        An exactly-zero stash is kept whatever the corners say: Blender hands back
+        (0, 0, 1) for one and no average can be near it, which is BUGS 35 on this path.
+        """
+        live = [li for li in corners_of.get(vi, ()) if li not in dead]
+        if not take_normal or not live or stash[vi] == (0.0, 0.0, 0.0):
+            return stash[vi], 0.0
+        acc = [0.0, 0.0, 0.0]
+        for li in live:
+            v = normals[li].vector
+            for c in range(3):
+                acc[c] += v[c]
+        length = (acc[0] ** 2 + acc[1] ** 2 + acc[2] ** 2) ** 0.5 or 1.0
+        avg = tuple(x / length for x in acc)
+        dev = max(abs(a - b) for a, b in zip(avg, stash[vi]))
+        return (stash[vi] if dev <= export_mod.NORMAL_EPS else avg), dev
+
+    decided, moved = {}, {}
+    for _slot, members in runs:
+        for vi in members:
+            decided[vi], moved[vi] = averaged(vi)
+
+    def corner(vi, li):
+        """(normal, u, w) for one corner of an original.
+
+        A corner further than NORMAL_EPS from what the vertex settled on is a hard edge
+        the scene put there and still splits; the rest resolve to the one value, so an
+        edit moves the vertex instead of duplicating it. A UV is float32 on both sides and
+        needs none of that.
+        """
+        base = decided[vi]
+        n = base if not take_normal else tuple(normals[li].vector)
+        u, w = uv_layer.data[li].uv if take_uv else uvs[vi]
+        if base == (0.0, 0.0, 0.0) or max(abs(a - b) for a, b in zip(n, base)) \
+                <= export_mod.NORMAL_EPS:
+            n = base
+        return n, u, w
+
+    def home(vi):
+        """The corner an original keeps, and how far its UV moved.
+
+        The file keeps this vertex's number and a flex key or a cloth row names it by
+        that, so of the corners a seam split apart the original takes the one nearest what
+        was imported. Untouched, every corner answers the stash and the first wins.
+
+        No corner at all is a vertex only a stripped lower LOD drew -- 3716 of
+        blueblood_female's 9129 -- and it is written anyway, the .vtx still naming it.
+        """
+        su, sw = uvs[vi]
+        best = None
+        for li in corners_of.get(vi, ()):
+            n, u, w = corner(vi, li)
+            duv = max(abs(u - su), abs(w - sw))
+            dn = max(abs(a - b) for a, b in zip(n, decided[vi]))
+            if best is None or (duv, dn) < best[:2]:
+                best = (duv, dn, n, u, w)
+        if best is None:
+            return decided[vi], su, sw, 0.0
+        return best[2], best[3], best[4], best[0]
+
+    edits = dict(NO_EDITS)
     where, run_of_slot, out, seen, kept = {}, {}, [], [], 0
     for ri, (slot, members) in enumerate(runs):
         run_of_slot[slot] = ri
         verts, keys = [], {}
         for vi in members:
             where[vi] = ri
-            # Written even where no face reaches it. The import strips the LODs, so a
-            # vertex only a lower one draws arrives loose, and the .vtx still names it by
-            # its own id -- 3716 of blueblood_female's 9129 are that, and dropping them
-            # left every lower LOD pointing past the end of its mesh.
-            n, (u, w) = stash[vi], uvs[vi]
+            n, u, w, duv = home(vi)
+            if duv > UV_Q:
+                edits["uvs"] += 1
+            if moved[vi] > export_mod.NORMAL_EPS:
+                edits["normals"] += 1
+            elif moved[vi] > export_mod.NORMAL_NOISE:
+                edits["blind"] += 1
             keys[key_of(vi, n, u, w)] = len(verts)
             verts.append(rec(vi, n, u, w))
             kept += 1
         out.append((verts, []))
         seen.append(keys)
 
-    added = 0
     for tri in me.loop_triangles:
         corners = []
         for li in tri.loops:
             vi = me.loops[li].vertex_index
             ri = where.get(vi)
-            own = ri is not None
-            if not own:
+            if ri is None:
                 ri = run_of_slot.get(tri.material_index)
                 if ri is None:
                     why.append("a triangle sits on material slot %d, which names no mesh "
                                "of the file" % tri.material_index)
                     return None
-            n = stash[vi] if own else tuple(normals[li].vector)
-            u, w = uv_layer.data[li].uv
+                n = tuple(normals[li].vector)
+                u, w = uv_layer.data[li].uv
+            else:
+                n, u, w = corner(vi, li)
             key = key_of(vi, n, u, w)
             at = seen[ri].get(key)
             if at is None:
                 at = seen[ri][key] = len(out[ri][0])
                 out[ri][0].append(rec(vi, n, u, w))
-                if not own:
-                    added += 1
+                edits["added"] += 1
             corners.append((ri, at))
         if corners[0][0] != corners[1][0] or corners[1][0] != corners[2][0]:
             why.append("a triangle spans two of the file's meshes")
             return None
         out[corners[0][0]][1].append(wound([c[1] for c in corners]))
     return [(runs[ri][0], out[ri][0], out[ri][1])
-            for ri in range(len(runs))], kept, added
+            for ri in range(len(runs))], kept, edits
 
 
 PIN_GROUP = "vtmb_pinned"
@@ -401,7 +505,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     total_unskinned = total_kept = 0
     crowded, cloths = [], []
     for obj in mesh_objs:
-        runs, unskinned, kept, _why = split_mesh(obj, bone_index, scale)
+        runs, unskinned, kept, _why, _edits = split_mesh(obj, bone_index, scale)
         total_unskinned += unskinned
         total_kept += kept
         over = export_mod.crowded_vertices(obj, bone_index)
@@ -600,6 +704,9 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
         a = build_mod.add_animation(d, act.name, poses, fps, flags, movements)
+        # `get(key, default)` and not `or`: an imported action carries "" where its
+        # sequence claimed no activity, and that is a value, not a gap for the
+        # dialog to fill.
         build_mod.add_sequence(d, act.name, a, act.get("vtmb_activity", activity),
                                int(act.get("vtmb_seq_flags", 0)))
     return len(actions), moved, unfitted, unkeepable

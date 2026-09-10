@@ -184,6 +184,8 @@ BONE_ROTATION_FROM_ROOT = 0x2
 
 ANIMDESC_STRIDE = 72
 SEQDESC_STRIDE = 764
+SEQ_ACTIVITY = 0x04
+SEQ_FLAGS = 0x08
 SEQ_BBMIN = 0x1c
 SEQ_ANIM = 0x38
 SEQ_GROUPSIZE = 0x23C
@@ -657,11 +659,17 @@ class Mdl:
         d, s = self.d, Seq()
         s.index = i
         s.label = self._cstr(off + struct.unpack_from("<i", d, off)[0])
-        s.activity = self._cstr(off + struct.unpack_from("<i", d, off + 4)[0])
+        # `> 0` the way the four string fields below are read: a zero word is what a
+        # writer leaves for "no activity", and adding it to `off` would read the record's
+        # own sznameindex as a string. No shipped sequence carries one -- 0 of 14012 --
+        # 2433 of them instead pointing at an empty string, which is the file's own idiom
+        # and what a writer reproduces.
+        v = struct.unpack_from("<i", d, off + SEQ_ACTIVITY)[0]
+        s.activity = self._cstr(off + v) if v > 0 else ""
         # STUDIO_LOOPING is bit 0 of THIS field, not of mstudioanimdesc_t.flags at the
         # same offset of that struct: a file carrying the animdesc bit and not this one
         # plays once and stops -- measured in game 2026-08-22 on ztest/zskel_loop.mdl.
-        s.flags = struct.unpack_from("<i", d, off + 8)[0]
+        s.flags = struct.unpack_from("<i", d, off + SEQ_FLAGS)[0]
         # Mod_GetBounds (engine.dll 200b5970) only *widens* hull_min/hull_max with this,
         # so a zero one does not stop the model drawing.  vampire.dll 10090c80 is the one
         # place it is read alone, sizing an entity's collision hull, and substitutes 0.0

@@ -20,13 +20,23 @@ the Unofficial Patch works with no extraction step.
   using an existing file as the donor. Animations come from Blender's poses; vertex
   positions, normals, UVs and weights are optional. Vertex and face counts may change: a
   mesh that moved is rebuilt whole and its `.dx80.vtx` rewritten beside the model, while a
-  mesh that did not comes back byte for byte. Only `.dx80.vtx` is written, so a
-  `.dx7_2bone.vtx`, `.dx90.vtx` or `.sw.vtx` beside the model goes stale and is named in a
-  warning — the engine asks for `.dx80.vtx` first and tests only the flavour it loaded.
+  mesh that did not comes back byte for byte. Geometry is written to `.dx80.vtx` only, so
+  a `.dx7_2bone.vtx`, `.dx90.vtx` or `.sw.vtx` beside the model goes stale and is named in
+  a warning — the engine asks for `.dx80.vtx` first and tests only the flavour it loaded.
+  **Turn LODs off** is the exception and edits every flavour that is there, since the
+  engine picks one by `-dxlevel` and a flavour left at seven LODs still swaps to a coarse
+  mesh at distance.
 - *File > Export > VTMB Model, no donor (.mdl)* authors a `.mdl` **and** its matching
   `.dx80.vtx` from the scene alone, with no donor file at all.
 
 Both paths have been confirmed in game.
+
+The donor path also edits the parts of a model that have no geometry: bones added,
+renamed or deleted (with the animations re-based onto the new bind and everything indexing
+a bone renumbered), an animation replaced, appended or deleted, materials renamed with a
+`.vmt` and a `.tth`/`.ttz` pair written beside the model on request, cloth gravity and
+stiffness taken from the scene, and **Turn LODs off**, which writes 1 into every `.vtx`
+LOD count so the model never swaps to a coarse mesh.
 
 **Bone sets** — *Add > VTMB > Bone set...* drops a skeleton into the scene, or merges one
 onto the armature already there. Each template is a small `.json` under `templates/`
@@ -41,8 +51,9 @@ something that walks, and the engine joins it **by bone name, case-insensitively
 generated skeleton of the right names plays the game's own animations at its own limb
 lengths. Rename a bone and it silently stops animating.
 
-Adding a template is dropping a file in `templates/`. `plans/template-check.py` validates
-every one of them, and packing refuses any field tagged as measured off a shipped file.
+Adding a template is dropping a file in `templates/`. Every one is validated against the
+schema before it ships, and packing refuses any field tagged as measured off a shipped
+file.
 
 ## Requirements
 
@@ -85,21 +96,23 @@ Stated up front, because hitting one should not be how it gets discovered.
   its faces. Which group a *new* triangle belongs to is studiomdl's decision and is
   recorded nowhere. 547 of 9705 top-LOD meshes are split that way, 5.64%; the rest edit
   freely, and a split mesh whose faces did not move is patched like any other.
-- Removing a bone.
-- Authoring new materials or textures. Repointing an existing one is a text edit to the
-  `.vmt`; supplying a genuinely new image would need a `.tth` encoder, which does not
-  exist here.
-- Skin families past the first, so alternate looks are invisible in Blender.
-- Removing an animation. The dialog replaces, and *Add the rest as new* appends; neither
-  drops one.
+- Collision and ragdoll. Both live in the sibling `.phy`, which nothing here reads or
+  writes, so renaming or deleting a bone leaves that file citing a skeleton the model no
+  longer has.
+- Authoring a skin family the file does not carry. Every family it *does* carry is listed
+  in the armature's Object Data tab and pickable, and the export writes the row you
+  picked.
 
 **What the no-donor path leaves out**, listed verbatim in its own export dialog:
 
 - collision and ragdoll — both live in the sibling `.phy`, not written
-- cloth, flex descs, controllers, rules and every vertanim
+- flex descs, controllers, rules and every vertanim
 - eyeballs, mouths and pose parameters
 - spring bones, procedural bones, IK chains and bone controllers
-- attachments, sequence events and autolayers
+- sequence events and autolayers
+
+The donor path writes every one of those bar the `.phy` — cloth, attachments and hitbox
+sets included.
 
 Nothing blocks a rebuild: over the 4464 models of a full install, all 4464 re-author and
 verify against the donor with none differing. Cloth carriers included — the region moves

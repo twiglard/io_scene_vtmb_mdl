@@ -1131,9 +1131,16 @@ def _stamp_posetobone(d):
 
 def set_bone_poses(d, poses):
     """Overwrite the bind pose of bones already in `d`.  `poses` is
-    {index: (pos, quat, flags)} and `flags` may be None to keep the record's own.
+    {index: (pos, quat, flags, parent)}; `flags` may be None to keep the record's own and
+    `parent` is None on all but a reparented bone.
 
-    The rest of each record stays: parent, the quantisation scales an existing animation is
+    A reparent is carried by `rebase_carried` for nothing extra: it re-encodes against the
+    bind each record now holds, and a bone whose parent changed has a different
+    parent-relative bind by construction, so it is in `moved` already.  Every channel is
+    parent-local, so `A_new = B_new . B_old^-1 . A_old` preserves the animation's offset
+    from the bind whichever parent each side is relative to.
+
+    The rest of each record stays: the quantisation scales an existing animation is
     already encoded against, surfaceprop, and the procedural helper.  `poseToBone` is
     restamped for every bone, not only the named ones, because a moved parent changes its
     children's world matrices too.
@@ -1145,12 +1152,14 @@ def set_bone_poses(d, poses):
     re-exported animations following it and the carried ones not -- is the defect.
     """
     old = _skeleton(d)
-    for k, (pos, quat, flags) in poses.items():
+    for k, (pos, quat, flags, parent) in poses.items():
         raw = d.bones[k].raw
         struct.pack_into("<3f", raw, 0x20, *pos)
         struct.pack_into("<4f", raw, 0x2c, *quat)
         if flags is not None:
             struct.pack_into("<i", raw, 0x88, flags)
+        if parent is not None:
+            struct.pack_into("<i", raw, 0x04, parent)
     _stamp_posetobone(d)
     return rebase_carried(d, old)
 
@@ -1379,6 +1388,12 @@ def remove_bone(d, i):
 
     for r in d.bones:
         patch(r.raw, 0x04, "bone %r" % r.name)
+        # mstudioaxisinterpbone_t.control @+0x00. Carried as one 176-byte blob, so it is
+        # the one bone index in the file no other loop here reaches.
+        if r.extra.get("proc"):
+            buf = bytearray(r.extra["proc"])
+            patch(buf, 0x00, "procedural bone %r" % r.name)
+            r.extra["proc"] = bytes(buf)
     for k, r in enumerate(d.bonecontrollers):
         patch(r.raw, 0x00, "bone controller %d" % k)
     for k, r in enumerate(d.hitboxsets):

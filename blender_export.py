@@ -19,19 +19,26 @@ import struct
 import bpy
 import mathutils
 
+from . import cloth as cloth_mod
 from . import mdl as mdl_mod
 from . import mdl_build as build_mod
 from . import mdl_rebuild as rebuild_mod
 from . import mdl_write as write_mod
 from . import mesh_write as mesh_mod
 from . import paths as paths_mod
+from . import vtx as vtx_mod
 from . import vtx_rebuild as vtxr_mod
+from . import vtx_write as vtxw_mod
 
 
 UV_TOL = 1e-6
 # Custom split normals are stored as two 16-bit angles, so an untouched mesh's corners
 # disagree by up to 9.2e-03; under this a normal is taken as unedited.
 NORMAL_EPS = 1.5e-2
+# The round trip's own worst error, so between this and NORMAL_EPS a vertex may have been
+# edited and cannot be told from storage noise. `_one_normal` counts those and the export
+# reports them rather than deciding in silence.
+NORMAL_NOISE = 9.2e-3
 NORMAL_ATTR = "vtmb_normal"
 # Against the import stash an untouched bone compares exactly -- until an edit happens.
 # Leaving Edit Mode recomposes every bone from head/tail/roll, and that reaches bones the
@@ -261,16 +268,51 @@ def moved_from_file(m, b, pos, quat):
                 and all(abs(x - y) <= REST_QUAT_EPS for x, y in zip(quat, b.quat)))
 
 
-def read_bones(m, arm_obj, scale):
-    """{index: (pos, quat, flags)} for the bones of `m` the armature actually moved.
+def reparented(m, k, db, file_of):
+    """The file bone index Blender's parent names, or None where it agrees with the file.
+
+    Raises where the edit cannot be written. The engine walks the bone array in order and
+    builds each world matrix off its parent's, so a parent has to sit earlier than its
+    child -- 0 of 61 925 bones over the 4445 shipped models break that -- and nothing here
+    renumbers the array.
+
+    A deletion is a reparent too, and reaches this in agreement rather than as an edit:
+    `drop_missing_bones` rebinds the children in `d` and `_EditedBones` puts that chain
+    back in `m` before the first reader runs.
+    """
+    b = m.bones[k]
+    name = db.parent.name if db.parent is not None else None
+    now = -1 if name is None else file_of.get(name)
+    if now is None:
+        raise ValueError(
+            "bone %r is parented to %r, which the file has no bone for -- parent it to "
+            "one the file carries, or let the export add %r first"
+            % (b.name, name, name))
+    if now == b.parent:
+        return None
+    if now >= k:
+        was = m.bones[b.parent].name if b.parent >= 0 else "nothing"
+        raise ValueError(
+            "bone %r was reparented from %s to %r, which sits at index %d against its own "
+            "%d -- the engine builds each bone's world matrix off its parent's while "
+            "walking the array in order, so a parent must come first, and nothing here "
+            "renumbers the bone array" % (b.name, was, m.bones[now].name, now, k))
+    return now
+
+
+def read_bones(m, arm_obj, scale, blind=None):
+    """{index: (pos, quat, flags, parent)} for the bones of `m` the armature actually moved.
 
     A bone still sitting on its imported pose is left out, so an unedited export does not
     touch the bone array and comes back byte for byte -- the same reason the mesh puts an
     unmoved vertex back with its file bytes rather than Blender's.
 
-    The file's parent chain is what the local matrix is taken against, not Blender's. The
-    two agree on an imported armature, and where they disagree it is the file the output
-    has to stay consistent with.
+    `parent` is None on all but a reparented bone. The local matrix is taken against the
+    chain the OUTPUT will have -- the file's where Blender agrees with it, Blender's where
+    it does not -- so the record and the parent it names stay consistent with each other.
+
+    `blind` is filled with the bones whose only baseline is the file's own record, where
+    the comparison is one-sided -- see `moved_from_file`.
     """
     dbs = arm_obj.data.bones
     bmap = bone_map(m, arm_obj)
@@ -278,11 +320,14 @@ def read_bones(m, arm_obj, scale):
     if missing:
         raise ValueError("armature has no bone %s (and %d more)"
                          % (missing[0], len(missing) - 1))
+    file_of = {bmap[b.name]: k for k, b in enumerate(m.bones)}
     out = {}
     for k, b in enumerate(m.bones):
+        parent = reparented(m, k, dbs[bmap[b.name]], file_of)
+        pk = b.parent if parent is None else parent
         local = dbs[bmap[b.name]].matrix_local
-        if b.parent >= 0:
-            local = dbs[bmap[m.bones[b.parent].name]].matrix_local.inverted() @ local
+        if pk >= 0:
+            local = dbs[bmap[m.bones[pk].name]].matrix_local.inverted() @ local
         pos, quat = to_file(local, scale)
         flags = bone_flags(arm_obj, bmap[b.name])
         # A quaternion and its negation are one rotation, so the nearer sign wins or a bone
@@ -292,18 +337,22 @@ def read_bones(m, arm_obj, scale):
         base = rest_baseline(arm_obj, bmap[b.name])
         if base is None:
             moved = moved_from_file(m, b, pos, quat)
+            if (blind is not None and not moved
+                    and (pos != tuple(b.pos) or quat != tuple(b.quat))):
+                blind.append(b.name)
         else:
             moved = any(abs(local[i][j] - base[i][j]) > REST_EPS
                         for i in range(4) for j in range(4))
-        if not moved and (flags is None or flags == b.flags):
+        if not moved and parent is None and (flags is None or flags == b.flags):
             continue
         if not moved:
             # A flags-only record. Blender's own pos and quat are the file's to within the
             # bound above, and writing them anyway hands `rebase_carried` a bone that reads
             # as moved under its exact `!=`, which re-quantises every animation in the file
-            # for storage noise.
-            pos, quat = b.pos, b.quat
-        out[k] = (pos, quat, flags)
+            # for storage noise. A reparent keeps Blender's, since the two parents give
+            # genuinely different parent-relative binds.
+            pos, quat = (pos, quat) if parent is not None else (b.pos, b.quat)
+        out[k] = (pos, quat, flags, parent)
     return out
 
 
@@ -509,7 +558,8 @@ def _one_uv(me, count, uv_layer):
 
 
 def _one_normal(me, count, stash):
-    """One normal per vertex, and how many were taken from Blender rather than `stash`.
+    """One normal per vertex, how many came from Blender rather than `stash`, and how many
+    sat in the band where the two cannot be told apart.
 
     Averaging the corners is only ever a fallback: the round trip through custom split
     normals is lossy, so a vertex still within NORMAL_EPS of the normal the importer
@@ -530,7 +580,7 @@ def _one_normal(me, count, stash):
     dead = _dead_loops(me)
     per = _per_vertex(me, count, corner, skip=dead)
     every = _per_vertex(me, count, corner) if dead else per
-    out, edited = [], 0
+    out, edited, blind = [], 0, 0
     for i, vs in enumerate(per):
         if not vs and stash:
             out.append(stash[i])
@@ -544,14 +594,15 @@ def _one_normal(me, count, stash):
         avg = [sum(v[c] for v in vs) / len(vs) for c in range(3)]
         n = math.sqrt(sum(x * x for x in avg)) or 1.0
         avg = tuple(x / n for x in avg)
-        if stash and (stash[i] == (0.0, 0.0, 0.0)
-                      or max(abs(a - b) for a, b in zip(avg, stash[i]))
-                      <= NORMAL_EPS):
+        dev = max(abs(a - b) for a, b in zip(avg, stash[i])) if stash else None
+        if stash and (stash[i] == (0.0, 0.0, 0.0) or dev <= NORMAL_EPS):
             out.append(stash[i])
+            if stash[i] != (0.0, 0.0, 0.0) and dev > NORMAL_NOISE:
+                blind += 1
         else:
             out.append(avg)
             edited += 1
-    return out, edited
+    return out, edited, blind
 
 
 def _stashed(me, name, count, width=4, field="color"):
@@ -633,14 +684,14 @@ def read_mesh(obj, model, bone_index, fields):
                          % (obj.name, len(me.vertices), model.numvertices, model.name))
     n = model.numvertices
     uvs = normals = [None] * n
-    edited = 0
+    edited = blind = 0
     if "uvs" in fields:
         uv_layer = me.uv_layers.active
         if uv_layer is None:
             raise ValueError("%s has no UV layer" % obj.name)
         uvs = _one_uv(me, n, uv_layer)
     if "normals" in fields:
-        normals, edited = _one_normal(
+        normals, edited, blind = _one_normal(
             me, n, _stashed(me, NORMAL_ATTR, n, width=3, field="vector"))
     skin = None
     if "weights" in fields:
@@ -658,19 +709,83 @@ def read_mesh(obj, model, bone_index, fields):
         x.weights, x.bones, x.numbones = _one_skin(
             v, obj.vertex_groups, bone_index, skin[i] if skin else None)
         out.append(x)
-    return out, edited
+    return out, edited, blind
 
 
-def _must_rebuild(obj, model, fields):
+def _canon_faces(tris):
+    """Triangles counted as rotations starting at the lowest corner.
+
+    Rotation-blind so the two spellings of one face compare equal, winding-sensitive so a
+    reversed one does not, and a Counter rather than a set because 11 of 4463 shipped
+    models carry a repeated triangle -- 25 extra copies, `chinabldgroof` 4 and `tunabp2b`
+    5 -- and Blender keeps every one of them, so multiplicity is part of what the donor
+    said.
+    """
+    import collections
+    return collections.Counter(vtxr_mod._canon(t) for t in tris)
+
+
+def _donor_faces(source, m):
+    """{(bodypart, model): the donor's own LOD-0 triangles}, in the file's winding.
+
+    Triangles live in the .vtx alone -- `mstudiomesh_t` carries no count -- so a face
+    added, deleted or reversed reaches the file by no other route and the .mdl offers
+    nothing to compare on. Corners come out model-local, which is what a Blender object's
+    vertices are indexed by, by the same mapping `blender_import` reads them in through.
+
+    Empty where no .vtx sits beside the source, which leaves the caller comparing what it
+    compared before rather than rebuilding every model on a missing file.
+    """
+    path = vtx_path(source)
+    if not source or not os.path.exists(path):
+        return {}
+    reader = vtx_mod.Vtx(path)
+    models = mesh_mod.models_of(m)
+    out, per = {}, {}
+    for sg in reader.groups:
+        if sg.lod != 0 or sg.model >= len(models):
+            continue
+        mo = models[sg.model][3]
+        if sg.mesh >= len(mo.meshes):
+            continue
+        base = mo.meshes[sg.mesh].vertexoffset
+        ids = reader.orig_vert_ids(sg)
+        per.setdefault(sg.model, []).extend(
+            tuple(ids[x] + base for x in t) for t in reader.triangles(sg))
+    for gi, tris in per.items():
+        bi, mi = models[gi][0], models[gi][1]
+        out[(bi, mi)] = _canon_faces(tris)
+    return out
+
+
+def _scene_faces(me):
+    """The scene's triangles in the file's own winding, model-local.
+
+    `wound` reverses in both directions -- the format winds a triangle against its outward
+    normal and Blender winds it with -- so the reverse here is what puts a Blender face
+    back in the donor's terms.
+    """
+    me.calc_loop_triangles()
+    return _canon_faces(tuple(tri.vertices)[::-1] for tri in me.loop_triangles)
+
+
+def _must_rebuild(obj, model, fields, donor_faces=None):
     """Whether this object has outgrown the in-place path.
 
-    In place patches fields index for index and is byte-identical wherever nothing moved,
-    so it stays the default; the split path rewrites the whole model and is what a changed
-    count or a UV seam needs. A seam is a vertex whose corners disagree, which the format
-    spells by duplicating the vertex -- so it is a count change wearing another hat.
+    In place patches fields index for index; the split path rewrites the whole model and
+    is what a changed vertex count, a UV seam or a changed face needs. A seam is a vertex
+    whose corners disagree, which the format spells by duplicating the vertex -- so it is
+    a count change wearing another hat.
+
+    `donor_faces` is what the .vtx said, and None where no .vtx was found. Comparing it is
+    what stops a face deleted, added between existing vertices, or flipped from writing a
+    file identical to the one it was edited from: none of the three moves the vertex count
+    or a UV, so every other test here passes on an edit the file never took.
     """
     me = obj.data
     if len(me.vertices) != model.numvertices:
+        return True
+    if donor_faces is not None and _scene_faces(me) != donor_faces:
         return True
     if "uvs" not in fields:
         return False
@@ -682,18 +797,23 @@ def _must_rebuild(obj, model, fields):
                for vs in per)
 
 
-def rebuild_cell(d, obj, bi, mi, bone_index):
-    """One model's geometry replaced from the scene, and its per-mesh triangles.
+def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals")):
+    """One model's geometry replaced from the scene, its per-mesh triangles and its edits.
 
     Refuses a renumbering the file cannot absorb rather than dropping what it would break:
     `split_mesh` reports `kept` 0 when the original partition could not be recovered, and
     names which of its eight conditions forced that. A flex payload or a cloth binding
     keyed to the old numbering would be carried onto the wrong vertices; with neither of
     those present renumbering costs nothing.
+
+    `fields` is what the checkboxes asked for. Without it a face added or a winding
+    reversed changes Blender's corner normal on every vertex it touches, and the split
+    would take that as an edit and write it -- on an export that never asked for normals.
     """
     # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
     from . import blender_scratch as scratch_mod
-    runs, unskinned, kept, why = scratch_mod.split_mesh(obj, bone_index, 1.0)
+    runs, unskinned, kept, why, edits = scratch_mod.split_mesh(obj, bone_index, 1.0,
+                                                               fields)
     mr = d.bodyparts[bi].kids[mi]
     if not kept:
         carries = []
@@ -706,7 +826,7 @@ def rebuild_cell(d, obj, bi, mi, bone_index):
                 "%s: the file's own vertex numbering could not be recovered -- %s -- and "
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
     faces = build_mod.replace_model(d, bi, mi, [(None, v, f) for _slot, v, f in runs])
-    return faces, unskinned, kept
+    return faces, unskinned, kept, edits
 
 
 def _vertex_normals(me, coords):
@@ -817,13 +937,44 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     return nkeys, nrec, skipped, None
 
 
+# PR #2 corrected the packed position on 2026-08-20. A `.blend` saved by an import older
+# than that holds every filetype-2 model 255x oversized, and `vtmb_orig_co` is wrong the same
+# way, so the export's own before/after comparison cannot see it. Filetypes 0 and 1 decode
+# the same today as they did then.
+STALE_DECODE = {2: (0, 2, 0)}
+
+
+def stale_stash(m, source):
+    """[(object, filetype, stamped version or None)] for scene objects an old import made.
+
+    An unstamped object counts as stale: every `.blend` that exists today is unstamped, and
+    the versions that wrote no stamp are exactly the ones the decode fix post-dates.
+    """
+    found = mesh_objects(m, source)
+    out = []
+    for bi, mi, _bp, mo in mesh_mod.models_of(m):
+        want = STALE_DECODE.get(mo.filetype)
+        obj = found.get((bi, mi))
+        if want is None or obj is None:
+            continue
+        got = obj.get("vtmb_addon_version")
+        got = tuple(int(x) for x in got) if got is not None else None
+        if got is None or got < want:
+            out.append((obj.name, mo.filetype, got))
+    return out
+
+
 def read_meshes(m, source, fields):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
-    models it does not, the fields the file cannot carry, and the objects holding a vertex
-    whose fifth bone group no record can hold."""
+    models it does not, the fields the file cannot carry, the objects holding a vertex whose
+    fifth bone group no record can hold, and the vertices whose normal moved by more than the
+    round trip's own error and less than `NORMAL_EPS`, which are written from the stash and
+    so lose the edit."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
+    donor_faces = _donor_faces(source, m)
     edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
+    blind_normals = 0
     crowded = []
     for bi, mi, _bp, mo in mesh_mod.models_of(m):
         ok, no = mesh_mod.supported(mo.filetype, fields)
@@ -835,16 +986,18 @@ def read_meshes(m, source, fields):
         over = crowded_vertices(obj, bone_index)
         if over:
             crowded.append((obj.name, over))
-        if _must_rebuild(obj, mo, ok):
+        if _must_rebuild(obj, mo, ok, donor_faces.get((bi, mi))):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.
             rebuild[(bi, mi)] = obj
             continue
         unsupported |= set(no)
         if ok:
-            edits[(bi, mi)], n = read_mesh(obj, mo, bone_index, ok)
+            edits[(bi, mi)], n, nb = read_mesh(obj, mo, bone_index, ok)
             renormals += n
-    return edits, rebuild, missing, sorted(unsupported), renormals, crowded
+            blind_normals += nb
+    return (edits, rebuild, missing, sorted(unsupported), renormals, crowded,
+            blind_normals)
 
 
 def named_index(anim_names, action):
@@ -1009,25 +1162,96 @@ def skin_family(m, arm_obj):
     return fam
 
 
+def slot_moves(obj):
+    """({slot the import stamped: the slot it is in now}, [names no slot holds any more]).
+
+    A material slot index is the addon's only handle on which material speaks for which
+    file mesh, and Blender renumbers slots on a reorder or a delete, so the stamped index
+    names a different material afterwards and every texture record downstream is renamed
+    to whatever moved into its place. 1686 of the corpus's 4567 models carry two or more
+    slots, so that is 38% of it. `obj["vtmb_slot_mats"]` is what the import put in each
+    slot, and finding a stamped name at another index is what says the slots moved.
+
+    A name no slot holds is read two ways, and the slot count is what separates them.
+    Blender appends an added slot, so the count only falls when a slot was deleted: while
+    it holds or grows, an absent name is a rename and the slots no stamped name claimed
+    are what it was renamed to, its own index first and the rest in index order -- one
+    rename alone is exact, and with no reorder every rename is. Once the count has fallen,
+    a deletion and a rename are the same evidence and neither is guessed at, so the
+    unmatched names are reported and a rename made in the same edit is lost with them.
+
+    None rather than a map where the object carries no stamp -- a `.blend` saved before
+    2026-09-09 -- since the index is then all there is and reading every slot as deleted
+    would be worse than the defect.
+    """
+    stamp = [str(x) for x in (obj.get("vtmb_slot_mats") or ())]
+    if not stamp:
+        return None, []
+    mats = obj.data.materials
+    here = {}
+    for j, mm in enumerate(mats):
+        if mm is not None:
+            here.setdefault(mm.name, j)
+    out = {slot: here.get(name) for slot, name in enumerate(stamp)}
+    left = [slot for slot in sorted(out) if out[slot] is None]
+    idle = [j for j in range(len(mats))
+            if mats[j] is not None and j not in set(out.values())]
+    gone = []
+    if len(mats) < len(stamp):
+        gone = [stamp[slot] for slot in left]
+    else:
+        for slot in left:
+            if slot in idle:
+                idle.remove(slot)
+                out[slot] = slot
+        for slot in left:
+            if out[slot] is not None:
+                continue
+            if idle:
+                out[slot] = idle.pop(0)
+            else:
+                gone.append(stamp[slot])
+    return out, gone
+
+
+def slot_of(stash, moves, j):
+    """The slot file mesh `j` speaks through now, or None if there is no longer one."""
+    if j >= len(stash):
+        return None
+    slot = int(stash[j][0])
+    if moves is None:
+        return slot
+    return moves.get(slot)
+
+
 def read_materials(m, source, family=0):
-    """{file texture index: name} from the scene's material slots.
+    """({file texture index: name}, slots reordered, [slots deleted]).
 
     `obj["vtmb_meshes"]` records which slot each file mesh landed in, and it is the only
-    thing that maps a material back: two meshes may share one, and Blender's per-face slot
-    cannot speak for a mesh whose triangles all sit in a lower LOD.
+    thing that maps a material back: Blender's per-face slot cannot speak for a mesh whose
+    triangles all sit in a lower LOD, and nothing stops two meshes sharing one material --
+    though 0 of the corpus's 4567 models do. That index is resolved through `slot_moves`
+    rather than used directly.
+
+    A deleted slot leaves the file's own name standing, because every mesh names an
+    `mstudiotexture_t` and there is no way to spell "no material" in the format.
     """
-    out = {}
+    out, moved, gone = {}, 0, []
     for (bi, mi), obj in sorted(mesh_objects(m, source).items()):
         stash = obj.get("vtmb_meshes")
         if not stash:
             continue
         mats = obj.data.materials
+        moves, missing = slot_moves(obj)
+        gone.extend(missing)
         for j, mesh in enumerate(m.bodyparts[bi].models[mi].meshes):
             if j >= len(stash):
                 break
-            slot = int(stash[j][0])
-            if not 0 <= slot < len(mats) or mats[slot] is None:
+            slot = slot_of(stash, moves, j)
+            if slot is None or not 0 <= slot < len(mats) or mats[slot] is None:
                 continue
+            if slot != int(stash[j][0]):
+                moved += 1
             ref = mesh.material
             row = m.skins[family] if 0 <= family < len(m.skins) else None
             if row and 0 <= ref < len(row):
@@ -1037,7 +1261,7 @@ def read_materials(m, source, family=0):
                 raise ValueError("texture %d is named both %r and %r by the scene's "
                                  "materials" % (ref, out[ref], name))
             out[ref] = name
-    return out
+    return out, moved, gone
 
 
 def new_materials(m, source):
@@ -1053,7 +1277,10 @@ def new_materials(m, source):
         stash = obj.get("vtmb_meshes")
         if not stash:
             continue
-        used = {int(x[0]) for x in stash}
+        # Resolved the same way `read_materials` resolves it, or a reorder makes every
+        # slot look like one the scene added and the export appends the whole set again.
+        moves = slot_moves(obj)[0]
+        used = {slot_of(stash, moves, j) for j in range(len(stash))}
         for slot, mat in enumerate(obj.data.materials):
             if mat is None or slot in used or mat.name in seen:
                 continue
@@ -1252,6 +1479,189 @@ def _material_index(d, name):
 
 _FLEXCTRL_RE = re.compile(
     r"^\s*(\S+)\s+(?:range\s+(\S+)\s+(\S+)\s+)?(\S+)\s*$")
+
+
+# Springs store `w0 = 2*sigma*k0` and `w1 = -2*sigma*(1-k0)` and group 1 stores
+# `rest2 = slack * d2`, so one authored number moving is visible in every spring. Under
+# 1e-4 is the preset table's own rounding -- `cloth.recover` matches a preset to exactly
+# that -- and writing it would move a file nobody edited.
+CLOTH_TOL = 1e-4
+# Below this a rest separation carries no direction and its ratio is not recoverable.
+CLOTH_MIN_D2 = 1e-9
+# Cleared by cloth-donor.py's `noratio` control, which refits to the new separation itself
+# and so loses the group-1 slack and whatever else the spring's own ratio carried.
+CLOTH_KEEP_RATIO = True
+
+
+def _cloth_slot(cl):
+    """(slot, offset into cl["data"]) of the row-0 object the importer drew, or None.
+
+    Row 0 is what `blender_import._stamp_cloth` puts on the mesh object, so it is the only
+    one the scene can speak for.
+    """
+    cols = cl.get("cols") or 0
+    for k, at in cl.get("slots") or ():
+        if cols > 0 and k // cols == 0:
+            return k, at
+    return None
+
+
+def _cloth_header(data, at):
+    """The mstudiocloth_t fields a rewrite needs, off one object inside the carried blob."""
+    scale = struct.unpack_from("<f", data, at)[0]
+    npart, nfixed, _nfree, pvoff = struct.unpack_from("<4i", data, at + 0x04)
+    _ns, ns0, ns1, spoff = struct.unpack_from("<4i", data, at + 0x14)
+    pv = list(struct.unpack_from("<%dH" % npart, data, at + pvoff)) \
+        if pvoff and npart else []
+    springs = [struct.unpack_from("<2H3f", data, at + spoff + q * 16)
+               for q in range(ns0 + ns1)] if spoff else []
+    return scale, npart, nfixed, ns0, spoff, pv, springs
+
+
+def _d2(p, q):
+    return sum((a - b) ** 2 for a, b in zip(p, q))
+
+
+def cloth_edits(m, source, d):
+    """What each cloth-bound model's scene says that its donor bytes do not.
+
+    One entry per model carrying cloth: which of the three authored numbers moved, how many
+    particles sit somewhere else than the file compiled them at, and the reason the object
+    cannot be spoken for at all. Split from the write so the same comparison reports the
+    narrowing when the write is off -- a cloth object left describing the geometry it was
+    compiled against simulates the old garment, and nothing on screen says so.
+    """
+    found = mesh_objects(m, source)
+    out = []
+    for bi, mi, _bp, mo in mesh_mod.models_of(m):
+        rec = d.bodyparts[bi].kids[mi]
+        cl = rec.extra.get("cloth")
+        if not cl:
+            continue
+        obj = found.get((bi, mi))
+        e = {"key": (bi, mi), "model": mo.name, "object": obj.name if obj else None,
+             "why": None, "scale": None, "sigma": None, "slack": None, "moved": 0,
+             "springs": 0, "flattens": False}
+        out.append(e)
+        if obj is None:
+            e["why"] = "no mesh object in the scene belongs to this model"
+            continue
+        slot = _cloth_slot(cl)
+        if slot is None:
+            e["why"] = "the file's cloth table names no object in row 0"
+            continue
+        if not obj.get("vtmb_cloth"):
+            e["why"] = ("the Cloth box is off and the file's cloth object stays -- "
+                        "removing one is not a write this exporter has")
+            continue
+        _k, at = slot
+        scale_f, _npart, _nfixed, ns0, _spoff, pv, springs = _cloth_header(cl["data"], at)
+        if not springs or not pv:
+            e["why"] = "the file's cloth object carries no springs or no particle map"
+            continue
+        me = obj.data
+        if len(me.vertices) != mo.numvertices:
+            e["why"] = ("the scene holds %d vertices where the file's model has %d, so a "
+                        "particle's rest position cannot be read"
+                        % (len(me.vertices), mo.numvertices))
+            continue
+        donor = m.vertices(mo)
+        was = [donor[v].pos if v < len(donor) else (0.0, 0.0, 0.0) for v in pv]
+        r = cloth_mod.recover(scale_f, springs, ns0, was)
+        preset = str(obj.get("vtmb_cloth_preset") or "") or None
+        if preset is not None and preset not in cloth_mod.PRESETS:
+            e["why"] = ("the object names cloth preset %r, which is not one of the 17"
+                        % preset)
+            continue
+        p = cloth_mod.PRESETS[preset] if preset else None
+        # The panel's own number first, then the preset it names, then what the file
+        # already holds. A preset's `sigma` is a mean over a whole garment's objects and
+        # is not this object's number, so it is never a source here.
+        want_scale = obj.get("vtmb_cloth_scale")
+        if want_scale is None:
+            want_scale = p.scale if p else scale_f
+        want_slack = obj.get("vtmb_cloth_slack")
+        if want_slack is None:
+            want_slack = p.s if p else r.slack
+        want_sigma = obj.get("vtmb_cloth_sigma")
+        if want_scale is not None and abs(float(want_scale) - scale_f) > CLOTH_TOL:
+            e["scale"] = (scale_f, float(want_scale))
+        if want_slack is not None and r.slack is not None \
+                and abs(float(want_slack) - r.slack) > CLOTH_TOL:
+            e["slack"] = (r.slack, float(want_slack))
+        if want_sigma is not None and r.sigma is not None \
+                and abs(float(want_sigma) - r.sigma) > CLOTH_TOL:
+            e["sigma"] = (r.sigma, float(want_sigma))
+            # 39 of the corpus's 150 objects carry a sigma that varies spring by spring and
+            # the panel holds one number, so writing it replaces the variation.
+            e["flattens"] = not r.uniform
+        e["moved"] = sum(1 for v, w in zip(pv, was)
+                         if v < len(me.vertices)
+                         and _d2(tuple(me.vertices[v].co), w) > CLOTH_MIN_D2)
+        e["springs"] = len(springs)
+    return out
+
+
+def apply_cloth(d, m, source, edits=None):
+    """Each model's row-0 cloth object rewritten in place from the scene.
+
+    `scale` at +0x00, each spring's `w0`/`w1` from the panel's sigma with the file's own
+    mass split kept, and `rest2` refitted to where the particle's vertex now sits. Nothing
+    outside the object's own bytes moves, so the region keeps its length and the second
+    indirection stays as it was -- the table stores no count and every payload offset is
+    object-relative (anomalies section B10).
+
+    A spring's own `rest2 / d2` carries the group-1 slack and whatever else the compiler
+    left in it, so that ratio is what a geometry refit multiplies. The panel's slack
+    replaces it only where the user moved that number, which is what keeps an unedited
+    re-export byte for byte.
+    """
+    if edits is None:
+        edits = cloth_edits(m, source, d)
+    found = mesh_objects(m, source)
+    out = {"models": 0, "springs": 0, "scale": 0, "sigma": 0, "slack": 0, "refitted": 0,
+           "flattened": []}
+    for e in edits:
+        if e["why"] is not None:
+            continue
+        if not (e["scale"] or e["sigma"] or e["slack"] or e["moved"]):
+            continue
+        bi, mi = e["key"]
+        cl = d.bodyparts[bi].kids[mi].extra["cloth"]
+        _k, at = _cloth_slot(cl)
+        data = bytearray(cl["data"])
+        _scale_f, _npart, _nfixed, ns0, spoff, pv, springs = _cloth_header(data, at)
+        mo = m.bodyparts[bi].models[mi]
+        me, donor = found[(bi, mi)].data, m.vertices(mo)
+        now = [tuple(me.vertices[v].co) if v < len(me.vertices) else (0.0, 0.0, 0.0)
+               for v in pv]
+        was = [donor[v].pos if v < len(donor) else (0.0, 0.0, 0.0) for v in pv]
+        if e["scale"]:
+            struct.pack_into("<f", data, at, e["scale"][1])
+            out["scale"] += 1
+        sigma = e["sigma"][1] if e["sigma"] else None
+        slack = e["slack"][1] if e["slack"] else None
+        for q, (a, b, w0, w1, rest2) in enumerate(springs):
+            if sigma is not None and (w0 - w1) != 0.0:
+                # k0 is w0 / (2*sigma), and 2*sigma is w0 - w1 whatever the mass split.
+                k0 = w0 / (w0 - w1)
+                w0, w1 = 2.0 * sigma * k0, -2.0 * sigma * (1.0 - k0)
+            if a < len(now) and b < len(now):
+                d2_was, d2_now = _d2(was[a], was[b]), _d2(now[a], now[b])
+                if q >= ns0 and slack is not None:
+                    rest2 = slack * d2_now
+                elif d2_was > CLOTH_MIN_D2 and abs(d2_now - d2_was) > CLOTH_MIN_D2:
+                    rest2 = (rest2 / d2_was) * d2_now if CLOTH_KEEP_RATIO else d2_now
+                    out["refitted"] += 1
+            struct.pack_into("<2H3f", data, at + spoff + q * 16, a, b, w0, w1, rest2)
+            out["springs"] += 1
+        cl["data"] = bytes(data)
+        out["models"] += 1
+        out["sigma"] += 1 if sigma is not None else 0
+        out["slack"] += 1 if slack is not None else 0
+        if e["flattens"]:
+            out["flattened"].append(e["object"])
+    return out
 
 
 def apply_flex(d, m, arm_obj):
@@ -1496,7 +1906,21 @@ def _apply_params(rec, params, names, where):
     return 1 if was != (tuple(idx), tuple(start), tuple(end)) else 0
 
 
-def apply_sequences(d, arm_obj, anim_names):
+def sequence_actions(anim_names, source, arm_obj, actions=None):
+    """{animation index: action} for reading Loops and Activity off, the export's map last.
+
+    `match_indices` is what decides which action speaks for which animation everywhere
+    else, ties dropped and all, so it decides it here too rather than a second rule
+    picking one of three copies by `bpy.data.actions` order. The wider scan is what makes
+    the panel's two fields reach the file on an export that replaces no animation at all;
+    an action the export is writing wins over one merely stamped from the same file.
+    """
+    out = dict(match_indices(anim_names, source, arm_obj)[0])
+    out.update({int(k): v for k, v in (actions or {}).items()})
+    return out
+
+
+def apply_sequences(d, arm_obj, anim_names, actions=None):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
     Matched by position: the stash is written in file order. A file carrying more than the
@@ -1505,6 +1929,12 @@ def apply_sequences(d, arm_obj, anim_names):
     the file claims sequences that are not there and is refused. Blends are stored as
     animation names because an index means nothing once the file is re-emitted, so they
     resolve back through `anim_names`.
+
+    `actions` is {animation index: action}. Two fields are the action's rather than the
+    armature's -- the flags word at +0x08, whose bit 0 is Loops, and the activity -- since
+    those are the two the panel puts on an Action and the stash is written once at import
+    and never again. An action reaches its sequence through the animation its first blend
+    names, which is the pairing the import stamps both properties through.
     """
     stash = arm_obj.get("vtmb_sequences")
     if not stash:
@@ -1524,11 +1954,17 @@ def apply_sequences(d, arm_obj, anim_names):
     bones = {r.name: k for k, r in enumerate(d.bones)}
     n = 0
     for rec, s in zip(d.seqs, stash):
-        label, activity = s.get("label"), s.get("activity")
+        label = s.get("label")
         if label and rec.name != label:
             rec.name, n = label, n + 1
-        if activity and rec.extra.get("activity") != activity:
-            rec.extra["activity"], n = activity, n + 1
+        activity = s.get("activity")
+        if activity is not None:
+            # `""` is written as an empty string and not as a zero word: 2433 of the 14012
+            # shipped sequences carry a pointer to one and none carries a zero, so that is
+            # what "this sequence claims no activity" looks like in the file.
+            activity = str(activity)
+            if rec.extra.get("activity") != activity:
+                rec.extra["activity"], n = activity, n + 1
         blends = [list(col) for col in s.get("blends") or []]
         gx, gy = len(blends), max((len(c) for c in blends), default=0)
         # The grid sits inside the 764-byte record at a 0x20 stride, so one that would run
@@ -1552,10 +1988,70 @@ def apply_sequences(d, arm_obj, anim_names):
         n += _apply_events(rec, s.get("events"))
         n += _apply_params(rec, s.get("params"), pp, rec.name)
         n += _apply_seq_tail(rec, s, labels, bones)
+    # After the grid, not inside the loop: which animation a sequence names is what picks
+    # the action, and the stash has just rewritten it.
+    for k, act in _first_citers(d, actions).items():
+        n += _apply_seq_action(d.seqs[k], act)
     return n
 
 
-_SEQ_SCALARS = (("statrequired", "<i", mdl_mod.SEQ_STATREQUIRED),
+def _first_citers(d, actions):
+    """{sequence index: action}, one sequence per animation and the first that names it.
+
+    The import stamps `vtmb_seq_flags` and `vtmb_activity` from the first sequence citing
+    each animation, so that is the one sequence an action can be read back into. Handing
+    the value to every citer instead would let one sequence's flags overwrite another's on
+    a plain re-export, which is the one thing this must not cost.
+    """
+    if not actions:
+        return {}
+    out, taken = {}, set()
+    for k, rec in enumerate(d.seqs):
+        gx, gy = struct.unpack_from("<ii", rec.raw, mdl_mod.SEQ_GROUPSIZE)
+        # The whole grid and in the stash's own order, which is what `_first_seq` walks
+        # on the way in -- a grid's second row citing an animation first is what decides
+        # which sequence that animation's action was stamped from.
+        for x in range(max(0, min(gx, 16))):
+            for y in range(max(0, min(gy, 16))):
+                at = mdl_mod.SEQ_ANIM + x * 0x20 + y * 2
+                if at + 2 > len(rec.raw):
+                    continue
+                a = struct.unpack_from("<h", rec.raw, at)[0]
+                if a in taken:
+                    continue
+                taken.add(a)
+                if a in actions:
+                    out.setdefault(k, actions[a])
+    return out
+
+
+def _apply_seq_action(rec, act):
+    """The two sequence fields the panel puts on an Action, after the stash has had its
+    say. Returns what moved.
+
+    An action carrying neither key says nothing and the stash stands; `vtmb_activity`
+    present and empty is a sequence with no activity, which is the only way a donor's own
+    comes off.
+    """
+    if act is None:
+        return 0
+    n = 0
+    flags = act.get("vtmb_seq_flags")
+    if flags is not None:
+        flags = int(flags)
+        if struct.unpack_from("<i", rec.raw, mdl_mod.SEQ_FLAGS)[0] != flags:
+            n += 1
+        struct.pack_into("<i", rec.raw, mdl_mod.SEQ_FLAGS, flags)
+    activity = act.get("vtmb_activity")
+    if activity is not None:
+        activity = str(activity)
+        if rec.extra.get("activity") != activity:
+            rec.extra["activity"], n = activity, n + 1
+    return n
+
+
+_SEQ_SCALARS = (("flags", "<i", mdl_mod.SEQ_FLAGS),
+                ("statrequired", "<i", mdl_mod.SEQ_STATREQUIRED),
                 ("seqselectmask", "<i", mdl_mod.SEQ_SEQSELECTMASK),
                 ("node", "<3i", mdl_mod.SEQ_ENTRYNODE),
                 ("phase", "<2f", mdl_mod.SEQ_ENTRYPHASE),
@@ -1716,6 +2212,41 @@ def stale_flavours(dest, written=("dx80",)):
             if os.path.exists(p)]
 
 
+def cut_vtx_lods(source, dest, written=(), flavours=None):
+    """Every `.vtx` beside the written model turned down to one LOD. One row per file.
+
+    Every flavour that exists is edited, not only the one the geometry pass rewrote: the
+    engine picks by `-dxlevel` and a flavour left at seven LODs still swaps to a coarse
+    mesh. A flavour the geometry pass did not write is copied across from the donor first,
+    since the cut is the only reason that file would appear beside a new `dest`.
+
+    `flavours` narrows that to the ones named, which is what a cut forced by a renumbering
+    rebuild wants: a donor flavour nobody rewrote describes the old numbering whole, so
+    copying a cut version of it across replaces one wrong file with another.
+    """
+    out = []
+    for flavour in (VTX_FLAVOURS if flavours is None else flavours):
+        src_p, dst_p = vtx_path(source, flavour), vtx_path(dest, flavour)
+        at = dst_p if (flavour in written and os.path.exists(dst_p)) else src_p
+        if not os.path.exists(at):
+            continue
+        with open(at, "rb") as f:
+            data = f.read()
+        try:
+            cut, was, dropped = vtxw_mod.cut_lods(data)
+        except (ValueError, struct.error) as exc:
+            out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": None,
+                        "dropped": [], "why": str(exc)})
+            continue
+        if cut != data or at != dst_p:
+            with open(dst_p, "wb") as f:
+                f.write(cut)
+        out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": was,
+                    "dropped": dropped, "why": None,
+                    "bytes": sum(1 for a, b in zip(data, cut) if a != b)})
+    return out
+
+
 def phy_path(p):
     return (p[:-4] if p[-4:].lower() == ".mdl" else p) + ".phy"
 
@@ -1807,7 +2338,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
-                   vtx_flavours=("dx80",)):
+                   write_cloth=True, cut_lods=False, vtx_flavours=("dx80",)):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -1967,9 +2498,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0, "stale": 0,
              "accessories": 0,
-             "rebased": 0, "requantised": [], "root_turned": [],
-             "added_materials": [], "surplus": surplus_bones(m, arm_obj)}
-    poses = read_bones(m, arm_obj, scale)
+             "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
+             "added_materials": [], "surplus": surplus_bones(m, arm_obj),
+             "slots_moved": 0, "slots_gone": [],
+             "blind_bones": []}
+    poses = read_bones(m, arm_obj, scale, scene["blind_bones"])
     if poses:
         # Translation decodes additively over the record's own `pos`, so a bind that only
         # moved carries every animation with it for nothing. A bind that TURNED does not:
@@ -1978,12 +2511,17 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         # Those are re-encoded here and not left for a later export -- one file answering
         # the same edit two ways, the re-exported animations following the bone and the
         # carried ones not, is the defect and an option would be a second way to produce it.
+        scene["reparented"] = [(m.bones[k].name,
+                                m.bones[v[3]].name if v[3] >= 0 else "nothing")
+                               for k, v in sorted(poses.items()) if v[3] is not None]
         rebase = build_mod.set_bone_poses(d, poses)
         scene["bones"] = len(poses)
         scene["rebased"] = rebase["anims"]
         scene["requantised"] = rebase["widened"]
         scene["root_turned"] = [d.bones[k].name for k in rebase["root_turned"]]
-    for ref, name in sorted(read_materials(m, source, skin_family(m, arm_obj)).items()):
+    named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+        m, source, skin_family(m, arm_obj))
+    for ref, name in sorted(named.items()):
         if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
             d.textures[ref].name = name
             scene["materials"] += 1
@@ -2003,7 +2541,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["flex"] = apply_flex(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
-    scene["sequences"] = apply_sequences(d, arm_obj, [r.name for r in d.anims])
+    anim_names = [r.name for r in d.anims]
+    scene["sequences"] = apply_sequences(
+        d, arm_obj, anim_names,
+        sequence_actions(anim_names, source, arm_obj, actions))
 
     added = []
     for action, poses, movements, nframes in pending:
@@ -2025,12 +2566,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
-            "unskinned": 0, "renumbered": 0, "crowded": [],
-            "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": []}
+            "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
+            "rebuilt_uvs": 0, "rebuilt_added": 0,
+            "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
+            "stale_stash": stale_stash(m, source)}
     revised = {}
     if mesh_fields:
         cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
-            mesh["crowded"] = read_meshes(m, source, mesh_fields)
+            mesh["crowded"], mesh["blind_normals"] = read_meshes(m, source, mesh_fields)
         if not cells and not rebuild and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
         for (bi, mi), verts in sorted(cells.items()):
@@ -2042,7 +2585,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         bone_index = {b.name: b.index for b in m.bones}
         for (bi, mi), obj in sorted(rebuild.items()):
             was = m.bodyparts[bi].models[mi].numvertices
-            faces, unskinned, kept = rebuild_cell(d, obj, bi, mi, bone_index)
+            faces, unskinned, kept, edits = rebuild_cell(d, obj, bi, mi, bone_index,
+                                                         mesh_fields)
             for k, tris in enumerate(faces):
                 revised[(bi, mi, k)] = tris
             now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
@@ -2050,6 +2594,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             mesh["rebuilt"].append((obj.name, was, now))
             mesh["unskinned"] += unskinned
             mesh["renumbered"] += 0 if kept else 1
+            # Same meaning as the in-place path's, so they share the report line.
+            mesh["normals"] += edits["normals"]
+            mesh["blind_normals"] += edits["blind"]
+            mesh["rebuilt_uvs"] += edits["uvs"]
+            mesh["rebuilt_added"] += edits["added"]
 
     if write_flexes:
         # After the geometry, because add_flex bounds every key against the mesh's
@@ -2066,6 +2615,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             if why:
                 mesh["flex_refused"].append((obj.name, why))
 
+    # After the geometry: a rest length is refitted against where the vertex now sits, and
+    # a rebuilt model has just moved them.
+    cloth_was = cloth_edits(m, source, d)
+    cloth = apply_cloth(d, m, source, cloth_was) if write_cloth else None
+
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
@@ -2077,6 +2631,19 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     touched = (revise_vtx(source, dest, data, revised, vtx_flavours)
                if (revised or removed or added_bones) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
+    # After the geometry pass, which writes whole .vtx files: the cut is two dwords over
+    # the finished bytes and would otherwise be laid back over.
+    # `revise` rewrites LOD 0 and leaves the lower ones the donor's own triangles, which
+    # index by original vertex id -- valid while the numbering holds and meaningless once
+    # a rebuild renumbers. On `tray.mdl` deleting one vertex takes the model from 142
+    # vertices to 95 and leaves LOD 1 naming ids up to 141. The decimation is authored and
+    # cannot be rebuilt from LOD 0, so the LODs go. The cut is the whole file's and not the
+    # one model's: `numLODs` agrees between the file header and every model header on all
+    # 8887 shipped files, and the Unofficial Patch's own cut models set both.
+    forced = bool(mesh["renumbered"]) and not cut_lods
+    lods = (cut_vtx_lods(source, dest, [x["flavour"] for x in touched],
+                         None if cut_lods else [x["flavour"] for x in touched])
+            if (cut_lods or forced) else [])
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
@@ -2092,6 +2659,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "includes": [r.name for r in d.includes],
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
                       if (revised or removed or added_bones) else []),
+            "cloth": cloth, "cloth_edits": cloth_was, "lods": lods,
+            "lods_forced": forced,
             "phy": phy_report(source, dest, removed, renamed, bool(revised))}
 
 

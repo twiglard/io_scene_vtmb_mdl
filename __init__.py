@@ -620,6 +620,25 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "where the .dx80.vtx allows nine, so it is revised from its own copy "
                     "and not derived from the other one. Nothing happens when no "
                     ".dx7_2bone.vtx sits beside the source")
+    write_cloth: bpy.props.BoolProperty(
+        name="Cloth from the scene", default=True,
+        description="Refit each cloth object to the scene before writing: the stiffness, "
+                    "slack and gravity on the VTMB cloth panel, and the rest length of "
+                    "every spring against where its vertex now sits. Off leaves the "
+                    "file's own cloth object alone, which after a geometry edit simulates "
+                    "the garment the model used to be; either way the report says what "
+                    "the scene asked for. Nothing is written where the scene and the file "
+                    "already agree, so an unedited model still comes back byte for byte")
+    cut_lods: bpy.props.BoolProperty(
+        name="Turn LODs off", default=False,
+        description="Write 1 into every numLODs field of every .vtx beside the model, so "
+                    "the engine draws LOD 0 at any distance and never swaps to a coarse "
+                    "mesh. Two dwords per file over the finished bytes and nothing else, "
+                    "which is the edit the Unofficial Patch makes to its own four cut "
+                    "models -- the LOD 1..n payload stays on disk with nothing pointing "
+                    "at it, and the file keeps its length. Every flavour present is cut, "
+                    "not only the .dx80.vtx, because the engine picks by -dxlevel and one "
+                    "left alone still swaps. A model already at one LOD is untouched")
     write_flexes: bpy.props.BoolProperty(
         name="Shape keys as flexes", default=False,
         description="Rewrite each model's flexes from its shape keys -- the way to get a "
@@ -782,6 +801,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     box.label(text="saved as %s" % os.path.basename(self.filepath),
                               icon="INFO")
                 box.prop(self, "write_flexes")
+                box.prop(self, "write_cloth")
+                box.prop(self, "cut_lods")
                 box.prop(self, "write_2bone_vtx")
                 box.prop(self, "fit_hull")
                 row = box.split(factor=SPLIT)
@@ -970,6 +991,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 root_motion=self.root_motion,
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
                 write_flexes=self.write_flexes,
+                write_cloth=self.write_cloth,
+                cut_lods=self.cut_lods,
                 vtx_flavours=(("dx80", "dx7_2bone") if self.write_2bone_vtx
                               else ("dx80",)),
                 # Derived only for a dialog, where the field is on screen with the
@@ -1021,6 +1044,16 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "%d vertices of a rebuilt mesh are in no vertex "
                                      "group and were bound to bone 0"
                         % mesh["unskinned"])
+        if mesh.get("rebuilt_uvs"):
+            self.report({"INFO"}, "%d UV%s came from Blender rather than the file, on the "
+                                  "file's own vertex"
+                        % (mesh["rebuilt_uvs"],
+                           "" if mesh["rebuilt_uvs"] == 1 else "s"))
+        if mesh.get("rebuilt_added"):
+            self.report({"INFO"}, "a rebuild added %d %s, which is what the format costs "
+                                  "for a seam or a hard edge"
+                        % (mesh["rebuilt_added"],
+                           "vertex" if mesh["rebuilt_added"] == 1 else "vertices"))
         if mesh["crowded"]:
             total = sum(k for _n, k in mesh["crowded"])
             self.report({"WARNING"}, "%d vertex%s carr%s a fifth vertex group, which no "
@@ -1094,6 +1127,90 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         % (got["name"], got["index"],
                            "" if got["parent"] is None else
                            " under %r" % got["parent"]))
+        blind = r["mesh"].get("blind_normals") or 0
+        if blind:
+            self.report({"WARNING"},
+                        "%d vertex normal%s moved by more than the round trip's own error "
+                        "and by less than the export can tell from it, and %s written "
+                        "from the file. Move one further than 1.5e-2 per component for the "
+                        "edit to reach the file"
+                        % (blind, "" if blind == 1 else "s",
+                           "was" if blind == 1 else "were"))
+        stale = r["mesh"].get("stale_stash") or []
+        if stale:
+            self.report({"WARNING"},
+                        "%d filetype-2 mesh%s -- %s -- came from an import older than the "
+                        "packed-position fix of 2026-08-20, or from one that stamped no "
+                        "version. Those scenes hold the model 255x oversized and the "
+                        "stash the export compares against is wrong by the same factor, "
+                        "so nothing here can measure it. Re-import to be sure"
+                        % (len(stale), "" if len(stale) == 1 else "es",
+                           ", ".join("%s (%s)" % (n, "unstamped" if v is None
+                                                  else ".".join(str(x) for x in v))
+                                     for n, _ft, v in stale[:3])
+                           + ("" if len(stale) <= 3 else " and %d more" % (len(stale) - 3))))
+        gaps = r["scene"].get("blind_bones") or []
+        if gaps:
+            self.report({"WARNING"},
+                        "%d bone%s carr%s no imported rest pose -- %s -- so the only "
+                        "baseline is the file's own record and a move under 1e-3 units, or "
+                        "2e-3 on a quaternion entry, is not written. Re-import the model "
+                        "to get the exact comparison"
+                        % (len(gaps), "" if len(gaps) == 1 else "s",
+                           "ies" if len(gaps) == 1 else "y",
+                           ", ".join(gaps[:3])
+                           + ("" if len(gaps) <= 3 else " and %d more" % (len(gaps) - 3))))
+        forced = r.get("lods_forced")
+        for row in r.get("lods") or []:
+            if row["why"] is not None:
+                self.report({"WARNING"}, "%s could not be cut to one LOD: %s"
+                            % (row["file"], row["why"]))
+            elif row["was"] in (None, 1):
+                if not forced:
+                    self.report({"INFO"}, "%s was already at one LOD" % row["file"])
+            elif forced:
+                self.report({"WARNING"},
+                            "%s cut from %d LODs to 1: the file's own vertex numbering "
+                            "was rebuilt, so every lower LOD named vertices that are no "
+                            "longer there. A lower LOD is an authored decimation and "
+                            "cannot be rebuilt from LOD 0. It used to swap at %s"
+                            % (row["file"], row["was"],
+                               ", ".join("%g" % x for x in row["dropped"])))
+            else:
+                self.report({"INFO"},
+                            "%s cut from %d LODs to 1, %d byte%s changed. It used to swap "
+                            "at %s, and that geometry is still in the file with nothing "
+                            "pointing at it"
+                            % (row["file"], row["was"], row["bytes"],
+                               "" if row["bytes"] == 1 else "s",
+                               ", ".join("%g" % x for x in row["dropped"])))
+        cl = r.get("cloth")
+        for e in r.get("cloth_edits") or []:
+            moved = [w for w in ("stiffness" if e["sigma"] else None,
+                                 "slack" if e["slack"] else None,
+                                 "gravity" if e["scale"] else None) if w]
+            if e["moved"]:
+                moved.append("%d of the cloth's particles moved" % e["moved"])
+            if e["why"] is not None:
+                if moved:
+                    self.report({"WARNING"},
+                                "%s: %s, so %s stayed as the file had it"
+                                % (e["object"] or e["model"], e["why"], " and ".join(moved)))
+                continue
+            if not moved:
+                continue
+            if cl is None:
+                self.report({"WARNING"},
+                            "%s: %s and Cloth from the scene is off, so the file keeps the "
+                            "cloth object it shipped with"
+                            % (e["object"], " and ".join(moved)))
+            else:
+                self.report({"INFO"}, "%s: cloth refitted -- %s, over %d springs"
+                            % (e["object"], " and ".join(moved), e["springs"]))
+        for name in (cl or {}).get("flattened") or []:
+            self.report({"WARNING"},
+                        "%s: this cloth object's stiffness varied spring by spring and the "
+                        "panel holds one number, so every spring now carries it" % name)
         if r.get("boxes") is not None:
             done, total = r["boxes"]
             self.report({"INFO"} if done == total else {"WARNING"},
@@ -1134,6 +1251,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            "was" if len(surplus) == 1 else "were",
                            ", ".join(surplus[:4]),
                            "" if len(surplus) <= 4 else " and %d more" % (len(surplus) - 4)))
+        moved_up = r["scene"].get("reparented") or []
+        if moved_up:
+            self.report({"INFO"}, "%s reparented onto %s"
+                        % (", ".join(a for a, _b in moved_up[:4])
+                           + ("" if len(moved_up) <= 4
+                              else " and %d more" % (len(moved_up) - 4)),
+                           ", ".join(b for _a, b in moved_up[:4])))
         n = r["scene"].get("rebased") or 0
         if n:
             self.report({"INFO"}, "%d bone%s turned, so %d animation%s you did not export "
@@ -1216,6 +1340,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             extra += _write_tths(context, obj, self.filepath,
                                  scene["added_materials"], self.write_tth,
                                  self.tth_format)
+        if scene.get("slots_moved"):
+            extra += ("; followed %d material slot%s that had moved since the import"
+                      % (scene["slots_moved"],
+                         "" if scene["slots_moved"] == 1 else "s"))
+        for name in scene.get("slots_gone") or []:
+            self.report({"WARNING"},
+                        "the material slot holding %r is no longer in the scene. Every "
+                        "mesh names a texture record and the format cannot spell "
+                        "\"no material\", so that record keeps the name the file gave "
+                        "it. A rename made in the same edit cannot be told from the "
+                        "delete and was not taken either" % name)
         self.report({"INFO"}, "wrote %d of %d animations over %d bones, %d -> %d bytes: "
                               "%s%s" % (len(r["wrote"]), r["anims"], r["bones"], r["was"],
                                         r["bytes"], what, extra))

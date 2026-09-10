@@ -86,11 +86,10 @@ def _activity_get(action):
 
 
 def _activity_set(action, value):
-    value = str(value).strip()
-    if value:
-        action["vtmb_activity"] = value
-    elif action.get("vtmb_activity") is not None:
-        del action["vtmb_activity"]
+    # Emptying the box stores the empty string rather than dropping the key: absent means
+    # the scene never stated one and the sequence keeps whatever the file says, so
+    # deleting it here would make clearing a donor's activity impossible.
+    action["vtmb_activity"] = str(value).strip()
 
 
 def panel_action(context):
@@ -190,8 +189,13 @@ class VTMB_OT_set_skin_family(bpy.types.Operator):
         # half-switched scene names one texture record two ways and is refused outright.
         for o in arm_meshes(context, arm_obj):
             refs = [int(x) for x in (o.get("vtmb_skinrefs") or ())]
+            # Through the import's stamp, since a reordered slot holds a different
+            # material and writing by the stamped index would put this family's picture
+            # on the wrong mesh.
+            moves = blender_export.slot_moves(o)[0]
             for slot, r in enumerate(refs):
-                if slot >= len(o.data.materials):
+                at = slot if moves is None else moves.get(slot)
+                if at is None or at >= len(o.data.materials):
                     continue
                 ref = rows[self.family][r] if 0 <= r < len(rows[self.family]) else r
                 name = str(mats[ref]) if 0 <= ref < len(mats) else ""
@@ -199,9 +203,13 @@ class VTMB_OT_set_skin_family(bpy.types.Operator):
                 if mat is None:
                     missing.append(name or "record %d" % ref)
                     continue
-                if o.data.materials[slot] is not mat:
-                    o.data.materials[slot] = mat
+                if o.data.materials[at] is not mat:
+                    o.data.materials[at] = mat
                     moved += 1
+            # Re-stamped because this is the one thing that replaces a slot's material on
+            # purpose: leaving the old stamp would make the next export read every slot
+            # as renamed.
+            o["vtmb_slot_mats"] = [mm.name if mm else "" for mm in o.data.materials]
         arm_obj["vtmb_skin_family"] = self.family
         if missing:
             self.report({"WARNING"}, "family %d: %d slot(s) moved, and no material in "
@@ -1619,7 +1627,9 @@ def register_props():
     bpy.types.Action.vtmb_activity_text = bpy.props.StringProperty(
         name="Activity", get=_activity_get, set=_activity_set,
         description="The activity the sequence written for this action claims, e.g. "
-                    "ACT_IDLE. Empty takes whichever the export dialog offers")
+                    "ACT_IDLE. Emptying it writes a sequence with no activity; an action "
+                    "that has never carried one instead keeps whatever the donor says, "
+                    "and on the no-donor export takes the dialog's")
 
 
 def unregister_props():

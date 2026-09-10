@@ -256,7 +256,7 @@ def sequence_stash(m):
     `apply_sequences` refuses a stash claiming more sequences than are there.
     """
     labels = [x.label for x in m.seqs]
-    return [{"label": s.label, "activity": s.activity,
+    return [{"label": s.label, "activity": s.activity, "flags": s.flags,
              "groupsize": list(s.groupsize),
              "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
                          for i in col] for col in s.blends],
@@ -804,6 +804,10 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # The skinref each slot was built from, in slot order. vtmb.set_skin_family needs
         # the inverse of `slots` and cannot rebuild it: that would take the .mdl back.
         obj["vtmb_skinrefs"] = [r for r, _ in sorted(slots.items(), key=lambda kv: kv[1])]
+        # What sits in each slot, so the export can find a material the user moved. The
+        # slot index alone is stale the moment a slot is reordered or deleted, and 1686 of
+        # the corpus's 4567 models carry two or more.
+        obj["vtmb_slot_mats"] = [mm.name if mm else "" for mm in me.materials]
         for fam in range(len(m.skins) or 1):
             row = m.skins[fam] if fam < len(m.skins) else None
             for r, j in slots.items():
@@ -813,6 +817,10 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # Keyed by file vertex, not by Blender vertex: an edit rewrites the second and
         # interpolates any float attribute, so only an object property survives one.
         obj["vtmb_orig_co"] = [c * scale for v_ in verts for c in v_.pos]
+        # Which import wrote the stash, so a later decode fix can be told from a live edit.
+        # `vtmb_import` on the armature carries the same number and is not enough: one scene
+        # holds objects from several imports.
+        obj["vtmb_addon_version"] = _addon_version()
         # Names are not unique: move_and_ranged has four bodyparts whose model is called
         # sharedbones.smd, so only the position in the file tells them apart.
         obj["vtmb_index"] = gi
@@ -991,11 +999,13 @@ def _rest_local_inv(m, arm_obj):
     return out
 
 
-def _seq_flags(src, _cache={}):
-    """animation index -> the flags of the first sequence citing it.
+def _first_seq(src, _cache={}):
+    """animation index -> the first sequence citing it.
 
     The scratch exporter writes one sequence per action, so first-citer is the pairing
-    a re-export reproduces. An animation no sequence names keeps 0.
+    a re-export reproduces. It is also the pairing `apply_sequences` reads back and the
+    one `_event_markers` puts the markers on, so an action edited in the panel reaches
+    the sequence it was stamped from. An animation no sequence names gets nothing.
     """
     got = _cache.get(src.path)
     if got is None:
@@ -1003,7 +1013,7 @@ def _seq_flags(src, _cache={}):
         for s in src.seqs:
             for row in s.blends:
                 for i in row:
-                    got.setdefault(i, s.flags)
+                    got.setdefault(i, s)
         _cache[src.path] = got
     return got
 
@@ -1069,7 +1079,12 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
                     c += 1
         action["vtmb_fps"] = a.fps
         action["vtmb_flags"] = a.flags
-        action["vtmb_seq_flags"] = _seq_flags(src).get(a.index, 0)
+        seq = _first_seq(src).get(a.index)
+        action["vtmb_seq_flags"] = seq.flags if seq is not None else 0
+        # Stamped even when it is empty: absent means "the scene never said", and
+        # the export needs that apart from "cleared", or a donor's own activity
+        # can never be taken off.
+        action["vtmb_activity"] = (seq.activity or "") if seq is not None else ""
         action["vtmb_numframes"] = a.numframes
         action["vtmb_source"] = src.path
         action["vtmb_anim_index"] = a.index
