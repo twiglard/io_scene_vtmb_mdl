@@ -209,6 +209,30 @@ def bone_map(m, arm_obj):
     return out
 
 
+def knockback_bones(d, m):
+    """{the name the file gave a bone: its index now, or None where the scene deleted it}.
+
+    A knockback record is the only stash entry that names a bone, and it names it by the
+    name the file carried at import. `d.bones` already carries the name the export is about
+    to write, so resolving through that refuses every renamed bone -- and the knockback bone
+    is a label in the panel, so the rename is the only way a scene reaches these records at
+    all. `m.bones` is index-aligned with `d.bones` through both `_EditedBones` wraps and
+    keeps the file's own names, which is what every other reader here resolves through.
+
+    A deleted bone answers None rather than being absent: `remove_bone` has already rebound
+    the record to that bone's parent and reported it, so the file's own index stands.
+    """
+    if len(m.bones) != len(d.bones):
+        raise ValueError(
+            "the bone list being written has %d bones and the one carrying the file's own "
+            "names has %d, so a stashed bone name resolves to the wrong index"
+            % (len(d.bones), len(m.bones)))
+    out = {b.name: k for k, b in enumerate(m.bones)}
+    for name in getattr(m, "gone", {}):
+        out.setdefault(name, None)
+    return out
+
+
 def renamed_bones(m, arm_obj, bmap=None):
     """{file bone index: the name Blender now gives it}, for the ones that differ.
 
@@ -2169,7 +2193,7 @@ def sequence_actions(anim_names, source, arm_obj, actions=None):
     return out
 
 
-def apply_sequences(d, arm_obj, anim_names, actions=None):
+def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
     Matched by position: the stash is written in file order. A file carrying more than the
@@ -2200,7 +2224,7 @@ def apply_sequences(d, arm_obj, anim_names, actions=None):
         labels.setdefault(s.get("label") or (d.seqs[k].name or ""), k)
     for k, rec in enumerate(d.seqs):
         labels.setdefault(rec.name or "", k)
-    bones = {r.name: k for k, r in enumerate(d.bones)}
+    bones = knockback_bones(d, m)
     n = 0
     for rec, s in zip(d.seqs, stash):
         label = s.get("label")
@@ -2369,6 +2393,9 @@ def _apply_knockbacks(rec, kbs, bones):
     The other 170 bytes have no scene representation, so a stash whose count differs from
     the file's is refused rather than half-written -- a new record would go out as zeroes
     and the engine walks it unconditionally.
+
+    `bones` is `knockback_bones`: keyed by the name the file gave each bone, since that is
+    what the stash holds, and None where the scene deleted one.
     """
     if kbs is None:
         return 0
@@ -2383,11 +2410,19 @@ def _apply_knockbacks(rec, kbs, bones):
         name = str(src.get("bone") or "")
         if name not in bones:
             raise build_mod.Refused(
-                "knockback %d of sequence %r drives bone %r, which the armature has not got"
+                "knockback %d of sequence %r drives bone %r, which the file has not got and "
+                "the scene did not delete. The stash names a bone by the name the file gave "
+                "it, so a stash written against another model reaches this"
                 % (k, rec.name, name))
-        if struct.unpack_from("<i", dst.raw, 0x08)[0] != bones[name]:
-            n += 1
-        struct.pack_into("<i", dst.raw, 0x08, bones[name])
+        at = bones[name]
+        # None is a bone the scene deleted, and the record has already been rebound to that
+        # bone's parent by `remove_bone` and reported, so the file's own index stands. Cycle
+        # end and the activity grid below are still written: those are the scene's whatever
+        # happened to the bone.
+        if at is not None:
+            if struct.unpack_from("<i", dst.raw, 0x08)[0] != at:
+                n += 1
+            struct.pack_into("<i", dst.raw, 0x08, at)
         ce = float(src.get("cycleend", 0.0))
         if struct.unpack_from("<f", dst.raw, 0x04)[0] != ce:
             n += 1
@@ -2810,7 +2845,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # stash and the file disagree on how many sequences there are.
     anim_names = [r.name for r in d.anims]
     scene["sequences"] = apply_sequences(
-        d, arm_obj, anim_names,
+        d, m, arm_obj, anim_names,
         sequence_actions(anim_names, source, arm_obj, actions))
 
     added = []
