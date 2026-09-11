@@ -2193,6 +2193,12 @@ def sequence_actions(anim_names, source, arm_obj, actions=None):
     return out
 
 
+# Cleared by blend-index-check.py's `refuse` control, which puts the raise back on a cell
+# the stash holds as "" -- the form that failed every export of the four models that ship
+# one.
+BLEND_KEEP_INDEX = True
+
+
 def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
@@ -2208,6 +2214,11 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     those are the two the panel puts on an Action and the stash is written once at import
     and never again. An action reaches its sequence through the animation its first blend
     names, which is the pairing the import stamps both properties through.
+
+    A blend cell the stash holds as `""` is one whose index named no animation of the file
+    -- 8 of the 14012 shipped sequences, over 4 models -- so there is no name to resolve
+    and the word the file already carries stands, the rule a knockback record on a deleted
+    bone follows. Returns (what moved, those cells).
     """
     stash = arm_obj.get("vtmb_sequences")
     if not stash:
@@ -2225,7 +2236,7 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     for k, rec in enumerate(d.seqs):
         labels.setdefault(rec.name or "", k)
     bones = knockback_bones(d, m)
-    n = 0
+    n, out_of_range = 0, []
     for rec, s in zip(d.seqs, stash):
         label = s.get("label")
         if label and rec.name != label:
@@ -2251,6 +2262,12 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
         for x, col in enumerate(blends):
             for y, name in enumerate(col):
                 at = mdl_mod.SEQ_ANIM + x * 0x20 + y * 2
+                if not name and BLEND_KEEP_INDEX:
+                    # `sequence_stash` writes "" where the file's own index named no
+                    # animation, so the word the file carries stands and is reported.
+                    out_of_range.append((rec.name or "", x, y,
+                                         struct.unpack_from("<h", rec.raw, at)[0]))
+                    continue
                 a = index.get(name, -1)
                 if a < 0:
                     raise ValueError("sequence %r blends animation %r, which the file does "
@@ -2265,7 +2282,7 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     # the action, and the stash has just rewritten it.
     for k, act in _first_citers(d, actions).items():
         n += _apply_seq_action(d.seqs[k], act)
-    return n
+    return n, out_of_range
 
 
 def _first_citers(d, actions):
@@ -2844,7 +2861,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     anim_names = [r.name for r in d.anims]
-    scene["sequences"] = apply_sequences(
+    scene["sequences"], scene["blends_out_of_range"] = apply_sequences(
         d, m, arm_obj, anim_names,
         sequence_actions(anim_names, source, arm_obj, actions))
 

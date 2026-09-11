@@ -1383,6 +1383,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "leaf -- so this takes a path no shipped file takes"
                         % (scene["spring_ends"],
                            "" if scene["spring_ends"] == 1 else "s"))
+        sb = scene.get("blends_out_of_range") or []
+        if sb:
+            self.report({"WARNING"},
+                        "%d blend cell%s name%s an animation the file has not got -- %s -- "
+                        "so each keeps the index the file already carries. The model "
+                        "shipped that way and nothing in the scene can name what is not "
+                        "there"
+                        % (len(sb), "" if len(sb) == 1 else "s",
+                           "s" if len(sb) == 1 else "",
+                           ", ".join("%r blend %d,%d at animation %d" % tuple(x)
+                                     for x in sb[:3])
+                           + ("" if len(sb) <= 3 else " and %d more" % (len(sb) - 3))))
         for name, was in scene.get("dup_bones") or ():
             self.report({"WARNING"}, "%r says it was copied from %r, which another bone "
                                      "still is, so it is appended as a new bone and %r "
