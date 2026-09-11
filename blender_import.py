@@ -410,8 +410,25 @@ def _image(content, rel):
     return _tth_image(content, rel, name)
 
 
+# A VertexLitGeneric base texture keeps its specular/envmap mask in the alpha channel, so
+# the channel is opacity only where one of these says it is. Jeanette's body averages 0.031
+# there, which Workbench draws as 97% see-through in Solid + Texture.
+ALPHA_KEYS = ("$translucent", "$alphatest", "$additive")
+
+
+def _alpha_is_opacity(path, blob):
+    for key in ALPHA_KEYS:
+        v = _vmt(path, blob, key)
+        if v is not None and v.strip().strip('"') not in ("", "0"):
+            return True
+    return False
+
+
 def _find_image(content, search_paths, name):
-    """VMT first, since $basetexture may point outside the model's own directory."""
+    """(image, whether its alpha channel is opacity), or (None, False).
+
+    VMT first, since $basetexture may point outside the model's own directory.
+    """
     for stem in paths_mod.material_stems(name, search_paths):
         vmt, blob = content.find(stem + ".vmt")
         if vmt:
@@ -422,11 +439,21 @@ def _find_image(content, search_paths, name):
                 img = _image(content, paths_mod.MATERIALS_DIR + "/"
                              + base.replace("\\", "/").strip("/"))
                 if img is not None:
-                    return img
+                    return img, _alpha_is_opacity(vmt, blob)
         img = _image(content, stem)
         if img is not None:
-            return img
-    return None
+            return img, bool(vmt) and _alpha_is_opacity(vmt, blob)
+    return None, False
+
+
+def _set_alpha_mode(img, opacity):
+    """One image datablock serves several materials -- Jeanette's hair map serves six --
+    so a material that needs the channel claims it and an opaque one never takes it back."""
+    if opacity:
+        img["vtmb_alpha_opacity"] = True
+        img.alpha_mode = "STRAIGHT"
+    elif not img.get("vtmb_alpha_opacity"):
+        img.alpha_mode = "NONE"
 
 
 def _average_color(img, stride=16):
@@ -482,9 +509,11 @@ def _material(m, index, content, family=0):
                 bsdf.inputs[sock].default_value = 0.0
                 break
 
-    img = _find_image(content, m.material_paths, name) if bsdf is not None else None
+    img, opacity = (_find_image(content, m.material_paths, name)
+                    if bsdf is not None else (None, False))
     if img is None:
         return mat
+    _set_alpha_mode(img, opacity)
     mat["vtmb_texture"] = img.get("vtmb_source") or img.filepath or img.name
     mat.diffuse_color = _average_color(img)
     tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
@@ -515,7 +544,9 @@ def build_shape_keys(obj, model, scale):
             order.append(f.flexdesc)
             targets[f.flexdesc] = f.target
     nverts = len(obj.data.vertices)
-    obj.shape_key_add(name="Basis", from_mix=False)
+    # Blender 5.2's shape_key_add hands back a key at value 1.0, so without this every
+    # flex arrives fully applied and the face is the sum of all of them at once.
+    obj.shape_key_add(name="Basis", from_mix=False).value = 0.0
     nrec = dropped = 0
     for fd in order:
         nm = None
@@ -524,6 +555,7 @@ def build_shape_keys(obj, model, scale):
                 nm = f.name
                 break
         kb = obj.shape_key_add(name=nm or "flex_%d" % fd, from_mix=False)
+        kb.value = 0.0
         kb.slider_min, kb.slider_max = 0.0, 1.0
         data = kb.data
         for mesh, f in flexes:
