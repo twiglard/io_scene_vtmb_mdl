@@ -276,6 +276,26 @@ def _base_path(op, context):
     return (ad.action.get("vtmb_source") if ad and ad.action else None) or ""
 
 
+def _restamp_sequences(obj, written, src, added, dropped_seqs):
+    """Write `vtmb_sequences` again when the export moved how many sequences the file has.
+
+    `apply_sequences` matches the stash to the file by position, so an append leaves the
+    new sequence in the file and in no panel -- its events, pose parameters and record
+    tail all resolve through the stash -- while a delete that took sequences leaves a
+    stash claiming more than are there, which every later export refuses outright.
+    `sequence_stash` states the rule and this is the whole of it.
+
+    Only when the file just written is the one the stash describes: the stash belongs to
+    the armature's own model, and an export to another path leaves that model alone.
+    Returns how many sequences moved, and 0 when nothing was written.
+    """
+    moved = len(dropped_seqs) + len(added)
+    if not moved or not blender_export.same_file(written, src):
+        return 0
+    obj["vtmb_sequences"] = blender_import.sequence_stash(mdl.Mdl(written))
+    return moved
+
+
 def _base_anims(path):
     if not path or not os.path.exists(path):
         return []
@@ -1309,13 +1329,21 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "now faces across the travel direction the movement "
                                      "blocks still state" % ", ".join(root))
         gone = r["dropped"]
+        moved = len(r["added"]) + len(gone["seqs"])
+        stamped = _restamp_sequences(obj, self.filepath, src, r["added"],
+                                     gone["seqs"])
+        if moved and not stamped:
+            # The stash describes the armature's own model, which this export left alone,
+            # so what it moved is reachable only by importing what it wrote.
+            self.report({"WARNING"},
+                        "%d sequence%s %s %s, and this armature's sequence list describes "
+                        "%s, which is what the export read. Import the written file to "
+                        "edit the sequences it holds"
+                        % (moved, "" if moved == 1 else "s",
+                           "appended to" if not gone["seqs"] else
+                           "removed from" if not r["added"] else "moved in",
+                           os.path.basename(self.filepath), os.path.basename(src)))
         if gone["anim"]:
-            # apply_sequences matches the stash to the file by position and refuses one
-            # claiming more sequences than are there, so a delete that took sequences
-            # makes every later export fail until this is written again.
-            if gone["seqs"]:
-                obj["vtmb_sequences"] = blender_import.sequence_stash(
-                    mdl.Mdl(self.filepath))
             self.report({"WARNING"}, "removed animation %s%s. Its action is still in the "
                                      "blend and will be offered as an append"
                         % (gone["anim"],
