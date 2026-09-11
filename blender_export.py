@@ -121,6 +121,48 @@ def _rows(mat, scale):
     return [[mat[i][0], mat[i][1], mat[i][2], mat[i][3] / scale] for i in range(3)]
 
 
+def _stash_claims(arm_obj):
+    """{the file bone a pose bone says it came from: [pose bone names]}."""
+    out = {}
+    for pb in arm_obj.pose.bones:
+        was = pb.get("vtmb_bone_name")
+        if was:
+            out.setdefault(str(was), []).append(pb.name)
+    return out
+
+
+def _one_claimant(was, names):
+    """The pose bone that owns file bone `was`, or None where nothing in the scene decides.
+
+    Shift+D copies the stash, so two bones can both say they came from one record. The copy
+    is the one Blender renamed, which leaves the original still called after the record --
+    that is the whole tiebreak, and `_one_model` takes the same one through
+    `vtmb_model_label`. Two claimants and neither named after it is a rename or a delete on
+    top of a duplicate, where nothing says which of them is the record's own.
+    """
+    if len(names) == 1:
+        return names[0]
+    own = [n for n in names if n == was]
+    return own[0] if len(own) == 1 else None
+
+
+def duplicate_bones(m, arm_obj):
+    """[(pose bone, the file bone it says it came from)] for the copies that are not it.
+
+    `add_surplus_bones` appends each of them, which is what a Shift+D asks for. Reported
+    because nothing else says so and a copy sits on top of the original until it is moved.
+    """
+    claims = _stash_claims(arm_obj)
+    out = []
+    for b in m.bones:
+        names = claims.get(b.name) or []
+        if len(names) < 2:
+            continue
+        got = _one_claimant(b.name, names)
+        out += [(n, b.name) for n in sorted(names) if n != got]
+    return out
+
+
 def bone_map(m, arm_obj):
     """{file bone name: armature bone name} for the file bones the armature still has.
 
@@ -134,13 +176,26 @@ def bone_map(m, arm_obj):
     cannot be picked up by a second file bone. A bone with no stash -- one the user built,
     or a scene older than the stamp -- resolves by its own name, which is what every export
     before this did.
+
+    A record more than one pose bone claims goes to `_one_claimant` rather than to whichever
+    came first in `pose.bones`, whose order is the armature's and not the user's.
     """
     dbs = arm_obj.data.bones
+    claims = _stash_claims(arm_obj)
     stash = {}
-    for pb in arm_obj.pose.bones:
-        was = pb.get("vtmb_bone_name")
-        if was:
-            stash.setdefault(str(was), pb.name)
+    for b in m.bones:
+        names = claims.get(b.name)
+        if not names:
+            continue
+        got = _one_claimant(b.name, names)
+        if got is None:
+            raise build_mod.Refused(
+                "%d bones say they came from %r -- %s -- and none of them is still called "
+                "that, so nothing in the scene says which one is the record. Rename one "
+                "back to %r, or clear vtmb_bone_name on the copies to have them appended "
+                "as new bones instead"
+                % (len(names), b.name, ", ".join(repr(n) for n in sorted(names)), b.name))
+        stash[b.name] = got
     out, taken = {}, set()
     for b in m.bones:
         got = stash.get(b.name)
@@ -465,8 +520,8 @@ def add_surplus_bones(d, m, arm_obj, scale):
     return out
 
 
-def mesh_objects(m, source):
-    """{(bodypart index, model index): object} for the scene meshes belonging to `m`.
+def _model_claims(m, source):
+    """{(bodypart index, model index): [objects]} -- every scene mesh saying it is that one.
 
     The importer stamps `vtmb_bodypart`/`vtmb_model` on each object and `vtmb_source` on
     the armature it parents them to, so the file is identified through the parent rather
@@ -489,7 +544,56 @@ def mesh_objects(m, source):
         else:
             key = want.get((obj.get("vtmb_bodypart"), obj.get("vtmb_model")))
         if key is not None:
-            out.setdefault(key, obj)
+            out.setdefault(key, []).append(obj)
+    return out
+
+
+def _one_model(objs):
+    """The object that owns the model, or None where nothing in the scene decides.
+
+    `_one_claimant` for meshes: Shift+D copies the stamps and renames the mesh datablock,
+    so the original is the one whose datablock is still called what `vtmb_model_label`
+    says -- the comparison `renamed_models` already makes. Alt+D shares the datablock, so
+    both objects match it and neither wins.
+    """
+    if len(objs) == 1:
+        return objs[0]
+    own = [o for o in objs if o.data.get("vtmb_model_label") == o.data.name]
+    return own[0] if len(own) == 1 else None
+
+
+def duplicate_models(m, source):
+    """(copies not written, models no one object owns), out of the objects claiming one.
+
+    A copy is not written at all: the format holds one mesh per model and the donor path
+    has no way to add one, so the file keeps what the object it was copied from says.
+    """
+    dups, clash = [], []
+    for key, objs in sorted(_model_claims(m, source).items()):
+        if len(objs) < 2:
+            continue
+        label = m.bodyparts[key[0]].models[key[1]].name
+        got = _one_model(objs)
+        names = sorted(o.name for o in objs)
+        if got is None:
+            clash.append((label, names))
+        else:
+            dups += [(n, label) for n in names if n != got.name]
+    return dups, clash
+
+
+def mesh_objects(m, source):
+    """{(bodypart index, model index): object} for the scene meshes belonging to `m`.
+
+    A model more than one object claims is left out rather than settled by `bpy.data`
+    order: `duplicate_models` is what names it and `export_actions` refuses on it. This
+    does not raise, the export dialog drawing through it (`__init__._mesh_status`).
+    """
+    out = {}
+    for key, objs in _model_claims(m, source).items():
+        obj = _one_model(objs)
+        if obj is not None:
+            out[key] = obj
     return out
 
 
@@ -655,14 +759,22 @@ def _skinning(weights, bones):
 
 
 def _one_skin(v, groups, bone_index, stash):
-    """(weights, bones, count) for one vertex, keeping the file's slot order where it
-    still describes the same skinning -- the order is not derivable, so losing it would
-    move bytes on a rewrite that changed nothing.
+    """(weights, bones, count, whether a binding was lost) for one vertex, keeping the
+    file's slot order where it still describes the same skinning -- the order is not
+    derivable, so losing it would move bytes on a rewrite that changed nothing.
 
     A vertex the file binds to nothing keeps its stash outright. 5716 shipped vertices
     over 13 models have numbones 0 and weight bytes (255, 0, 0); the importer makes no
     vertex group for one, so an empty reconstruction is what an untouched vertex looks
     like and there is no edit to honour.
+
+    A vertex no bone drives on a file that bound it to one is an edit, and it goes to bone
+    0 at full weight: the format has no model space -- the skinning block reads bone[0]
+    and transforms by it before it reads the count at all, StudioRender 0x2c0172b9 -- so
+    numbones 0 does not mean "follows nothing", and `split_mesh` gives such a vertex
+    `[(0, 1.0)]` already. Writing that here is what makes one scene state produce one
+    record whichever path takes it, and the count is reported rather than left to be
+    found in game.
     """
     pairs = sorted(((g.weight, -bone_index[groups[g.group].name])
                     for g in v.groups if groups[g.group].name in bone_index),
@@ -673,9 +785,11 @@ def _one_skin(v, groups, bone_index, stash):
     if stash is not None:
         sw, sb, sn = stash
         sb = [int(x) for x in sb]
-        if (not pairs and not sn) or _skinning(sw, sb) == _skinning(w, b):
-            return list(sw), sb, sn
-    return w, b, n
+        if (not n and not sn) or _skinning(sw, sb) == _skinning(w, b):
+            return list(sw), sb, sn, False
+    if not n:
+        return [1.0, 0.0, 0.0, 0.0], [0, 0, 0, 0], 1, True
+    return w, b, n, False
 
 
 def crowded_vertices(obj, bone_index):
@@ -697,7 +811,9 @@ def crowded_vertices(obj, bone_index):
 
 
 def read_mesh(obj, model, bone_index, fields):
-    """One `mdl.Vertex` per file vertex, in file order, inverting what the importer did.
+    """One `mdl.Vertex` per file vertex, in file order, inverting what the importer did,
+    plus the normals taken from Blender, the ones in the band where the two cannot be told
+    apart, and the vertices the scene has taken out of every group.
 
     Only the requested fields are read, because the per-loop agreement check refuses a
     mesh a write of some other field would have been fine with.
@@ -709,7 +825,7 @@ def read_mesh(obj, model, bone_index, fields):
                          % (obj.name, len(me.vertices), model.numvertices, model.name))
     n = model.numvertices
     uvs = normals = [None] * n
-    edited = blind = 0
+    edited = blind = unskinned = 0
     if "uvs" in fields:
         uv_layer = uv_layer_of(obj)[0]
         if uv_layer is None:
@@ -731,10 +847,11 @@ def read_mesh(obj, model, bone_index, fields):
         # so it has neither UV nor corner normal, and the file's own bytes must stand.
         x.normal = normals[i]
         x.uv = (uvs[i][0], 1.0 - uvs[i][1]) if uvs[i] else None
-        x.weights, x.bones, x.numbones = _one_skin(
+        x.weights, x.bones, x.numbones, lost = _one_skin(
             v, obj.vertex_groups, bone_index, skin[i] if skin else None)
+        unskinned += lost
         out.append(x)
-    return out, edited, blind
+    return out, edited, blind, unskinned
 
 
 def _canon_faces(tris):
@@ -996,12 +1113,13 @@ def read_meshes(m, source, fields):
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
     fifth bone group no record can hold, the vertices whose normal moved by more than the
     round trip's own error and less than `NORMAL_EPS`, which are written from the stash and
-    so lose the edit, the UV layers no model wrote, and the donor's own triangles."""
+    so lose the edit, the UV layers no model wrote, the donor's own triangles, and the
+    vertices no bone drives any more, which go to bone 0 at full weight."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
     donor_faces = _donor_faces(source, m)
     edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
-    blind_normals = 0
+    blind_normals = unskinned = 0
     crowded, uv_spare = [], []
     for bi, mi, _bp, mo in mesh_mod.models_of(m):
         ok, no = mesh_mod.supported(mo.filetype, fields)
@@ -1025,11 +1143,12 @@ def read_meshes(m, source, fields):
             continue
         unsupported |= set(no)
         if ok:
-            edits[(bi, mi)], n, nb = read_mesh(obj, mo, bone_index, ok)
+            edits[(bi, mi)], n, nb, nu = read_mesh(obj, mo, bone_index, ok)
             renormals += n
             blind_normals += nb
+            unskinned += nu
     return (edits, rebuild, missing, sorted(unsupported), renormals, crowded,
-            blind_normals, uv_spare, donor_faces)
+            blind_normals, uv_spare, donor_faces, unskinned)
 
 
 def named_index(anim_names, action):
@@ -2446,6 +2565,22 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if bad:
             raise ValueError("the writer does not reproduce %s, so nothing was written: %s"
                              % (os.path.basename(source), "; ".join(bad)))
+    # Before anything is read off the scene: Shift+D copies the stamps, so two objects can
+    # claim one model and the file has one mesh per model to put them in. A copy the export
+    # can tell apart is dropped and reported; one it cannot is refused, since taking either
+    # discards the other's edits whole.
+    dup_models, dup_clash = duplicate_models(m, source)
+    if dup_clash:
+        label, names = dup_clash[0]
+        raise build_mod.Refused(
+            "%s claim model %r and none of them is the one the import made -- its mesh "
+            "datablock is still called what vtmb_model_label says. The file holds one mesh "
+            "per model, so unparent all but one from the armature, or clear vtmb_index and "
+            "the bodypart stamps on the copies"
+            % (", ".join(repr(n) for n in names), label))
+    # Before `bone_map` raises on an unresolvable one, and before the appends make each copy
+    # a bone of the file in its own right.
+    dup_bones = duplicate_bones(m, arm_obj)
     # Before the first reader: `read_poses` and `read_bones` both walk the FILE's bone list
     # and refuse by name on one the armature does not have, so a bone deleted in Blender has
     # to leave the description here or it never reaches the writer.
@@ -2579,6 +2714,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
              "slots_moved": 0, "slots_gone": [],
+             "dup_models": dup_models, "dup_bones": dup_bones,
              "blind_bones": []}
     poses = read_bones(m, arm_obj, scale, scene["blind_bones"])
     if poses:
@@ -2651,8 +2787,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     revised = {}
     if mesh_fields:
         cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
-            mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces = \
-            read_meshes(m, source, mesh_fields)
+            mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
+            mesh["unskinned"] = read_meshes(m, source, mesh_fields)
         if not cells and not rebuild and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
         for (bi, mi), verts in sorted(cells.items()):

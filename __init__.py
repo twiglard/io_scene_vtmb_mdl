@@ -1041,8 +1041,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"INFO"}, "%s was rebuilt: %d vertices -> %d, and the "
                                   ".dx80.vtx rewritten with it" % (name, was, now))
         if mesh["unskinned"]:
-            self.report({"WARNING"}, "%d vertices of a rebuilt mesh are in no vertex "
-                                     "group and were bound to bone 0"
+            self.report({"WARNING"}, "%d vertices are in no vertex group, or in none at a "
+                                     "weight above zero, and were bound to bone 0, which "
+                                     "drags them wherever it goes"
                         % mesh["unskinned"])
         if mesh.get("rebuilt_uvs"):
             self.report({"INFO"}, "%d UV%s came from Blender rather than the file, on the "
@@ -1345,6 +1346,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "leaf -- so this takes a path no shipped file takes"
                         % (scene["spring_ends"],
                            "" if scene["spring_ends"] == 1 else "s"))
+        for name, was in scene.get("dup_bones") or ():
+            self.report({"WARNING"}, "%r says it was copied from %r, which another bone "
+                                     "still is, so it is appended as a new bone and %r "
+                                     "keeps the record" % (name, was, was))
+        for name, model in scene.get("dup_models") or ():
+            self.report({"WARNING"}, "%r claims model %r, which another object owns, so "
+                                     "nothing of it reached the file -- the donor path "
+                                     "writes one mesh per model and cannot add one"
+                        % (name, model))
         if scene.get("face"):
             extra += ("; rewrote %d eyeball or mouth record%s"
                       % (scene["face"], "" if scene["face"] == 1 else "s"))

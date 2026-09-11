@@ -1221,7 +1221,9 @@ def _renumber_verts(mr, i):
 
     A slot that named `i` goes and the surviving weights rescale to 255, which is what
     Blender's armature modifier draws once the group matches no bone. A vertex left with
-    none becomes `numbones` 0, model space, which is where Blender leaves it -- measured
+    none becomes `numbones` 0 and rides bone 0 -- the skinning block transforms by
+    `bone[0]` before it reads the count at all, StudioRender 0x2c0172b9, so the format has
+    no model space to leave it in. Blender leaves it where the rest pose put it, measured
     at 1.267855 units from where the bone had been carrying it.
     """
     if struct.unpack_from("<i", mr.raw, 0x9c)[0] != 0:
@@ -1952,10 +1954,11 @@ def _carry_vertex_fields(pvb, old_vb, was, new_n):
         if src + 44 > len(old_vb):
             break
         donor, ours = _skin_key(old_vb, src), _skin_key(pvb, at)
-        # A rigid vertex is `numbones == 0` and lives in model space. Nothing in a Blender
-        # scene spells that -- `split_mesh` gives a vertex in no group `[(0, 1.0)]` so a
-        # scratch model still follows its armature -- so the donor's reading is kept where
-        # the two only differ that way. 1453 of 4423 shipped models are rigid.
+        # A rigid vertex is `numbones == 0`, which the skinning block draws as bone 0 at
+        # full weight, and all 5716 shipped ones name bone 0 with weight bytes (255, 0, 0).
+        # Nothing in a Blender scene spells the count-0 form -- `split_mesh` gives a vertex
+        # in no group `[(0, 1.0)]` -- so the donor's reading is kept where the two only
+        # differ that way. 1453 of 4423 shipped models are rigid.
         if donor == ours or (not donor and ours == [(0, 255)]):
             pvb[at:at + 12] = old_vb[src:src + 12]
         else:
