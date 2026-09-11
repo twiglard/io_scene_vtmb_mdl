@@ -810,6 +810,55 @@ def crowded_vertices(obj, bone_index):
     return n
 
 
+def claimed_groups(obj):
+    """The vertex groups something on the object records a use of its own for.
+
+    A vertex group is Blender's general per-vertex weight and skinning is one use of it:
+    the import makes one for the cloth pin set, a modifier names one to limit itself to,
+    a shape key names one to scale its range by. None of those is a binding, so naming
+    them would make `stray_groups` noise instead of a finding.
+    """
+    from . import blender_scratch as scratch_mod
+    out = {str(obj.get("vtmb_cloth_pin_group") or scratch_mod.PIN_GROUP)}
+    for mod in obj.modifiers:
+        out.add(getattr(mod, "vertex_group", "") or "")
+    keys = getattr(obj.data, "shape_keys", None)
+    for key in (keys.key_blocks if keys else ()):
+        out.add(key.vertex_group or "")
+    out.discard("")
+    return out
+
+
+def stray_groups(obj, bone_index):
+    """The object's vertex groups that hold a vertex at a weight above zero and name no
+    bone of the file.
+
+    Everything that reads a skin filters on `name in bone_index` -- `_one_skin`,
+    `crowded_vertices` and `split_mesh` alike -- so a bone name typed wrong, or a group
+    left behind by a bone the scene deleted, takes every vertex in it out of the skinning
+    and says nothing. It does not come out as an obviously broken file either: a vertex
+    left with no binding goes to bone 0 at full weight, so the geometry ships drawn by the
+    wrong bone.
+
+    Named and not refused, because nothing here tells a typo from a group somebody keeps
+    on purpose; `claimed_groups` covers the purposes the scene itself records. A group
+    with no weight above zero drives nothing and is left out -- that is an empty group and
+    it costs the file nothing.
+    """
+    groups = obj.vertex_groups
+    if not groups:
+        return []
+    claimed = claimed_groups(obj)
+    live = set()
+    for v in obj.data.vertices:
+        for g in v.groups:
+            if g.weight > 0.0:
+                live.add(g.group)
+    return sorted(groups[i].name for i in live
+                  if groups[i].name not in bone_index
+                  and groups[i].name not in claimed)
+
+
 def read_mesh(obj, model, bone_index, fields):
     """One `mdl.Vertex` per file vertex, in file order, inverting what the importer did,
     plus the normals taken from Blender, the ones in the band where the two cannot be told
@@ -1113,14 +1162,15 @@ def read_meshes(m, source, fields):
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
     fifth bone group no record can hold, the vertices whose normal moved by more than the
     round trip's own error and less than `NORMAL_EPS`, which are written from the stash and
-    so lose the edit, the UV layers no model wrote, the donor's own triangles, and the
-    vertices no bone drives any more, which go to bone 0 at full weight."""
+    so lose the edit, the UV layers no model wrote, the donor's own triangles, the
+    vertices no bone drives any more, which go to bone 0 at full weight, and the vertex
+    groups that skin something and name no bone."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
     donor_faces = _donor_faces(source, m)
     edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
     blind_normals = unskinned = 0
-    crowded, uv_spare = [], []
+    crowded, uv_spare, stray = [], [], []
     for bi, mi, _bp, mo in mesh_mod.models_of(m):
         ok, no = mesh_mod.supported(mo.filetype, fields)
         obj = found.get((bi, mi))
@@ -1136,6 +1186,9 @@ def read_meshes(m, source, fields):
         over = crowded_vertices(obj, bone_index)
         if over:
             crowded.append((obj.name, over))
+        odd = stray_groups(obj, bone_index)
+        if odd:
+            stray.append((obj.name, odd))
         if _must_rebuild(obj, mo, ok, donor_faces.get((bi, mi))):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.
@@ -1148,7 +1201,7 @@ def read_meshes(m, source, fields):
             blind_normals += nb
             unskinned += nu
     return (edits, rebuild, missing, sorted(unsupported), renormals, crowded,
-            blind_normals, uv_spare, donor_faces, unskinned)
+            blind_normals, uv_spare, donor_faces, unskinned, stray)
 
 
 def named_index(anim_names, action):
@@ -2783,12 +2836,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
             "rebuilt_uvs": 0, "rebuilt_added": 0, "uv_spare": [], "tangents": 0,
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
-            "stale_stash": stale_stash(m, source)}
+            "stray_groups": [], "stale_stash": stale_stash(m, source)}
     revised = {}
     if mesh_fields:
         cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
             mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
-            mesh["unskinned"] = read_meshes(m, source, mesh_fields)
+            mesh["unskinned"], mesh["stray_groups"] = read_meshes(
+                m, source, mesh_fields)
         if not cells and not rebuild and not mesh["missing"]:
             raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
         for (bi, mi), verts in sorted(cells.items()):

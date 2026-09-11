@@ -1041,10 +1041,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"INFO"}, "%s was rebuilt: %d vertices -> %d, and the "
                                   ".dx80.vtx rewritten with it" % (name, was, now))
         if mesh["unskinned"]:
-            self.report({"WARNING"}, "%d vertices are in no vertex group, or in none at a "
-                                     "weight above zero, and were bound to bone 0, which "
+            self.report({"WARNING"}, "%d vertices are driven by no bone -- in no vertex "
+                                     "group, in none above a zero weight, or in none that "
+                                     "names a bone -- and were bound to bone 0, which "
                                      "drags them wherever it goes"
                         % mesh["unskinned"])
+        for name, odd in mesh.get("stray_groups") or ():
+            self.report({"WARNING"}, "%s: %s name%s no bone, so %s bind%s nothing -- a "
+                                     "vertex whose only group it is goes to bone 0. A "
+                                     "bone name spelt wrong lands here"
+                        % (name, ", ".join(repr(g) for g in odd),
+                           "s" if len(odd) == 1 else "",
+                           "it" if len(odd) == 1 else "they",
+                           "s" if len(odd) == 1 else ""))
         if mesh.get("rebuilt_uvs"):
             self.report({"INFO"}, "%d UV%s came from Blender rather than the file, on the "
                                   "file's own vertex"
@@ -1683,6 +1692,14 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
                                      "bone 0, which drags them wherever it goes"
                         % r["unskinned"])
+        for name, odd in r.get("stray_groups") or ():
+            self.report({"WARNING"}, "%s: %s name%s no bone, so %s bind%s nothing -- a "
+                                     "vertex whose only group it is goes to bone 0. A "
+                                     "bone name spelt wrong lands here"
+                        % (name, ", ".join(repr(g) for g in odd),
+                           "s" if len(odd) == 1 else "",
+                           "it" if len(odd) == 1 else "they",
+                           "s" if len(odd) == 1 else ""))
         if r["crowded"]:
             total = sum(k for _n, k in r["crowded"])
             self.report({"WARNING"}, "%d vertex%s carr%s a fifth vertex group, which no "

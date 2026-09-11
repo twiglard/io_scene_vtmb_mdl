@@ -503,7 +503,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     """
     slot_of = {}
     total_unskinned = total_kept = 0
-    crowded, cloths = [], []
+    crowded, cloths, stray = [], [], []
     for obj in mesh_objs:
         runs, unskinned, kept, _why, _edits = split_mesh(obj, bone_index, scale)
         total_unskinned += unskinned
@@ -511,6 +511,9 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
         over = export_mod.crowded_vertices(obj, bone_index)
         if over:
             crowded.append((obj.name, over))
+        odd = export_mod.stray_groups(obj, bone_index)
+        if odd:
+            stray.append((obj.name, odd))
         mats = obj.data.materials
         meshes = []
         for slot, verts, faces in runs:
@@ -535,7 +538,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
                 add_cloth(d, obj, cverts, cfaces, npin,
                           bool(obj.get("vtmb_cloth_flip")))
                 cloths.append((obj.name, npin, len(cverts)))
-    return list(d.faces), total_unskinned, total_kept, crowded, cloths
+    return list(d.faces), total_unskinned, total_kept, crowded, cloths, stray
 
 
 _ARM = ("upperarm", "forearm", "hand", "finger", "thumb")
@@ -746,13 +749,15 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
-    faces, unskinned, kept, crowded, cloths = add_meshes(d, mesh_objs, bone_index, scale)
+    faces, unskinned, kept, crowded, cloths, stray = add_meshes(
+        d, mesh_objs, bone_index, scale)
     if hitboxes:
         fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
     add_attachments(d, arm_obj, bone_index, scale)
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
-    return d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths
+    return (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
+            stray)
 
 
 def _set_hull(d, lo, hi):
@@ -814,8 +819,9 @@ def write(d, faces, path, checksum):
 
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
-    d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths = build(
-        context, arm_obj, mesh_objs, actions, embedded_name(path), **kw)
+    (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
+     stray) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
+                    **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "with_root_motion": moved, "unfitted": unfitted,
@@ -829,4 +835,4 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
                                for bp in d.bodyparts for x in bp.kids),
             "kept": kept, "crowded": crowded,
             "unskinned": unskinned, "dropped": dict(d.dropped),
-            "cloths": cloths}
+            "cloths": cloths, "stray_groups": stray}
