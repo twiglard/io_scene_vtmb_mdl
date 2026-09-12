@@ -877,6 +877,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     box.label(text="    no sequence plays it, so none goes with it",
                               icon="TRASH")
             if self.target == ALL:
+                if self.use_range:
+                    box.label(text="    Scene range is ignored here: it applies to one "
+                                   "animation at a time", icon="INFO")
                 hits, unwritten = _matches(self, context)
                 _pair(box, "matched", "%d of %d" % (len(hits), len(_base_anims(base))),
                       icon="NONE" if hits else "ERROR")
@@ -1005,8 +1008,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 if gone in names:
                     actions.pop(names.index(gone), None)
                 adds = [a for a in adds if a.name != gone]
+            # `vtmb_scale` is 1.0 on every imported armature -- the importer has no scale
+            # option -- but the skeleton template takes one and stamps it, and that armature
+            # reaches this path as soon as an action of it carries a `vtmb_source`. Without
+            # this the bone positions, the poses, the accessories and the face all go in
+            # unscaled while `fit_hull` alone divides.
+            arm_scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
             r = blender_export.export_actions(
-                context, obj, src, self.filepath, actions,
+                context, obj, src, self.filepath, actions, scale=arm_scale,
                 root_motion_in_keys=self.root_motion_in_keys,
                 root_motion=self.root_motion,
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
@@ -1025,8 +1034,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                              if self.options.is_invoke else "")),
                 cdtexture=self.cdtexture or None,
                 hull=(blender_scratch.fit_hull(
-                    list(blender_export.mesh_objects(m, src).values()),
-                    float(obj.get("vtmb_scale", 1.0) or 1.0))
+                    list(blender_export.mesh_objects(m, src).values()), arm_scale)
                     if self.fit_hull else None),
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)

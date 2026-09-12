@@ -3003,7 +3003,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             obj = found.get((bi, mi))
             if obj is None:
                 continue
-            k, r, skipped, why = shape_key_flexes(d, obj, bi, mi)
+            k, r, skipped, why = shape_key_flexes(d, obj, bi, mi, scale)
             mesh["flexes"] += k
             mesh["flex_records"] += r
             mesh["flex_skipped"] += skipped
