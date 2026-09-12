@@ -288,7 +288,8 @@ def _fit_endpoints(px):
         ws = []
         for p in px:
             den = sum((b[c] - a[c]) ** 2 for c in range(3))
-            t = 0.0 if den < 1e-12 else                 sum((p[c] - a[c]) * (b[c] - a[c]) for c in range(3)) / den
+            t = (0.0 if den < 1e-12
+                 else sum((p[c] - a[c]) * (b[c] - a[c]) for c in range(3)) / den)
             ws.append(min(1.0, max(0.0, round(t * 3.0) / 3.0)))
         s0 = sum((1.0 - w) ** 2 for w in ws)
         s1 = sum(w * w for w in ws)

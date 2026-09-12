@@ -1151,7 +1151,8 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
         for vi in moved:
             delta = tuple((co[vi][c] - base[vi][c]) / scale for c in range(3))
             ndelta = tuple(morph_n[vi][c] - base_n[vi][c] for c in range(3))
-            if sum(c * c for c in delta) ** 0.5 < FLEX_POS_STEP / 2.0 and                     sum(c * c for c in ndelta) ** 0.5 < FLEX_NRM_STEP / 2.0:
+            if (sum(c * c for c in delta) ** 0.5 < FLEX_POS_STEP / 2.0
+                    and sum(c * c for c in ndelta) ** 0.5 < FLEX_NRM_STEP / 2.0):
                 continue
             at = local.get(vi)
             if at is None:
@@ -2001,13 +2002,15 @@ def apply_cloth(d, m, source, edits=None):
             out["scale"] += 1
         sigma = e["sigma"][1] if e["sigma"] else None
         slack = e["slack"][1] if e["slack"] else None
-        per_edge = {} if sigma is not None             else cloth_sigma_edges(found[(bi, mi)], pv, springs, ns0, donor)
+        per_edge = ({} if sigma is not None
+                    else cloth_sigma_edges(found[(bi, mi)], pv, springs, ns0, donor))
         for q, (a, b, w0, w1, rest2) in enumerate(springs):
             # The panel's one number first, then the edge the spring sits on, then the
             # file's own. Rewriting a spring whose sigma did not move would re-round w0
             # through k0, so an untouched re-export is left alone rather than recomputed.
             s = sigma
-            if s is None and q in per_edge                     and abs(per_edge[q] - (w0 - w1) / 2.0) > CLOTH_TOL:
+            if (s is None and q in per_edge
+                    and abs(per_edge[q] - (w0 - w1) / 2.0) > CLOTH_TOL):
                 s = per_edge[q]
                 out["sigma_edges"] += 1
             if s is not None and (w0 - w1) != 0.0:

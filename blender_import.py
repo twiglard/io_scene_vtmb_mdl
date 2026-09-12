@@ -896,7 +896,8 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
                 "record also carries has no Blender field and is not in the scene"
                 % (nkeys, nflexrec))
         if nflexdrop:
-            note += ", and %d record(s) named a vertex or a direction this file does "                     "not hold" % nflexdrop
+            note += (", and %d record(s) named a vertex or a direction this file "
+                     "does not hold" % nflexdrop)
     if cloth_notes:
         note = "; ".join(([note] if note else []) + cloth_notes)
     return objs, note

@@ -1658,7 +1658,9 @@ def add_flex(d, bi, mi, k, name, records, target=(0.0, 0.0, 0.0, 0.0)):
                           % (name, index, numvertices))
     vertanimtype = 1
     for _index, delta, _ndelta in records:
-        if max(abs(c) for c in delta) > MAX_VERTANIM1_DELTA or                 (delta[0] ** 2 + delta[1] ** 2 + delta[2] ** 2) ** 0.5 >                 MAX_VERTANIM1_DELTA:
+        if (max(abs(c) for c in delta) > MAX_VERTANIM1_DELTA
+                or ((delta[0] ** 2 + delta[1] ** 2 + delta[2] ** 2) ** 0.5
+                    > MAX_VERTANIM1_DELTA)):
             vertanimtype = 0
             break
     raw = bytearray(32)

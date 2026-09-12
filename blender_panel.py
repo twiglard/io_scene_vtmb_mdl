@@ -368,7 +368,8 @@ def cloth_sigmas(obj):
     number below is the whole-object override and writing it flattens them."""
     me = obj.data
     att = me.attributes.get("vtmb_cloth_sigma")
-    if att is None or att.domain != "EDGE" or len(att.data) != len(me.edges)             or not len(me.edges):
+    if (att is None or att.domain != "EDGE" or len(att.data) != len(me.edges)
+            or not len(me.edges)):
         return None
     buf = [0.0] * len(me.edges)
     att.data.foreach_get("value", buf)

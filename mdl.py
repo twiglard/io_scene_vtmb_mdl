@@ -125,7 +125,8 @@ def parse_flex_expr(text, controllers, flexdescs):
             return v
         if t == "-":
             # Unary minus: studiomdl has none, so it is written out as 0 - x.
-            return [(STUDIO_CONST, struct.unpack("<i", struct.pack("<f", 0.0))[0])]                 + atom() + [(STUDIO_SUB, 0)]
+            return ([(STUDIO_CONST, struct.unpack("<i", struct.pack("<f", 0.0))[0])]
+                    + atom() + [(STUDIO_SUB, 0)])
         if t[0] == "%":
             k = fdx.get(t[1:].lower())
             if k is None:
@@ -934,7 +935,8 @@ class Mdl:
             e.lowerflexdesc = struct.unpack_from("<3i", d, eo + 0x50)
             e.uppertarget = struct.unpack_from("<3f", d, eo + 0x5c)
             e.lowertarget = struct.unpack_from("<3f", d, eo + 0x68)
-            e.upperlidflexdesc, e.lowerlidflexdesc =                 struct.unpack_from("<2i", d, eo + 0x74)
+            e.upperlidflexdesc, e.lowerlidflexdesc = struct.unpack_from(
+                "<2i", d, eo + 0x74)
             e.pitch = struct.unpack_from("<2f", d, eo + 0x7c)
             e.yaw = struct.unpack_from("<2f", d, eo + 0x84)
             ids = (list(e.upperflexdesc) + list(e.lowerflexdesc)
@@ -997,9 +999,11 @@ class Mdl:
             c = Cloth()
             c.slot, c.row, c.col = k, k // cols, k % cols
             c.scale = struct.unpack_from("<f", d, at)[0]
-            c.numparticles, c.numfixed, c.numfree, pvoff =                 struct.unpack_from("<4i", d, at + 0x04)
+            c.numparticles, c.numfixed, c.numfree, pvoff = struct.unpack_from(
+                "<4i", d, at + 0x04)
             c.numsprings, c.ns0, c.ns1, spoff = struct.unpack_from("<4i", d, at + 0x14)
-            c.pv = list(struct.unpack_from("<%dH" % c.numparticles, d, at + pvoff))                 if pvoff else []
+            c.pv = (list(struct.unpack_from("<%dH" % c.numparticles, d, at + pvoff))
+                    if pvoff else [])
             c.springs = [struct.unpack_from("<2H3f", d, at + spoff + q * 16)
                          for q in range(c.ns0 + c.ns1)] if spoff else []
             m.cloths.append(c)
