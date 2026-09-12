@@ -347,6 +347,34 @@ def cloth_numbers(obj):
     return blender_scratch.cloth_mod.resolve(preset, *got), over
 
 
+def cloth_flips(obj):
+    """(vertices the flip attribute sets, total), or None where the object's flag covers
+    the whole mesh. Bit 15 of `+0x34` negates that vertex's normal and 63 of the 84
+    shipped meshes set it on some vertices and not others, so the import stamps it per
+    vertex; Blender's own attribute editing is what edits one."""
+    me = obj.data
+    att = me.attributes.get("vtmb_cloth_flip")
+    if att is None or len(att.data) != len(me.vertices):
+        return None
+    buf = [0] * len(me.vertices)
+    att.data.foreach_get("value", buf)
+    return sum(1 for v in buf if v), len(me.vertices)
+
+
+def cloth_sigmas(obj):
+    """(lowest, highest, edges) the per-edge sigma attribute holds, or None where the
+    object has none. 28 of the 59 shipped row-0 objects vary sigma spring by spring, and
+    group 0 is the face list's edge set, so the import stamps one float per edge; the
+    number below is the whole-object override and writing it flattens them."""
+    me = obj.data
+    att = me.attributes.get("vtmb_cloth_sigma")
+    if att is None or att.domain != "EDGE" or len(att.data) != len(me.edges)             or not len(me.edges):
+        return None
+    buf = [0.0] * len(me.edges)
+    att.data.foreach_get("value", buf)
+    return min(buf), max(buf), len(buf)
+
+
 def cloth_pins(obj):
     """(pinned, total) for the object's pin group, or None where it cannot be counted."""
     me = obj.data
@@ -364,13 +392,23 @@ def draw_cloth(lay, obj):
         return
     lay.prop(obj, "vtmb_cloth_preset_name")
     lay.prop(obj, "vtmb_cloth_pin_text")
-    lay.prop(obj, "vtmb_cloth_flip_on")
+    flips = cloth_flips(obj)
+    if flips is None:
+        lay.prop(obj, "vtmb_cloth_flip_on")
+    else:
+        lay.label(text="Flip normals: %d of %d vertices" % flips)
+        lay.label(text="edited per vertex, in the vtmb_cloth_flip attribute")
     numbers, over = cloth_numbers(obj)
     if numbers is None:
         lay.label(text="preset %r is not one of the %d"
                        % (str(obj.get("vtmb_cloth_preset")),
                           len(blender_scratch.cloth_mod.PRESETS)), icon="ERROR")
         return
+    sigmas = cloth_sigmas(obj)
+    if sigmas is not None:
+        lay.label(text="Sigma: %g to %g over %d edges" % sigmas)
+        lay.label(text="edited per edge, in the vtmb_cloth_sigma attribute; the number "
+                       "below overrides all of them")
     for i, (k, label, _lo, _hi, _desc) in enumerate(CLOTH_NUMBERS):
         row = lay.row(align=True)
         row.prop(obj, "vtmb_cloth_%s_on" % k, text="")

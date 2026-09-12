@@ -1237,6 +1237,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             moved = [w for w in ("stiffness" if e["sigma"] else None,
                                  "slack" if e["slack"] else None,
                                  "gravity" if e["scale"] else None) if w]
+            if e["sigma_edges"]:
+                moved.append("%d spring stiffness(es) off the mesh's own edges"
+                             % e["sigma_edges"])
             if e["moved"]:
                 moved.append("%d of the cloth's particles moved" % e["moved"])
             if e["why"] is not None:

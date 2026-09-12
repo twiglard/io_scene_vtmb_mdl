@@ -905,6 +905,22 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
 PIN_GROUP = "vtmb_pinned"
 
 
+def _stamp_sigma(obj, c, verts, fallback):
+    """Each group-0 spring's own sigma on the mesh edge that carries it, `fallback` on the
+    rest. Answers how many springs no edge reaches."""
+    me = obj.data
+    at = {cloth_mod.pair(*tuple(e.vertices)): e.index for e in me.edges}
+    keys, missed = cloth_mod.edge_keys(c.pv, c.springs, c.ns0,
+                                       [v.pos for v in verts], set(at))
+    buf = [float(fallback)] * len(me.edges)
+    for q, k in keys.items():
+        w0, w1 = c.springs[q][2], c.springs[q][3]
+        buf[at[k]] = (w0 - w1) / 2.0
+    att = me.attributes.new("vtmb_cloth_sigma", "FLOAT", "EDGE")
+    att.data.foreach_set("value", buf)
+    return len(missed)
+
+
 def _stamp_cloth(obj, model, verts):
     """The model's row-0 cloth object put on the mesh object, and what would not fit.
 
@@ -913,10 +929,12 @@ def _stamp_cloth(obj, model, verts):
     preset's `s` to 3.8e-07 over 142 objects, and `(scale, slack)` names one of the 17
     presets or none, that pair being unique over them.
 
-    Three things cannot be represented and are returned rather than dropped in silence: a
-    pinned particle no vertex names (2297 over the corpus against 2614 that are named), a
-    per-vertex flip bit where the writer has one flag per mesh (mixed within 62 of the 84
-    shipped meshes), and a sigma that varies across the object (39 of 150).
+    One thing cannot be represented and is returned rather than dropped in silence: a pinned
+    particle no vertex names, 2297 over the corpus against 2614 that are named. The flip bit
+    is stamped per vertex as a BOOLEAN attribute, 63 of the 84 shipped meshes setting it on
+    some vertices and not others, and each group-0 spring's sigma per edge as a FLOAT one,
+    28 of the 59 row-0 objects varying it -- bar the 289 springs over the corpus that no
+    edge of the mesh reaches, which keep the value the file gave them.
     """
     row0 = [c for c in model.cloths if c.row == 0]
     if not row0:
@@ -935,15 +953,19 @@ def _stamp_cloth(obj, model, verts):
         obj["vtmb_cloth_scale"] = c.scale
         if r.slack is not None:
             obj["vtmb_cloth_slack"] = r.slack
-    if r.sigma is not None and not r.uniform:
-        out.append("%s: sigma runs %.4f to %.4f across the object and one number is what "
-                   "the scene holds, so a re-export writes %.4f everywhere"
-                   % (obj.name, r.sigma_min, r.sigma, r.sigma))
-    if r.sigma is not None and (r.preset is None or not r.uniform):
-        obj["vtmb_cloth_sigma"] = r.sigma
+    if r.sigma is not None:
+        # Every mesh edge gets a value, so the attribute alone describes the object and a
+        # spring an edit adds has a number to take. The object key of the same name stays
+        # what the panel writes, and setting it there is what flattens the object.
+        miss = _stamp_sigma(obj, c, verts, r.sigma)
+        if miss:
+            out.append("%s: %d of %d group-0 springs run between two vertices the mesh has "
+                       "no edge between, so their sigma stays out of the scene and a "
+                       "re-export writes what the file already holds"
+                       % (obj.name, miss, c.ns0))
     # The mesh binding is what says which vertices are particles at all; c.pv is the
     # inverse and names one vertex per particle where a seam has several.
-    pinned, flips = set(), set()
+    pinned, flips, flipped = set(), set(), {}
     for e in model.meshes:
         if not e.clothbind:
             continue
@@ -951,6 +973,7 @@ def _stamp_cloth(obj, model, verts):
             if col != c.col:
                 continue
             flips.add(flip)
+            flipped[e.vertexoffset + v] = flip
             if part < c.numfixed:
                 pinned.add(e.vertexoffset + v)
     obj["vtmb_cloth_pin_group"] = PIN_GROUP
@@ -962,11 +985,14 @@ def _stamp_cloth(obj, model, verts):
         out.append("%s: %d of %d pinned particles are named by no vertex and a vertex "
                    "group cannot hold them, so a re-export pins %d"
                    % (obj.name, c.numfixed - named, c.numfixed, named))
+    # Bit 15 of +0x34 negates that vertex's normal. The attribute is what the exporter
+    # reads; the object key stays for an authored sheet, which has no attribute at all.
     if flips == {True}:
         obj["vtmb_cloth_flip"] = 1
-    elif len(flips) > 1:
-        out.append("%s: the +0x34 flip bit is set on some vertices and clear on others, "
-                   "and the writer has one flag per mesh" % obj.name)
+    if flipped:
+        att = obj.data.attributes.new("vtmb_cloth_flip", "BOOLEAN", "POINT")
+        att.data.foreach_set("value", [bool(flipped.get(i))
+                                       for i in range(len(obj.data.vertices))])
     return out
 
 

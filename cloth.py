@@ -32,6 +32,49 @@ def tri_edges(tris):
     return set(pair(t[i], t[(i + 1) % 3]) for t in tris for i in range(3))
 
 
+# How far apart two model positions may be and still count as one seam's duplicates.  The
+# corpus duplicates a vertex exactly, so this only has to survive float32 printing.
+EDGE_Q = 4
+
+
+def edge_keys(pv, springs, ns0, pos, edges):
+    """({group-0 spring: the mesh edge carrying its sigma}, the springs no edge reaches).
+
+    A spring names two particles and `pv` names each one's model vertex, but the mesh's
+    triangulation is not the cloth's own face list, so the pair is not always an edge of it:
+    26 950 of the corpus's 30 623 group-0 springs are one directly, another 3384 once a
+    vertex is exchanged for a duplicate a seam left at the same position, and 289 are reached
+    by no edge at all and keep whatever the file gave them.  The exchange takes the smallest
+    such pair, and it is injective as measured -- those 30 334 springs land on 30 334
+    distinct edges, no two claiming one.
+
+    `pos` is one position per model vertex and `edges` the mesh's own ascending pairs.  Both
+    sides pass the FILE's positions, so moving a vertex in the scene cannot move a spring
+    onto another edge.
+    """
+    at = collections.defaultdict(list)
+    for i, p in enumerate(pos):
+        at[tuple(round(x, EDGE_Q) for x in p)].append(i)
+    keys, missed = {}, []
+    for q in range(min(ns0, len(springs))):
+        a, b = springs[q][0], springs[q][1]
+        if a >= len(pv) or b >= len(pv):
+            missed.append(q)
+            continue
+        u, w = pv[a], pv[b]
+        k = pair(u, w)
+        if k not in edges:
+            du = at.get(tuple(round(x, EDGE_Q) for x in pos[u]), [u]) if u < len(pos) else [u]
+            dw = at.get(tuple(round(x, EDGE_Q) for x in pos[w]), [w]) if w < len(pos) else [w]
+            hit = sorted(pair(x, y) for x in du for y in dw if pair(x, y) in edges)
+            if not hit:
+                missed.append(q)
+                continue
+            k = hit[0]
+        keys[q] = k
+    return keys, missed
+
+
 def adjacency(pairs, n):
     g = collections.defaultdict(set)
     for a, c in pairs:
@@ -260,13 +303,18 @@ def face_edges(f, seen=()):
 
 
 def generate(pos, faces, npin, pv=None, sigma=None, slack=None, scale=None, collide=None,
-             preset=None):
+             preset=None, sigma0=None):
     """`pos` is one rest position per particle, `faces` triangles over particle indices, and
     the first `npin` particles are the pinned ones -- the array is ordered pinned-first and
     nothing else marks a pin (section 1.1).
 
     `preset` names one of the 17 shipped (scale, s) pairs and supplies whichever of the three
-    numbers the caller left None; passing all three explicitly is the same call as before."""
+    numbers the caller left None; passing all three explicitly is the same call as before.
+
+    `sigma0` is one value per ascending particle pair and overrides `sigma` on group 0 alone,
+    28 of the 59 shipped row-0 objects varying it spring by spring.  Group 1 keeps the scalar:
+    it is 1.0 on all 27 008 shipped group-1 springs, and its pairs are bend partners rather
+    than edges, so nothing addresses them."""
     sigma, slack, scale = resolve(preset, sigma, slack, scale)
     c = Cloth()
     c.scale, c.numfixed = scale, npin
@@ -281,19 +329,21 @@ def generate(pos, faces, npin, pv=None, sigma=None, slack=None, scale=None, coll
     def d2(a, b):
         return sum((x - y) ** 2 for x, y in zip(pos[a], pos[b]))
 
-    def spring(a, b, rest2):
+    def spring(a, b, rest2, s=None):
         # v0 is the end nearer the pins, which is what makes it the heavier one and puts
         # k0 == 0 exactly on a pinned v0 -- section 3.3.
+        s = sigma if s is None else s
         if r.get(a, 1 << 30) > r.get(b, 1 << 30):
             a, b = b, a
         r0, r1 = r.get(a, 0), r.get(b, 0)
         k0 = (r0 * r0) / float(r0 * r0 + r1 * r1)
-        return (a, b, 2.0 * sigma * k0, -2.0 * sigma * (1.0 - k0), rest2)
+        return (a, b, 2.0 * s * k0, -2.0 * s * (1.0 - k0), rest2)
 
     g0 = []
     for a, b in sorted(fe):
         if a in r and b in r and not (r[a] == 0 and r[b] == 0):
-            g0.append(spring(a, b, d2(a, b)))
+            g0.append(spring(a, b, d2(a, b),
+                             None if sigma0 is None else sigma0.get((a, b))))
 
     # Group 1 is the bend set: the corners opposite each shared face edge, which is a little
     # under half the full 2-ring -- section 3.2a.  Pairs with both ends pinned are dropped by
@@ -442,13 +492,22 @@ def region(blob, nvert, npart, flip):
     if nvert > npart:
         raise SystemExit("%d vertices against %d particles" % (nvert, npart))
     table = struct.pack("<i", 4)                     # one slot, the object right after it
-    bit = 0x8000 if flip else 0
+    # Bit 15 negates that vertex's normal, and 63 of the 84 shipped meshes set it on some
+    # vertices and not others, so a shipped object needs one flag per vertex. A bool is
+    # the whole mesh, which is what an authored sheet has.
+    if isinstance(flip, (bool, int)):
+        bits = [0x8000 if flip else 0] * nvert
+    else:
+        bits = [0x8000 if f else 0 for f in flip]
+        if len(bits) != nvert:
+            raise SystemExit("%d flip flags against %d vertices"
+                             % (len(bits), nvert))
     # All three arrays start 4-aligned on 84 of 84 shipped meshes, so an odd vertex count
     # needs the ushort ones padded too, not only the documented byte one.
     def pad(x):
         return x + bytes(-len(x) % 4)
     own = pad(bytes(nvert))                          # column 0 for every vertex
-    p34 = pad(b"".join(struct.pack("<H", v | bit) for v in range(nvert)))
+    p34 = pad(b"".join(struct.pack("<H", v | bits[v]) for v in range(nvert)))
     p38 = pad(b"".join(struct.pack("<H", v) for v in range(nvert)))
     at_own = 4 + len(blob)
     at_p34 = at_own + len(own)

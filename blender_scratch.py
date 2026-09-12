@@ -221,7 +221,7 @@ def wound(corners):
 
 
 def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
-    """([(material slot, verts, faces), ...], unskinned, kept, why, edits) per corner.
+    """([(material slot, verts, faces), ...], unskinned, kept, why, edits, origins).
 
     The format stores one normal, one UV and one skin per vertex, so a seam or a hard edge
     is spelled by duplicating the vertex. `kept` counts the originals written back into
@@ -235,6 +235,12 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
     `fields` is the export's own, so an original keeps what was imported for any field the
     scene was not asked to supply. A vertex that has no original takes Blender's whatever
     is asked, there being nothing else to take.
+
+    `origins` runs parallel to the runs and names the Blender vertex each output vertex
+    came from, several of them naming one where a seam split it apart. Anything the scene
+    holds per Blender vertex needs it to reach a written vertex: two vertices a seam
+    duplicated share a position, so a position cannot tell them apart, and 18 998 of the
+    25 564 named cloth particles are named by vertices that disagree about the flip bit.
     """
     me = obj.data
     if not me.polygons:
@@ -272,11 +278,12 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
             out = _split_preserved(me, runs, stash, uvs, normals, uv_layer,
                                    rec, key_of, why, fields)
             if out is not None:
-                return out[0], unskinned, out[1], None, out[2]
+                return out[0], unskinned, out[1], None, out[2], out[3]
 
     per_slot = {}
     for tri in me.loop_triangles:
-        verts, faces, seen = per_slot.setdefault(tri.material_index, ([], [], {}))
+        verts, faces, seen, orig = per_slot.setdefault(tri.material_index,
+                                                       ([], [], {}, []))
         corners = []
         for li in tri.loops:
             vi = me.loops[li].vertex_index
@@ -287,11 +294,12 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
             if at is None:
                 at = seen[key] = len(verts)
                 verts.append(rec(vi, n, u, w))
+                orig.append(vi)
             corners.append(at)
         faces.append(wound(corners))
     return ([(k, per_slot[k][0], per_slot[k][1]) for k in sorted(per_slot)],
             unskinned, 0, why[0] if why else "the file's partition was not recoverable",
-            dict(NO_EDITS))
+            dict(NO_EDITS), [per_slot[k][3] for k in sorted(per_slot)])
 
 
 def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, fields):
@@ -385,9 +393,10 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
 
     edits = dict(NO_EDITS)
     where, run_of_slot, out, seen, kept = {}, {}, [], [], 0
+    origins = []
     for ri, (slot, members) in enumerate(runs):
         run_of_slot[slot] = ri
-        verts, keys = [], {}
+        verts, keys, orig = [], {}, []
         for vi in members:
             where[vi] = ri
             n, u, w, duv = home(vi)
@@ -399,8 +408,10 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
                 edits["blind"] += 1
             keys[key_of(vi, n, u, w)] = len(verts)
             verts.append(rec(vi, n, u, w))
+            orig.append(vi)
             kept += 1
         out.append((verts, []))
+        origins.append(orig)
         seen.append(keys)
 
     for tri in me.loop_triangles:
@@ -423,6 +434,7 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
             if at is None:
                 at = seen[ri][key] = len(out[ri][0])
                 out[ri][0].append(rec(vi, n, u, w))
+                origins[ri].append(vi)
                 edits["added"] += 1
             corners.append((ri, at))
         if corners[0][0] != corners[1][0] or corners[1][0] != corners[2][0]:
@@ -430,7 +442,7 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
             return None
         out[corners[0][0]][1].append(wound([c[1] for c in corners]))
     return [(runs[ri][0], out[ri][0], out[ri][1])
-            for ri in range(len(runs))], kept, edits
+            for ri in range(len(runs))], kept, edits, origins
 
 
 PIN_GROUP = "vtmb_pinned"
@@ -450,13 +462,13 @@ def cloth_params(obj):
 
 
 def pin_first(obj, verts, faces, group, scale=1.0):
-    """(verts, faces, npin) reordered so the pinned particles come first.
+    """(verts, faces, npin, order) reordered so the pinned particles come first.
 
     cloth_mod.generate takes the pin set as a count and nothing else marks a pin, so the
-    order is the only channel a mesh has into it.  split_mesh drops the Blender vertex
-    index -- a seam duplicates a vertex -- so membership is carried by position, and two
-    vertices sharing one position while disagreeing about the group are refused rather
-    than resolved.
+    order is the only channel a mesh has into it.  Membership is carried by position,
+    which two vertices a seam duplicated share; `order` is the permutation itself, so
+    anything the caller holds per output vertex follows the reorder rather than being
+    re-derived from a position that cannot tell those two apart.
     """
     vg = obj.vertex_groups.get(group)
     if vg is None:
@@ -479,15 +491,58 @@ def pin_first(obj, verts, faces, group, scale=1.0):
                       % (obj.name, npin))
     at = {o: i for i, o in enumerate(order)}
     return ([verts[o] for o in order],
-            [tuple(at[c] for c in f) for f in faces], npin)
+            [tuple(at[c] for c in f) for f in faces], npin, order)
 
 
-def add_cloth(d, obj, verts, faces, npin, flip=False):
+def flip_flags(obj, origins):
+    """One flip bit per output vertex, from the mesh attribute or from the object key.
+
+    Bit 15 of `mstudiomesh_t +0x34` negates that vertex's normal and 63 of the 84 shipped
+    meshes set it on some vertices and not others, so the import stamps it per vertex.
+    The object key is what an authored sheet and a `.blend` saved before the attribute
+    shipped have, and it covers every vertex.
+    """
+    per_vertex = _point_ints(obj.data, "vtmb_cloth_flip")
+    if per_vertex is None:
+        return bool(obj.get("vtmb_cloth_flip"))
+    return [bool(per_vertex[vi]) for vi in origins]
+
+
+def sigma_edges(obj, origins, faces):
+    """{ascending output particle pair: the sigma its Blender edge holds}, or None.
+
+    28 of the 59 shipped row-0 objects give each group-0 spring its own sigma, and group 0
+    is the face list's edge set, so a float per mesh edge is what an authored one carries.
+    `origins` names the Blender vertex each output vertex came from, so a pair a seam split
+    reads the edge it was split from.
+    """
+    me = obj.data
+    att = me.attributes.get("vtmb_cloth_sigma")
+    if att is None or att.domain != "EDGE" or len(att.data) != len(me.edges):
+        return None
+    buf = [0.0] * len(me.edges)
+    att.data.foreach_get("value", buf)
+    at = {cloth_mod.pair(*tuple(e.vertices)): e.index for e in me.edges}
+    out = {}
+    for f in faces:
+        for i in range(3):
+            a, b = cloth_mod.pair(f[i], f[(i + 1) % 3])
+            if a >= len(origins) or b >= len(origins):
+                continue
+            j = at.get(cloth_mod.pair(origins[a], origins[b]))
+            if j is not None:
+                out[(a, b)] = buf[j]
+    return out
+
+
+def add_cloth(d, obj, verts, faces, npin, flip=False, origins=None):
     """Generate this model's cloth object and hang it off the model's one mesh."""
     preset, sigma, slack, cscale, _g = cloth_params(obj)
     c = cloth_mod.generate([v[0] for v in verts], faces, npin,
                            pv=list(range(len(verts))), preset=preset,
-                           sigma=sigma, slack=slack, scale=cscale)
+                           sigma=sigma, slack=slack, scale=cscale,
+                           sigma0=None if origins is None
+                           else sigma_edges(obj, origins, faces))
     blob = cloth_mod.pack(c)
     mr = d.bodyparts[-1].kids[-1]
     mr.extra["cloth"] = cloth_mod.region(blob, len(verts), c.numparticles, flip)
@@ -505,7 +560,8 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     total_unskinned = total_kept = 0
     crowded, cloths, stray = [], [], []
     for obj in mesh_objs:
-        runs, unskinned, kept, _why, _edits = split_mesh(obj, bone_index, scale)
+        runs, unskinned, kept, _why, _edits, origins = split_mesh(obj, bone_index,
+                                                                  scale)
         total_unskinned += unskinned
         total_kept += kept
         over = export_mod.crowded_vertices(obj, bone_index)
@@ -528,15 +584,16 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
                               "object spans one model's whole particle array, so the "
                               "mesh has to be one material" % (obj.name, len(meshes)))
             slot, cverts, cfaces = meshes[0]
-            cverts, cfaces, npin = pin_first(obj, cverts, cfaces, cloth[4], scale)
+            cverts, cfaces, npin, order = pin_first(obj, cverts, cfaces, cloth[4], scale)
+            corig = [origins[0][o] for o in order]
+            cflip = flip_flags(obj, corig)
             meshes = [(slot, cverts, cfaces)]
         if meshes:
             build_mod.add_model(d, meshes,
                                 bodypart=obj.get("vtmb_bodypart") or obj.name,
                                 model=obj.get("vtmb_model") or obj.name + ".smd")
             if cloth is not None:
-                add_cloth(d, obj, cverts, cfaces, npin,
-                          bool(obj.get("vtmb_cloth_flip")))
+                add_cloth(d, obj, cverts, cfaces, npin, cflip, corig)
                 cloths.append((obj.name, npin, len(cverts)))
     return list(d.faces), total_unskinned, total_kept, crowded, cloths, stray
 

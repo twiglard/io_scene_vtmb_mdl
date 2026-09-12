@@ -1028,8 +1028,8 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     """
     # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
     from . import blender_scratch as scratch_mod
-    runs, unskinned, kept, why, edits = scratch_mod.split_mesh(obj, bone_index, 1.0,
-                                                               fields)
+    runs, unskinned, kept, why, edits, _origins = scratch_mod.split_mesh(
+        obj, bone_index, 1.0, fields)
     mr = d.bodyparts[bi].kids[mi]
     if not kept:
         carries = []
@@ -1795,6 +1795,24 @@ def _d2(p, q):
     return sum((a - b) ** 2 for a, b in zip(p, q))
 
 
+def cloth_sigma_edges(obj, pv, springs, ns0, donor):
+    """{group-0 spring: the sigma the mesh edge carrying it holds}, empty where none does.
+
+    `cloth.edge_keys` is the resolution and the import stamps the attribute through the same
+    call, so a spring reaches the edge it was written to. 289 of the corpus's 30 623 group-0
+    springs reach none and are absent here, which leaves them the value the file holds.
+    """
+    me = obj.data
+    att = me.attributes.get("vtmb_cloth_sigma")
+    if att is None or att.domain != "EDGE" or len(att.data) != len(me.edges):
+        return {}
+    buf = [0.0] * len(me.edges)
+    att.data.foreach_get("value", buf)
+    at = {cloth_mod.pair(*tuple(e.vertices)): e.index for e in me.edges}
+    keys, _missed = cloth_mod.edge_keys(pv, springs, ns0, [v.pos for v in donor], set(at))
+    return {q: buf[at[k]] for q, k in keys.items()}
+
+
 def cloth_edits(m, source, d):
     """What each cloth-bound model's scene says that its donor bytes do not.
 
@@ -1814,7 +1832,7 @@ def cloth_edits(m, source, d):
         obj = found.get((bi, mi))
         e = {"key": (bi, mi), "model": mo.name, "object": obj.name if obj else None,
              "why": None, "scale": None, "sigma": None, "slack": None, "moved": 0,
-             "springs": 0, "flattens": False}
+             "springs": 0, "flattens": False, "sigma_edges": 0}
         out.append(e)
         if obj is None:
             e["why"] = "no mesh object in the scene belongs to this model"
@@ -1868,6 +1886,13 @@ def cloth_edits(m, source, d):
             # 39 of the corpus's 150 objects carry a sigma that varies spring by spring and
             # the panel holds one number, so writing it replaces the variation.
             e["flattens"] = not r.uniform
+        # The mesh's own per-edge sigma, which is what stops a re-export flattening the 28
+        # of 59 shipped row-0 objects that vary it. A whole-object number set in the panel
+        # wins over it and is what `flattens` reports.
+        if want_sigma is None:
+            e["sigma_edges"] = sum(
+                1 for q, v in cloth_sigma_edges(obj, pv, springs, ns0, donor).items()
+                if abs(v - (springs[q][2] - springs[q][3]) / 2.0) > CLOTH_TOL)
         e["moved"] = sum(1 for v, w in zip(pv, was)
                          if v < len(me.vertices)
                          and _d2(tuple(me.vertices[v].co), w) > CLOTH_MIN_D2)
@@ -1893,11 +1918,12 @@ def apply_cloth(d, m, source, edits=None):
         edits = cloth_edits(m, source, d)
     found = mesh_objects(m, source)
     out = {"models": 0, "springs": 0, "scale": 0, "sigma": 0, "slack": 0, "refitted": 0,
-           "flattened": []}
+           "sigma_edges": 0, "flattened": []}
     for e in edits:
         if e["why"] is not None:
             continue
-        if not (e["scale"] or e["sigma"] or e["slack"] or e["moved"]):
+        if not (e["scale"] or e["sigma"] or e["slack"] or e["moved"]
+                or e["sigma_edges"]):
             continue
         bi, mi = e["key"]
         cl = d.bodyparts[bi].kids[mi].extra["cloth"]
@@ -1914,11 +1940,19 @@ def apply_cloth(d, m, source, edits=None):
             out["scale"] += 1
         sigma = e["sigma"][1] if e["sigma"] else None
         slack = e["slack"][1] if e["slack"] else None
+        per_edge = {} if sigma is not None             else cloth_sigma_edges(found[(bi, mi)], pv, springs, ns0, donor)
         for q, (a, b, w0, w1, rest2) in enumerate(springs):
-            if sigma is not None and (w0 - w1) != 0.0:
+            # The panel's one number first, then the edge the spring sits on, then the
+            # file's own. Rewriting a spring whose sigma did not move would re-round w0
+            # through k0, so an untouched re-export is left alone rather than recomputed.
+            s = sigma
+            if s is None and q in per_edge                     and abs(per_edge[q] - (w0 - w1) / 2.0) > CLOTH_TOL:
+                s = per_edge[q]
+                out["sigma_edges"] += 1
+            if s is not None and (w0 - w1) != 0.0:
                 # k0 is w0 / (2*sigma), and 2*sigma is w0 - w1 whatever the mass split.
                 k0 = w0 / (w0 - w1)
-                w0, w1 = 2.0 * sigma * k0, -2.0 * sigma * (1.0 - k0)
+                w0, w1 = 2.0 * s * k0, -2.0 * s * (1.0 - k0)
             if a < len(now) and b < len(now):
                 d2_was, d2_now = _d2(was[a], was[b]), _d2(now[a], now[b])
                 if q >= ns0 and slack is not None:
