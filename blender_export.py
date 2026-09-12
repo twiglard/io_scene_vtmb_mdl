@@ -1018,9 +1018,16 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
 
     Refuses a renumbering the file cannot absorb rather than dropping what it would break:
     `split_mesh` reports `kept` 0 when the original partition could not be recovered, and
-    names which of its eight conditions forced that. A flex payload or a cloth binding
-    keyed to the old numbering would be carried onto the wrong vertices; with neither of
-    those present renumbering costs nothing.
+    names which of its ten conditions forced that. A flex payload or a cloth binding keyed
+    to the old numbering would be carried onto the wrong vertices; with neither of those
+    present renumbering costs nothing.
+
+    A delete is not that case. The survivors keep the file's own order, so `split_mesh`
+    reports the donor vertex each written one came from and the flex payloads are
+    renumbered through it -- a record naming the deleted vertex is dropped and the rest
+    keep the vertex they named. A cloth binding still refuses: `mstudiocloth_t.vertindex`
+    names a model vertex that has to exist, so a particle whose anchor has gone has no
+    entry to emit.
 
     `fields` is what the checkboxes asked for. Without it a face added or a winding
     reversed changes Blender's corner normal on every vertex it touches, and the split
@@ -1028,8 +1035,9 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     """
     # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
     from . import blender_scratch as scratch_mod
+    carry = []
     runs, unskinned, kept, why, edits, _origins = scratch_mod.split_mesh(
-        obj, bone_index, 1.0, fields)
+        obj, bone_index, 1.0, fields, carry)
     mr = d.bodyparts[bi].kids[mi]
     if not kept:
         carries = []
@@ -1041,8 +1049,23 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
             raise ValueError(
                 "%s: the file's own vertex numbering could not be recovered -- %s -- and "
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
-    faces, edits["tangents"] = build_mod.replace_model(
-        d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris)
+    cl = mr.extra.get("cloth") if edits["deleted"] else None
+    bound = [] if not cl else [
+        k for k, cmap in enumerate(carry)
+        if k in cl["meshes"] and cmap is not None
+        and len(cmap) - sum(1 for o in cmap if o is None)
+        < struct.unpack_from("<i", mr.kids[k].raw, 0x08)[0]]
+    if bound:
+        raise ValueError(
+            "%s: mesh %s lost a vertex and binds this model's cloth. "
+            "mstudiocloth_t.vertindex names a model vertex that has to exist, so a "
+            "particle whose anchor has gone has no entry to emit, and dropping the "
+            "particle renumbers the spring array"
+            % (obj.name, ", ".join(str(k) for k in bound)))
+    faces, edits["tangents"], flex = build_mod.replace_model(
+        d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris,
+        carry=carry if kept else None)
+    edits["flex_dropped"], edits["flex_emptied"] = flex
     return faces, unskinned, kept, edits
 
 
@@ -2849,7 +2872,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0,
              "spring_ends": 0, "stale": 0,
-             "accessories": 0,
+             "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
              "slots_moved": 0, "slots_gone": [],
@@ -2890,6 +2913,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         scene["added_materials"].append(name)
     scene["springs"], scene["spring_ends"] = apply_springbones(d, m, arm_obj)
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
+    # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
+    scene["hitboxsets"] = len(d.hitboxsets)
     scene["face"] = apply_face(d, m, arm_obj, scale)
     scene["flex"] = apply_flex(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
@@ -2920,7 +2945,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
-            "rebuilt_uvs": 0, "rebuilt_added": 0, "uv_spare": [], "tangents": 0,
+            "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
+            "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source)}
     revised = {}
@@ -2964,6 +2990,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             mesh["blind_normals"] += edits["blind"]
             mesh["rebuilt_uvs"] += edits["uvs"]
             mesh["rebuilt_added"] += edits["added"]
+            mesh["rebuilt_deleted"] += edits["deleted"]
+            mesh["flex_dropped"] += edits.get("flex_dropped", 0)
+            mesh["flex_emptied"] += edits.get("flex_emptied", 0)
             mesh["tangents"] += edits["tangents"]
 
     if write_flexes:
@@ -3000,13 +3029,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # After the geometry pass, which writes whole .vtx files: the cut is two dwords over
     # the finished bytes and would otherwise be laid back over.
     # `revise` rewrites LOD 0 and leaves the lower ones the donor's own triangles, which
-    # index by original vertex id -- valid while the numbering holds and meaningless once
-    # a rebuild renumbers. On `tray.mdl` deleting one vertex takes the model from 142
-    # vertices to 95 and leaves LOD 1 naming ids up to 141. The decimation is authored and
-    # cannot be rebuilt from LOD 0, so the LODs go. The cut is the whole file's and not the
-    # one model's: `numLODs` agrees between the file header and every model header on all
-    # 8887 shipped files, and the Unofficial Patch's own cut models set both.
-    forced = bool(mesh["renumbered"]) and not cut_lods
+    # index by original vertex id -- valid while the numbering holds and meaningless once a
+    # rebuild renumbers or a delete shifts every survivor after the hole. A lower LOD's ids
+    # name the vertices a delete took, so they cannot be remapped either. The decimation is
+    # authored and cannot be rebuilt from LOD 0, so the LODs go. The cut is the whole
+    # file's and not the one model's: `numLODs` agrees between the file header and every
+    # model header on all 8887 shipped files, and the Unofficial Patch's own cut models set
+    # both.
+    forced = bool(mesh["renumbered"] or mesh["rebuilt_deleted"]) and not cut_lods
     lods = (cut_vtx_lods(source, dest, [x["flavour"] for x in touched],
                          None if cut_lods else [x["flavour"] for x in touched])
             if (cut_lods or forced) else [])

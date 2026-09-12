@@ -1119,6 +1119,41 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "vertex survives"
                         % (mesh["renumbered"],
                            "" if mesh["renumbered"] == 1 else "es"))
+        if mesh["rebuilt_deleted"]:
+            self.report({"INFO"},
+                        "%d of the file's vertices are claimed by no vertex of the scene "
+                        "and were dropped. Every survivor keeps the file's own order and "
+                        "the flex payloads follow the new numbering"
+                        % mesh["rebuilt_deleted"])
+        if mesh["flex_dropped"] or mesh["flex_emptied"]:
+            self.report({"WARNING"},
+                        "%d morph-target delta%s named a deleted vertex and went with "
+                        "it%s" % (mesh["flex_dropped"],
+                                  "" if mesh["flex_dropped"] == 1 else "s",
+                                  "" if not mesh["flex_emptied"] else
+                                  ", leaving %d flex%s holding none"
+                                  % (mesh["flex_emptied"],
+                                     "" if mesh["flex_emptied"] == 1 else "es")))
+        if mesh["flexes"] or mesh["flex_records"]:
+            self.report({"INFO"},
+                        "%d morph target%s rebuilt from shape keys, %d vertex delta%s"
+                        % (mesh["flexes"], "" if mesh["flexes"] == 1 else "s",
+                           mesh["flex_records"],
+                           "" if mesh["flex_records"] == 1 else "s"))
+        if mesh["flex_skipped"]:
+            self.report({"WARNING"},
+                        "%d shape-key delta%s sat on a vertex the file has not got, so "
+                        "there is no mesh-local index to write %s at"
+                        % (mesh["flex_skipped"],
+                           "" if mesh["flex_skipped"] == 1 else "s",
+                           "it" if mesh["flex_skipped"] == 1 else "them"))
+        for name, why in mesh["flex_refused"]:
+            self.report({"WARNING"},
+                        "%s: no shape key could be written -- %s" % (name, why))
+        vtx = r.get("vtx")
+        if vtx is not None:
+            self.report({"INFO"}, "%s rewritten, %d bytes over %d strip groups"
+                        % (os.path.basename(vtx["path"]), vtx["bytes"], vtx["groups"]))
         for x in r.get("vtx_more") or ():
             self.report({"INFO"}, "%s rewritten too, %d bytes over %d strip groups"
                         % (os.path.basename(x["path"]), x["bytes"], x["groups"]))
@@ -1243,10 +1278,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             if e["moved"]:
                 moved.append("%d of the cloth's particles moved" % e["moved"])
             if e["why"] is not None:
-                if moved:
-                    self.report({"WARNING"},
-                                "%s: %s, so %s stayed as the file had it"
-                                % (e["object"] or e["model"], e["why"], " and ".join(moved)))
+                self.report({"WARNING"},
+                            "%s: %s, so %s"
+                            % (e["object"] or e["model"], e["why"],
+                               ("%s stayed as the file had it" % " and ".join(moved))
+                               if moved else "the file keeps the cloth object it was "
+                               "compiled with, which describes the geometry as it was "
+                               "then"))
                 continue
             if not moved:
                 continue
@@ -1278,6 +1316,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             old, now = r["cdtexture"]
             self.report({"INFO"}, "the material directories are now %s, where the file "
                                   "had %s" % (", ".join(now), ", ".join(old) or "none"))
+        if r["scene"]["accessories"]:
+            self.report({"INFO"},
+                        "%d attachment or hitbox record%s written from the scene's "
+                        "empties%s"
+                        % (r["scene"]["accessories"],
+                           "" if r["scene"]["accessories"] == 1 else "s",
+                           "" if r["scene"]["hitboxsets"]
+                           else "; every box empty is gone, so the file now holds "
+                                "numhitboxsets 0"))
+        if r.get("includes"):
+            self.report({"INFO"},
+                        "this model chains its animations to %s"
+                        % ", ".join(r["includes"]))
         renamed = r.get("renamed") or []
         if renamed:
             self.report({"INFO"},
@@ -1288,20 +1339,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             # stops matching is left at its -1 sentinel and simply stops being driven.
             if r.get("includes"):
                 self.report({"WARNING"},
-                            "this model chains to %s, and an animation chain is joined by "
-                            "bone name, so a renamed bone stops matching unless the same "
-                            "rename is made there" % ", ".join(r["includes"][:3]))
-        surplus = r["scene"]["surplus"]
-        if surplus:
-            self.report({"WARNING"}, "%d bone%s of this armature %s not in %s and %s not "
-                                     "written: %s%s. The file's own bone list is what an "
-                                     "export walks, so a bone added in Blender is left out"
-                        % (len(surplus), "" if len(surplus) == 1 else "s",
-                           "is" if len(surplus) == 1 else "are",
-                           os.path.basename(src),
-                           "was" if len(surplus) == 1 else "were",
-                           ", ".join(surplus[:4]),
-                           "" if len(surplus) <= 4 else " and %d more" % (len(surplus) - 4)))
+                            "an animation chain is joined by bone name, so a bone renamed "
+                            "here stops matching in %s unless the same rename is made "
+                            "there" % ", ".join(r["includes"][:3]))
         moved_up = r["scene"].get("reparented") or []
         if moved_up:
             self.report({"INFO"}, "%s reparented onto %s"

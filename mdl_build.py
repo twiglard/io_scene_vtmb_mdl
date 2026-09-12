@@ -287,7 +287,7 @@ def _drop_stale_cloth(d):
                 break
 
 
-def _regrow_cloth(mr, k, new_n):
+def _regrow_cloth(mr, k, new_n, deleted=0):
     """Mesh `k`'s three per-vertex cloth arrays, rebuilt for a new vertex count.
 
     Row-major -- row r's slice starts at `numvertices * r`, recon 29.3 -- so a count change
@@ -303,6 +303,14 @@ def _regrow_cloth(mr, k, new_n):
     cl = mr.extra.get("cloth")
     if not cl or k not in cl["meshes"]:
         return False
+    if deleted:
+        raise Refused(
+            "mesh %d carries a cloth binding and %d of its vertices were deleted. "
+            "mstudiocloth_t.vertindex is one ushort per particle naming a model vertex "
+            "that has to exist -- ProcessMesh1_Cloth_000H StudioRender 0x2c023590 reads "
+            "pv[p] every frame and skins it -- so a particle whose anchor has gone has no "
+            "entry to emit, and dropping the particle renumbers the spring array"
+            % (k, deleted))
     spans, old_n = cl["meshes"][k]
     if old_n == new_n:
         return False
@@ -1739,19 +1747,27 @@ def _tangents(verts, tris):
 _GEOM_SPAN = {0: (12, 44), 1: (0, 12), 2: (0, 8)}
 
 
-def moved_vertices(filetype, donor, new, n):
+def moved_vertices(filetype, donor, new, n, carry=None):
     """Which of `n` written vertices differ from the donor in position, normal or UV.
 
     The written bytes and not the scene values, so a move the model's own quantisation
     cannot express does not count, and neither does a field the export was not asked for.
     A vertex the donor block is too short to hold counts as moved.
+
+    `carry` names the donor index each written vertex came from, None for one the edit
+    added. Without it written index i is compared against donor index i, which is the
+    contract an append satisfies and a delete does not.
     """
     lo, hi = _GEOM_SPAN[filetype]
     stride = M.VERTEX_STRIDE[filetype]
     out = set()
     for i in range(n):
-        o = i * stride
-        if o + hi > len(donor) or new[o + lo:o + hi] != donor[o + lo:o + hi]:
+        j = i if carry is None else (carry[i] if i < len(carry) else None)
+        if j is None:
+            out.add(i)
+            continue
+        o, p = i * stride, j * stride
+        if p + hi > len(donor) or new[o + lo:o + hi] != donor[p + lo:p + hi]:
             out.add(i)
     return out
 
@@ -1766,7 +1782,7 @@ def _ring(moved, tris, n):
 
 
 def retangent_block(filetype, donor_vb, new_vb, donor_tb, tris,
-                    quant_offset=None, quant_scale=None, also=()):
+                    quant_offset=None, quant_scale=None, also=(), carry=None):
     """(the model's tangent block, how many records it rewrote).
 
     A tangent is a function of the geometry, so an edit stales it -- and not only on the
@@ -1790,7 +1806,7 @@ def retangent_block(filetype, donor_vb, new_vb, donor_tb, tris,
     tris = list(tris)
     if not n or len(donor_tb) < n * 16 or not tris:
         return donor_tb, 0
-    want = _ring(moved_vertices(filetype, donor_vb, new_vb, n), tris, n) | \
+    want = _ring(moved_vertices(filetype, donor_vb, new_vb, n, carry), tris, n) | \
         {x for x in also if 0 <= x < n}
     if not want:
         return donor_tb, 0
@@ -1816,18 +1832,31 @@ def _canon3(t):
     return t[i:] + t[:i]
 
 
-def _face_moved(old_tris, tris, was, new_n):
+def _face_moved(old_tris, tris, was, new_n, carry=None):
     """Corners of every triangle this mesh gained or lost, in the new numbering.
 
     `old_tris` is model-local, so a triangle is this mesh's when all three corners fall in
     its donor run, and re-bases on it. Multiplicity counts -- 11 shipped models carry a
     repeated triangle.
+
+    `carry` renumbers the donor's corners onto the written vertices, since a delete shifts
+    every survivor after the hole. A triangle one corner of which was deleted has no
+    counterpart at all, so it counts as lost and its surviving corners are stale.
     """
     old_n, old_off = was
+    new_of = None if carry is None else {o: j for j, o in enumerate(carry)
+                                         if o is not None}
     a, b = {}, {}
     for t in old_tris:
         if all(old_off <= x < old_off + old_n for x in t):
-            k = _canon3(tuple(x - old_off for x in t))
+            local = [x - old_off for x in t]
+            if new_of is not None:
+                local = [new_of.get(x) for x in local]
+                if any(x is None for x in local):
+                    a[("lost",) + tuple(sorted(
+                        x for x in local if x is not None))] = 1
+                    continue
+            k = _canon3(tuple(local))
             a[k] = a.get(k, 0) + 1
     for t in tris:
         k = _canon3(t)
@@ -1835,26 +1864,42 @@ def _face_moved(old_tris, tris, was, new_n):
     out = set()
     for k in set(a) | set(b):
         if a.get(k, 0) != b.get(k, 0):
-            out.update(x for x in k if 0 <= x < new_n)
+            out.update(x for x in k
+                       if isinstance(x, int) and 0 <= x < new_n)
     return out
 
 
-def _retangent_run(ptb, pvb, old_vb, old_tb, was, new_n, tris, old_tris=None):
+def _retangent_run(ptb, pvb, old_vb, old_tb, was, new_n, tris, old_tris=None,
+                   carry=None):
     """Rewrite one mesh run's tangents: the donor's, patched where the edit reached.
 
     `_pack_verts` has already put a fresh accumulation in `ptb`, which is right for a
     from-scratch write and wrong here -- it disagrees with the shipped vector on most
     models, and where the UV basis is degenerate it is an arbitrary perpendicular. So the
     donor's run goes back underneath and `retangent_block` patches over it.
+
+    `carry` names the donor vertex each written one came from, so a delete puts each
+    survivor's own vector back under its new index rather than the vector of whatever
+    donor vertex now shares that number.
     """
     old_n, old_off = was
-    keep = max(0, min(old_n, new_n, len(old_tb) // 16 - old_off))
+    avail = max(0, len(old_tb) // 16 - old_off)
     base = bytearray(ptb)
-    base[:keep * 16] = old_tb[old_off * 16:(old_off + keep) * 16]
-    out, n = retangent_block(0, old_vb[old_off * 44:(old_off + keep) * 44],
+    if carry is None:
+        keep = max(0, min(old_n, new_n, avail))
+        base[:keep * 16] = old_tb[old_off * 16:(old_off + keep) * 16]
+    else:
+        for j in range(min(new_n, len(carry))):
+            o = carry[j]
+            if o is None or not 0 <= o < min(old_n, avail):
+                continue
+            src = (old_off + o) * 16
+            base[j * 16:j * 16 + 16] = old_tb[src:src + 16]
+    out, n = retangent_block(0, old_vb[old_off * 44:(old_off + old_n) * 44],
                              bytes(pvb), bytes(base), tris,
                              also=() if old_tris is None
-                             else _face_moved(old_tris, tris, was, new_n))
+                             else _face_moved(old_tris, tris, was, new_n, carry),
+                             carry=carry)
     ptb[:] = out
     return n
 
@@ -1940,19 +1985,25 @@ def _skin_key(rec, at):
     return sorted(zip(struct.unpack_from("<4h", rec, at + 4)[:n], w[:n]))
 
 
-def _carry_vertex_fields(pvb, old_vb, was, new_n):
+def _carry_vertex_fields(pvb, old_vb, was, new_n, carry=None):
     """Give each vertex an edit did not add its donor `bonecountcode` and tangent back.
 
     Only `code % 5` is read, and the high bits are never zero for a given count and mean
     something unread, so `mesh_write.count_code` keeps them and `_pack_verts` cannot --
     it has no donor to keep them from. The tangent is `_retangent_run`'s, which needs the
     fresh accumulation this leaves alone.
+
+    `carry` names the donor vertex each written one came from; without it written index j
+    is donor index j, which a delete breaks.
     """
     old_n, old_off = was
-    for j in range(min(old_n, new_n)):
-        src, at = (old_off + j) * 44, j * 44
+    for j in range(new_n):
+        o = j if carry is None else (carry[j] if j < len(carry) else None)
+        if o is None or not 0 <= o < old_n:
+            continue
+        src, at = (old_off + o) * 44, j * 44
         if src + 44 > len(old_vb):
-            break
+            continue
         donor, ours = _skin_key(old_vb, src), _skin_key(pvb, at)
         # A rigid vertex is `numbones == 0`, which the skinning block draws as bone 0 at
         # full weight, and all 5716 shipped ones name bone 0 with weight bytes (255, 0, 0).
@@ -1963,6 +2014,39 @@ def _carry_vertex_fields(pvb, old_vb, was, new_n):
             pvb[at:at + 12] = old_vb[src:src + 12]
         else:
             pvb[at + 3] = (old_vb[src + 3] - old_vb[src + 3] % 5) + pvb[at + 3] % 5
+
+
+def _remap_flexes(mesh, carry, new_n):
+    """One mesh's flex payloads renumbered onto the written vertices. (dropped, emptied).
+
+    `mstudioflex_t`'s vertanim index is mesh-local and signed, and the reader adds it to
+    the mesh's own first vertex with nothing bounding it -- so a record naming a vertex the
+    edit deleted has no legal value and is dropped. 0 of the corpus's 3 325 923 records
+    names an index outside its mesh, so an untouched re-export drops none and moves no
+    flex byte.
+
+    A flex left holding no record is reported: `numverts` 0 is a no-op, the reader looping
+    on it, and 0 of 18 060 shipped flexes is 0, so the form is legal and unshipped.
+    """
+    dropped = emptied = 0
+    new_of = {o: j for j, o in enumerate(carry) if o is not None}
+    for fx in mesh.kids:
+        w = 8 if struct.unpack_from("<i", fx.raw, 0x1c)[0] & 0xFFFF else 20
+        pay = fx.extra.get("payload") or b""
+        out = bytearray()
+        for at in range(0, len(pay) - w + 1, w):
+            j = new_of.get(struct.unpack_from("<h", pay, at)[0])
+            if j is None or not 0 <= j < new_n:
+                dropped += 1
+                continue
+            rec = bytearray(pay[at:at + w])
+            struct.pack_into("<h", rec, 0, j)
+            out += rec
+        fx.extra["payload"] = bytes(out)
+        struct.pack_into("<i", fx.raw, 0x14, len(out) // w)
+        if not out:
+            emptied += 1
+    return dropped, emptied
 
 
 def set_model_name(d, bi, mi, name):
@@ -1980,7 +2064,7 @@ def set_model_name(d, bi, mi, name):
     r.raw[0:128] = b + b"\x00" * (128 - len(b))
 
 
-def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None):
+def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=None):
     """Rewrite one existing model's geometry, keeping everything else its records carry.
 
     `meshes` is `add_model`'s -- [(material, verts, faces), ...] -- one entry per mesh the
@@ -1988,10 +2072,18 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None):
     addresses and what the .vtx indexes, so a caller that cannot preserve it has renumbered
     every vertex and must say so rather than call this.
 
-    Flexes, eyeballs, materialtype, meshid and the mesh centre stay with the record they
-    were read from. `mstudiomesh_t.center` is not the centroid over the corpus, and
-    `boundingradius` is 0.0 on every shipped record, so neither is refitted.
-    Returns the per-mesh face lists and how many tangents were rewritten.
+    Eyeballs, materialtype, meshid and the mesh centre stay with the record they were read
+    from. `mstudiomesh_t.center` is not the centroid over the corpus, and `boundingradius`
+    is 0.0 on every shipped record, so neither is refitted.
+
+    `carry` is one list per mesh naming the donor vertex each written one came from, None
+    for one the edit added, and None altogether for the positional contract -- written
+    local index j is donor local index j, which an append satisfies and a delete does not.
+    With it the donor's per-vertex fields, its tangents and its flex payloads all resolve
+    through the map, so a delete keeps the file's own numbering for every survivor.
+
+    Returns the per-mesh face lists, how many tangents were rewritten, and
+    (flex records dropped, flexes left holding none).
     """
     mr = d.bodyparts[bi].kids[mi]
     if len(meshes) != len(mr.kids):
@@ -2006,12 +2098,15 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None):
     old_vb = mr.extra.get("verts") or b""
     old_tb = mr.extra.get("tangents") or b""
     vb, tb, offset, faces, retang = bytearray(), bytearray(), 0, [], 0
+    flexdrop = flexempty = 0
     for k, (material, verts, tris) in enumerate(meshes):
+        cmap = None if carry is None else carry[k]
+        gone = 0 if cmap is None else was[k][0] - sum(1 for o in cmap if o is not None)
         pvb, ptb = _pack_verts(verts, tris)
         if old_ft == 0:
-            _carry_vertex_fields(pvb, old_vb, was[k], len(verts))
+            _carry_vertex_fields(pvb, old_vb, was[k], len(verts), cmap)
             retang += _retangent_run(ptb, pvb, old_vb, old_tb, was[k], len(verts),
-                                     tris, donor_tris)
+                                     tris, donor_tris, cmap)
         vb += pvb
         tb += ptb
         raw = mr.kids[k].raw
@@ -2025,7 +2120,11 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None):
             struct.pack_into("<3f", raw, 0x24,
                              *[sum(v[0][c] for v in verts) / max(1, len(verts))
                                for c in range(3)])
-        _regrow_cloth(mr, k, len(verts))
+        if cmap is not None:
+            a, b = _remap_flexes(mr.kids[k], cmap, len(verts))
+            flexdrop += a
+            flexempty += b
+        _regrow_cloth(mr, k, len(verts), gone)
         offset += len(verts)
         faces.append(list(tris))
     mr.extra["verts"] = bytes(vb)
@@ -2033,7 +2132,7 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None):
     # 44-byte records are filetype 0 whatever the donor was: 1 and 2 carry no weight or
     # bone field at all, so a quantised donor gains skinning here rather than losing it.
     struct.pack_into("<i", mr.raw, 0x9c, 0)
-    return faces, retang
+    return faces, retang, (flexdrop, flexempty)
 
 
 def _unit(v):

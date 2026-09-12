@@ -24,6 +24,12 @@ HDR = 0x5c
 NAIVE_FACE_EDGES = False
 
 
+class Refused(Exception):
+    """Declared here rather than imported, so `plans/cloth-gen.py` can import this module
+    flat. `SystemExit` is a BaseException and neither operator's `except Exception` caught
+    it."""
+
+
 def pair(a, c):
     return (a, c) if a < c else (c, a)
 
@@ -490,7 +496,8 @@ def region(blob, nvert, npart, flip):
     already wrote them, so nothing here touches the object's bytes.
     """
     if nvert > npart:
-        raise SystemExit("%d vertices against %d particles" % (nvert, npart))
+        raise Refused("a cloth region wants at least one particle per vertex, and this "
+                      "one has %d vertices against %d particles" % (nvert, npart))
     table = struct.pack("<i", 4)                     # one slot, the object right after it
     # Bit 15 negates that vertex's normal, and 63 of the 84 shipped meshes set it on some
     # vertices and not others, so a shipped object needs one flag per vertex. A bool is
@@ -500,8 +507,8 @@ def region(blob, nvert, npart, flip):
     else:
         bits = [0x8000 if f else 0 for f in flip]
         if len(bits) != nvert:
-            raise SystemExit("%d flip flags against %d vertices"
-                             % (len(bits), nvert))
+            raise Refused("%d flip flags against %d vertices; +0x34 is one entry per "
+                          "vertex" % (len(bits), nvert))
     # All three arrays start 4-aligned on 84 of 84 shipped meshes, so an odd vertex count
     # needs the ushort ones padded too, not only the documented byte one.
     def pad(x):
@@ -515,6 +522,8 @@ def region(blob, nvert, npart, flip):
     for name, off in (("object", 4), ("owner", at_own), ("particle", at_p34),
                       ("normal", at_p38)):
         if off % 4:
-            raise SystemExit("%s lands at %d, not 4-aligned" % (name, off))
+            raise Refused("the cloth region's %s array lands at %d, which is not "
+                          "4-aligned; all three start 4-aligned on 84 of 84 shipped "
+                          "meshes" % (name, off))
     return {"data": table + blob + own + p34 + p38, "cols": 1, "rows": 1, "table": 0,
             "slots": [(0, 4)], "meshes": {0: ([at_own, at_p34, at_p38], nvert)}}

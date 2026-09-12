@@ -37,7 +37,7 @@ UV_Q = 1e-6
 
 # `blind` is the normals that moved past the round trip's own error and not past
 # NORMAL_EPS: written from the file, so the edit is lost. Same band the in-place path reports.
-NO_EDITS = (("uvs", 0), ("normals", 0), ("blind", 0), ("added", 0))
+NO_EDITS = (("uvs", 0), ("normals", 0), ("blind", 0), ("added", 0), ("deleted", 0))
 # An original that has not been moved sits exactly on its imported position -- float32 both
 # sides -- so this is slack, not licence to have moved.
 HOME_TOL = 1e-3
@@ -161,14 +161,25 @@ def identity_map(obj, me):
     return out
 
 
-def original_runs(obj, me, why=None):
+def original_runs(obj, me, why=None, carry=None):
     """The file's mesh partition as [(material slot, [Blender vertex, ...]), ...].
 
-    None unless every original vertex is still present: one that has gone cannot be put
-    back in its slot, and renumbering around the hole is what the map exists to avoid.
-    A slot naming two runs is also refused, since a vertex the edit added is placed by
-    slot and there would be no saying which of them it belongs to. Each of those appends
-    to `why`, which the caller reports and cannot work out for itself.
+    A vertex the edit deleted is left out of its run, so the survivors stay in file order
+    and their new local index is their position in `members`. `carry` collects
+    `(the mesh's old vertex count, [the old local index of each survivor])` per run, which
+    is what lets a caller resolve the new numbering back onto the old -- a flex payload is
+    keyed by mesh-local index and cannot be carried positionally across a delete.
+
+    Only an original no vertex of the scene claims at all counts as deleted. One a vertex
+    still claims that `identity_map` could not resolve is unrecoverable instead: dropping
+    it would take a flex delta off geometry the scene still has, since the claimants are
+    then written as added vertices.
+
+    None where the partition itself is unrecoverable: that; a slot naming two runs, since a
+    vertex the edit added is placed by slot and there would be no saying which of them it
+    belongs to; or a mesh every vertex of which has gone, `numvertices` 0 being a form 0 of
+    9741 shipped meshes has. Each of those appends to `why`, which the caller reports and
+    cannot work out for itself.
     """
     if why is None:
         why = []
@@ -185,13 +196,25 @@ def original_runs(obj, me, why=None):
     # matched against a polygon's live `material_index` below and Blender renumbers slots
     # on a reorder or a delete.
     moves = export_mod.slot_moves(obj)[0]
+    claimed = set(_point_ints(me, "vtmb_orig") or ())
     runs, at, slots = [], 0, set()
     for slot, n in spec:
-        members = [ident.get(at + k) for k in range(int(n))]
-        if any(x is None for x in members):
-            lost = next(at + k for k in range(int(n)) if members[k] is None)
-            why.append("file vertex %d is claimed by no vertex of the scene, so it was "
-                       "deleted or its tag was lost" % lost)
+        members, kept_at = [], []
+        for k in range(int(n)):
+            vi = ident.get(at + k)
+            if vi is not None:
+                members.append(vi)
+                kept_at.append(k)
+            elif at + k in claimed:
+                why.append("file vertex %d is claimed by a vertex of the scene that "
+                           "cannot be resolved to it -- several claim the tag and none "
+                           "stands where the file put that original, so writing either "
+                           "would name the wrong vertex" % (at + k))
+                return None
+        if int(n) and not members:
+            why.append("every vertex of one of the file's meshes is claimed by no vertex "
+                       "of the scene, and a mesh with numvertices 0 is a form 0 of 9741 "
+                       "shipped meshes has")
             return None
         here = int(slot) if moves is None else moves.get(int(slot))
         if here is None:
@@ -204,6 +227,8 @@ def original_runs(obj, me, why=None):
             return None
         slots.add(here)
         runs.append((here, members))
+        if carry is not None:
+            carry.append((int(n), kept_at))
         at += int(n)
     return runs
 
@@ -220,14 +245,14 @@ def wound(corners):
     return tuple(reversed(corners))
 
 
-def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
+def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals"), carry=None):
     """([(material slot, verts, faces), ...], unskinned, kept, why, edits, origins).
 
     The format stores one normal, one UV and one skin per vertex, so a seam or a hard edge
     is spelled by duplicating the vertex. `kept` counts the originals written back into
     their own mesh in file order; it is 0 when the partition had to be rebuilt from the
     material slots instead, which puts every vertex in triangle-visit order. `why` names
-    the one condition that forced that, and is None where it did not happen -- eight
+    the one condition that forced that, and is None where it did not happen -- ten
     separate ones reach it and the caller refuses on the wrong one otherwise. `edits` is
     what the scene moved on the originals, in the keys of NO_EDITS, and is all zero on the
     rebuilt partition, which has no original to compare against.
@@ -241,6 +266,12 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
     holds per Blender vertex needs it to reach a written vertex: two vertices a seam
     duplicated share a position, so a position cannot tell them apart, and 18 998 of the
     25 564 named cloth particles are named by vertices that disagree about the flip bit.
+
+    `carry` is an out-parameter and collects one list per run, the old local index of each
+    output vertex and None for one the edit added. `mdl_build.replace_model` resolves the
+    donor's per-vertex fields through it instead of by position, which is what lets a
+    delete keep the file's own numbering for every vertex that survived. It is None per run
+    on the rebuilt partition, where no output vertex has an original.
     """
     me = obj.data
     if not me.polygons:
@@ -273,11 +304,17 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
     elif uvs is None:
         why.append("nothing stashed the file's own UVs on this mesh")
     else:
-        runs = original_runs(obj, me, why)
+        spans = []
+        runs = original_runs(obj, me, why, spans)
         if runs is not None:
             out = _split_preserved(me, runs, stash, uvs, normals, uv_layer,
                                    rec, key_of, why, fields)
             if out is not None:
+                out[2]["deleted"] = sum(n - len(k) for n, k in spans)
+                if carry is not None:
+                    carry.extend(
+                        kept_at + [None] * (len(out[0][ri][1]) - len(kept_at))
+                        for ri, (_n, kept_at) in enumerate(spans))
                 return out[0], unskinned, out[1], None, out[2], out[3]
 
     per_slot = {}
@@ -297,6 +334,8 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals")):
                 orig.append(vi)
             corners.append(at)
         faces.append(wound(corners))
+    if carry is not None:
+        carry.extend([None] * len(per_slot))
     return ([(k, per_slot[k][0], per_slot[k][1]) for k in sorted(per_slot)],
             unskinned, 0, why[0] if why else "the file's partition was not recoverable",
             dict(NO_EDITS), [per_slot[k][3] for k in sorted(per_slot)])
