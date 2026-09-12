@@ -965,26 +965,34 @@ def _stamp_cloth(obj, model, verts):
                        % (obj.name, miss, c.ns0))
     # The mesh binding is what says which vertices are particles at all; c.pv is the
     # inverse and names one vertex per particle where a seam has several.
-    pinned, flips, flipped = set(), set(), {}
+    flips, flipped = set(), {}
     for e in model.meshes:
         if not e.clothbind:
             continue
-        for v, (col, part, flip) in e.clothbind[0].items():
+        for v, (col, _part, flip) in e.clothbind[0].items():
             if col != c.col:
                 continue
             flips.add(flip)
             flipped[e.vertexoffset + v] = flip
-            if part < c.numfixed:
-                pinned.add(e.vertexoffset + v)
+    # The pin set is c.pv[0:numfixed] and not the binding's own pinned entries. A pinned
+    # particle anchors on a model vertex the cloth need not bind: 1496 of the corpus's 2892
+    # row-0 pinned particles name a vertex this object draws rigidly or a sibling mesh
+    # draws, which the binding never lists, and a group built from the binding loses every
+    # one of them. Model vertex index is Blender vertex index, so the reference carries all
+    # 2892 over 61 objects -- 0 name a vertex outside the model's own list and 0 two pinned
+    # particles share one.
+    nvert = len(obj.data.vertices)
+    pinned = set(v for v in c.pv[:c.numfixed] if v < nvert)
+    over = sum(1 for v in c.pv[:c.numfixed] if v >= nvert)
     obj["vtmb_cloth_pin_group"] = PIN_GROUP
     vg = obj.vertex_groups.new(name=PIN_GROUP)
     if pinned:
         vg.add(sorted(pinned), 1.0, "REPLACE")
-    named = len(set(c.pv[p] for p in range(c.numfixed)) & pinned)
-    if named < c.numfixed:
-        out.append("%s: %d of %d pinned particles are named by no vertex and a vertex "
-                   "group cannot hold them, so a re-export pins %d"
-                   % (obj.name, c.numfixed - named, c.numfixed, named))
+    if over or len(c.pv) < c.numfixed:
+        short = max(0, c.numfixed - len(c.pv))
+        out.append("%s: %d of %d pinned particles name a vertex the model has not got and "
+                   "a vertex group cannot hold them, so a re-export pins %d"
+                   % (obj.name, over + short, c.numfixed, len(pinned)))
     # Bit 15 of +0x34 negates that vertex's normal. The attribute is what the exporter
     # reads; the object key stays for an authored sheet, which has no attribute at all.
     if flips == {True}:
