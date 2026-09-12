@@ -706,13 +706,13 @@ class Mdl:
         d, s = self.d, Seq()
         s.index = i
         s.label = self._cstr(off + struct.unpack_from("<i", d, off)[0])
-        # `> 0` the way the four string fields below are read: a zero word is what a
-        # writer leaves for "no activity", and adding it to `off` would read the record's
-        # own sznameindex as a string. No shipped sequence carries one -- 0 of 14012 --
-        # 2433 of them instead pointing at an empty string, which is the file's own idiom
-        # and what a writer reproduces.
+        # `!= 0`, not `> 0`: Studio_GetSequenceActivityName_vtmb (client 10079f80) adds this
+        # to the record address with no test at all, so a negative offset resolves the way a
+        # positive one does and the string may precede its own record. The absent marker is
+        # an offset to the empty string -- 2433 of 14012 shipped sequences -- and 0 is the
+        # one value that cannot name a string, reading the record's own szlabelindex.
         v = struct.unpack_from("<i", d, off + SEQ_ACTIVITY)[0]
-        s.activity = self._cstr(off + v) if v > 0 else ""
+        s.activity = self._cstr(off + v) if v != 0 else ""
         # STUDIO_LOOPING is bit 0 of THIS field, not of mstudioanimdesc_t.flags at the
         # same offset of that struct: a file carrying the animdesc bit and not this one
         # plays once and stops -- measured in game 2026-08-22 on ztest/zskel_loop.mdl.
