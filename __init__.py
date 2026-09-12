@@ -1240,6 +1240,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                                   else ".".join(str(x) for x in v))
                                      for n, _ft, v in stale[:3])
                            + ("" if len(stale) <= 3 else " and %d more" % (len(stale) - 3))))
+        stamps = r["mesh"].get("stale_stamps") or []
+        if stamps:
+            for name, miss in stamps[:3]:
+                self.report({"WARNING"},
+                            "%s came from an import that stamped no %s, so this export "
+                            "cannot see %s. Re-import to edit that"
+                            % (name, " and no ".join(k for k, _w in miss),
+                               "; nor ".join(w for _k, w in miss)))
+            if len(stamps) > 3:
+                self.report({"WARNING"},
+                            "%d more object%s came from an import older than one of those "
+                            "stamps" % (len(stamps) - 3, "" if len(stamps) == 4 else "s"))
         gaps = r["scene"].get("blind_bones") or []
         if gaps:
             self.report({"WARNING"},

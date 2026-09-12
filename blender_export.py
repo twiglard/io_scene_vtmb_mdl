@@ -1204,6 +1204,44 @@ def stale_stash(m, source):
     return out
 
 
+# Four stamps landed after 0.2.49 was tagged and `bl_info` has not moved since, so
+# `vtmb_addon_version` cannot tell a `.blend` written before one from a scene imported today:
+# both stamp 0.2.49. What a stamp's ABSENCE does say is that the import predates it, which is
+# the test here, and it needs no version. The cloth pin group is the one of the four absence
+# cannot reach -- `vtmb_pinned` existed before its meaning changed on 2026-09-12 -- and
+# separating those two needs the version bump.
+STALE_STAMPS = (
+    ("vtmb_slot_mats", "object",
+     "which material sat in each slot, so a slot reordered or deleted since the import is "
+     "resolved by index and a rename can reach the wrong texture record"),
+    ("vtmb_uv_layer", "object",
+     "which UV layer is the file's, so a renamed first layer cannot be told from a deleted "
+     "one and neither is reported"),
+    ("vtmb_model_label", "mesh",
+     "which object owns the model, so two objects claiming one are refused rather than "
+     "resolved to the one still named after it"),
+)
+
+
+def stale_stamps(m, source):
+    """[(object, [(stamp, what it costs)])] for scene objects an import older than a stamp made.
+
+    Reported and never refused: every one of the three falls back to the behaviour that stood
+    before its stamp, so the export is correct for a scene that made no such edit and wrong
+    only for one that did, which is a thing to say rather than a thing to stop.
+    """
+    out, seen = [], set()
+    for obj in mesh_objects(m, source).values():
+        if obj.name in seen:
+            continue
+        seen.add(obj.name)
+        miss = [(k, why) for k, dom, why in STALE_STAMPS
+                if (obj if dom == "object" else obj.data).get(k) is None]
+        if miss:
+            out.append((obj.name, miss))
+    return out
+
+
 def read_meshes(m, source, fields):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
@@ -2948,7 +2986,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
             "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
-            "stray_groups": [], "stale_stash": stale_stash(m, source)}
+            "stray_groups": [], "stale_stash": stale_stash(m, source),
+            "stale_stamps": stale_stamps(m, source)}
     revised = {}
     if mesh_fields:
         cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
