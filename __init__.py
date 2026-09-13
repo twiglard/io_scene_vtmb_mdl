@@ -1455,6 +1455,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "leaf -- so this takes a path no shipped file takes"
                         % (scene["spring_ends"],
                            "" if scene["spring_ends"] == 1 else "s"))
+        if scene.get("spring_switched"):
+            self.report({"WARNING"},
+                        "%d spring bone chain%s switched on or off. A chain that starts "
+                        "switched off carries its start bone negated, and the game looks a "
+                        "chain up by the raw field, so nothing in it can switch that chain "
+                        "back on. 0 of the 600 shipped records are written that way"
+                        % (scene["spring_switched"],
+                           "" if scene["spring_switched"] == 1 else "s"))
         sb = scene.get("blends_out_of_range") or []
         if sb:
             self.report({"WARNING"},

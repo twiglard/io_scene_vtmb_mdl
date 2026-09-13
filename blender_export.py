@@ -1579,6 +1579,38 @@ def new_materials(m, source):
     return out
 
 
+# CBaseAnimating::SetModel (vampire.dll 0x10095166) ORs `1 << ordinal` into
+# m_nPhysicsChainDisableMask at entity+0x72c for every record whose bone is negative, and the
+# shift is a `shl %cl`, which masks its count to 5 bits in hardware -- there is no explicit AND
+# on either side of it. So ordinal 32 writes chain 0's bit. Nothing in any of the four modules
+# bounds numspringbones; the largest shipped count is 25 (manbat), so no shipped file can reach
+# this and a writer emitting the negative form inherits the limit.
+SPRING_MASK_BITS = 32
+
+
+def spring_start(k, have, off):
+    """The `mstudiospringbone_t.bone` a chain takes when the scene switches it off or on.
+
+    A negative field means three things at once and only the first is an encoding. The start
+    bone is `-1 - bone`, read off SpringBoneChain_Construct (`client.dll 0x100ac115`);
+    `CBaseAnimating::SetModel` switches the chain off through the mask above; and
+    `CBaseAnimating::LookupPhysicsChain` (`vampire.dll 0x10097980`) compares the RAW field at
+    `0x10097a5f` against a `LookupBone` result, which is never negative. That lookup is the one
+    route from a bone name to the ordinal `TurnOnPhysicsChain` takes -- it is what animation
+    events 2070 and 2071 resolve -- so a record written in the negative form can never be found
+    and nothing in the game turns the chain back on. 0 of 600 shipped records use it.
+    """
+    start = have if have >= 0 else -1 - have
+    if not off:
+        return start
+    if k >= SPRING_MASK_BITS:
+        raise build_mod.Refused(
+            "spring bone chain %d cannot start switched off: the engine sets bit "
+            "%d of a 32-bit mask for it, which belongs to chain %d"
+            % (k, k % SPRING_MASK_BITS, k % SPRING_MASK_BITS))
+    return -1 - start
+
+
 def spring_endbone(k, start, end, m):
     """The `mstudiospringbone_t.endbone` a named end bone resolves to, or a refusal.
 
@@ -1614,7 +1646,7 @@ def spring_endbone(k, start, end, m):
 
 
 def apply_springbones(d, m, arm_obj):
-    """(fields retuned, chains given a named end bone), out of the pose bones.
+    """(fields retuned, chains given a named end bone, chains switched off or on).
 
     Matched on the record ordinal the import stamped rather than on the bone, because a
     chain is identified by its ordinal everywhere the engine touches it -- the disable
@@ -1629,11 +1661,19 @@ def apply_springbones(d, m, arm_obj):
         k = pb.get("vtmb_spring_index")
         if k is not None:
             stamped.setdefault(int(k), pb)
-    changed = named = 0
+    changed = named = switched = 0
     for k, r in enumerate(d.springbones):
         pb = stamped.get(k)
         if pb is None:
             continue
+        have0 = struct.unpack_from("<i", r.raw, 0x00)[0]
+        off = pb.get("vtmb_spring_disabled")
+        # Absent is the scene never having said, the rule +0x04 and the five floats follow.
+        want0 = have0 if off is None else spring_start(k, have0, off)
+        if have0 != want0:
+            struct.pack_into("<i", r.raw, 0x00, want0)
+            changed += 1
+            switched += 1
         have = struct.unpack_from("<i", r.raw, 0x04)[0]
         end = pb.get("vtmb_spring_end")
         if end is None:
@@ -1642,9 +1682,9 @@ def apply_springbones(d, m, arm_obj):
             # below already follow -- writing -1 here would repoint the chain at the leaf.
             want = have
         elif end:
-            # +0x00 carries the start bone as -1-bone when the chain starts disabled.
-            v = struct.unpack_from("<i", r.raw, 0x00)[0]
-            want = spring_endbone(k, v if v >= 0 else -1 - v, end, m)
+            # +0x00 carries the start bone as -1-bone when the chain starts disabled, and
+            # want0 is the form this export is writing rather than the one it read.
+            want = spring_endbone(k, want0 if want0 >= 0 else -1 - want0, end, m)
             named += 1
         else:
             want = -1
@@ -1661,7 +1701,7 @@ def apply_springbones(d, m, arm_obj):
             if bytes(r.raw[at:at + 4]) != packed:
                 r.raw[at:at + 4] = packed
                 changed += 1
-    return changed, named
+    return changed, named, switched
 
 
 # An accessory matrix survives Blender as the object's loc/rot/scale, so reading one back
@@ -2912,7 +2952,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     d = build_mod.apply_anims(d, edits, source)
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0,
-             "spring_ends": 0, "stale": 0,
+             "spring_ends": 0, "spring_switched": 0, "stale": 0,
              "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
@@ -2952,7 +2992,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.add_material(d, name, None)
         have.add(name)
         scene["added_materials"].append(name)
-    scene["springs"], scene["spring_ends"] = apply_springbones(d, m, arm_obj)
+    (scene["springs"], scene["spring_ends"],
+     scene["spring_switched"]) = apply_springbones(d, m, arm_obj)
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)

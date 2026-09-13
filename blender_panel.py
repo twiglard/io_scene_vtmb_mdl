@@ -1553,9 +1553,18 @@ class VTMB_PT_bone(bpy.types.Panel):
             col.prop_search(pb, '["vtmb_spring_end"]',
                             *spring_end_search(context.object), text="Ends at")
             col.label(text="empty runs the chain first-child to the leaf")
-        if pb.get("vtmb_spring_disabled"):
-            col.label(text="starts switched off, and cannot be named back on",
-                      icon="ERROR")
+        off = pb.get("vtmb_spring_disabled")
+        if off is None:
+            # The third state again, and no widget can draw it: the export carries the
+            # file's own switch rather than deciding one.
+            col.label(text="switched on or off where the file says -- this scene has "
+                           "never said")
+        else:
+            col.prop(pb, '["vtmb_spring_disabled"]', text="Starts switched off")
+            if off:
+                col.label(text="and nothing in the game switches it back on: the chain "
+                               "is looked up by the raw start bone, which is negative "
+                               "here", icon="ERROR")
 
         col = lay.column(align=True)
         for key, name, _desc in SPRING_FIELDS:
