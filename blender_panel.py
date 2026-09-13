@@ -1502,6 +1502,18 @@ def _bone_pair(lay, key, value):
     row.label(text=value)
 
 
+def spring_end_search(arm_obj):
+    """The collection an end-bone picker searches, as (owner, property name).
+
+    In Edit mode the live bones are `edit_bones`; `armature.bones` is still populated but
+    frozen at the last Object-mode state, so a picker aimed at it offers a name a rename has
+    already taken away and omits the one it gave. Outside Edit mode `edit_bones` is empty.
+    This panel draws in Edit mode the way Blender's own bone panels do, so the mode decides.
+    """
+    arm = arm_obj.data
+    return arm, ("edit_bones" if arm_obj.mode == "EDIT" else "bones")
+
+
 SPRING_FIELDS = (
     ("vtmb_spring_gravity", "Gravity", "3 on 202 of the corpus's 600 records, 0 on 187, "
      "1 on 168. Subtracted as gravity*dt from each node's z every substep"),
@@ -1532,8 +1544,15 @@ class VTMB_PT_bone(bpy.types.Panel):
 
         col = lay.column(align=True)
         col.label(text="chain %d" % int(pb["vtmb_spring_index"]), icon="PHYSICS")
-        end = pb.get("vtmb_spring_end")
-        col.label(text="ends at %s" % (end if end else "the first-child chain"))
+        if pb.get("vtmb_spring_end") is None:
+            # Absent is a third state and prop_search cannot draw a key that is not there:
+            # the export carries the file's own end bone rather than repointing the chain,
+            # so saying so beats an empty box that reads as "no end bone".
+            col.label(text="ends where the file says -- this scene has never named a bone")
+        else:
+            col.prop_search(pb, '["vtmb_spring_end"]',
+                            *spring_end_search(context.object), text="Ends at")
+            col.label(text="empty runs the chain first-child to the leaf")
         if pb.get("vtmb_spring_disabled"):
             col.label(text="starts switched off, and cannot be named back on",
                       icon="ERROR")
