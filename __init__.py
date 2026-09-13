@@ -1422,6 +1422,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "boxes re-swept%s" % (done, total, "" if done == total else
                                               "; the rest keep the file's own, which "
                                               "describe the geometry before this edit"))
+        if r.get("hull") is not None:
+            self.report({"INFO"}, "the hull is now %.0f %.0f %.0f .. %.0f %.0f %.0f"
+                        % (r["hull"][0] + r["hull"][1]))
         for name, (bi, mi) in r.get("remodelled") or []:
             self.report({"INFO"}, "model %d.%d is now named %r in the file"
                         % (bi, mi, name))
@@ -1722,9 +1725,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "\"no material\", so that record keeps the name the file gave "
                         "it. A rename made in the same edit cannot be told from the "
                         "delete and was not taken either" % name)
-        self.report({"INFO"}, "wrote %d of %d animations over %d bones, %d -> %d bytes: "
-                              "%s%s" % (len(r["wrote"]), r["anims"], r["bones"], r["was"],
-                                        r["bytes"], what, extra))
+        self.report({"INFO"}, "wrote %d of %d animations over %d bones and %d sequences, "
+                              "%d -> %d bytes: %s%s"
+                              % (len(r["wrote"]), r["anims"], r["bones"], r["sequences"],
+                                 r["was"], r["bytes"], what, extra))
         return {"FINISHED"}
 
 
