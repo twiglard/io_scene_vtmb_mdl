@@ -511,6 +511,72 @@ def cut_lods(data):
     return bytes(d), was, dropped
 
 
+SHADOW_LOD_SWITCH = -1.0
+
+
+def set_lod_switch(data, values):
+    """One `.vtx`'s LOD switch points replaced in place: (bytes, was, uneven).
+
+    Twelve bytes per LOD per model written over the finished bytes and nothing else, the
+    way `cut_lods` writes its two dwords -- every offset and every payload stays where it
+    is and the file keeps its length.
+
+    A switch point is not a distance. `CStudioRender::ComputeModelLod`
+    (StudioRender 0x2c004a30) turns the caller's unit-sphere screen size into
+    `100.0 / size` and picks the first LOD `i` whose successor's switch point exceeds it,
+    so the number rises with distance and ladders ascend. Index 0's value is read by
+    nothing -- the loop reads `i + 1` for `i` in `0 .. numLODs - 2` -- and is 0.0 on all
+    9172 shipped model records, so 0.0 is what is written there.
+
+    A NEGATIVE LAST VALUE IS THE SHADOW LOD and not a free number. `ComputeModelLod`
+    tests `switch(numLODs - 1) < 0.0` at 0x2c004a7e and then returns `numLODs - 2`, so
+    that LOD is never drawn as a level of detail; `studiomdl`'s own `$shadowlod`
+    (source-2003 studiomdl.cpp:4283) writes -1.0, allows it on the last LOD alone, and
+    refuses a negative on `$lod` outright. The corpus agrees: 293 of 293 negative entries
+    are the last LOD of their model, every one of them -1.0.
+
+    `uneven` is the adjacent pairs that do not ascend, which leaves the earlier LOD
+    unreachable -- reported and not refused, `howitzer` shipping [0, 12, 12, 18].
+    """
+    d = bytearray(data)
+    version, = _u(d, 0, "i")
+    if version != VTX_VERSION:
+        raise ValueError(".vtx version %d, not %d" % (version, VTX_VERSION))
+    was, = _u(d, 0x14, "i")
+    vals = [float(v) for v in values]
+    if len(vals) != was:
+        raise ValueError("%d switch points given for a .vtx carrying %d LODs"
+                         % (len(vals), was))
+    for k, v in enumerate(vals[:-1]):
+        if v < 0.0:
+            raise ValueError("LOD %d's switch point is %g; a negative marks the shadow "
+                             "LOD and studiomdl allows it on the last LOD alone" % (k, v))
+    # Ahead of the LOD-0 rule, which on a one-entry ladder is the same entry: the engine
+    # consequence is the sharper thing to say, and saying the other leaves it unreachable.
+    if vals[-1] < 0.0 and was < 2:
+        raise ValueError("a negative switch point on a single-LOD model makes "
+                         "ComputeModelLod return -1 and read m_pLODs[-1]")
+    if vals[0] != 0.0:
+        raise ValueError("LOD 0's switch point is %g; it is read by nothing and is 0.0 on "
+                         "all 9172 shipped model records" % vals[0])
+    uneven = [(k, a, b) for k, (a, b) in enumerate(zip(vals, vals[1:]))
+              if b >= 0.0 and b <= a]
+
+    numbodyparts, bodypartoffset = _u(d, 0x1c, "2i")
+    for i in range(numbodyparts):
+        bo = bodypartoffset + i * BODYPART_STRIDE
+        nmodels, modeloffset = _u(d, bo, "2i")
+        for j in range(nmodels):
+            mo = bo + modeloffset + j * MODEL_STRIDE
+            nlods, lodoffset = _u(d, mo, "2i")
+            if nlods != was:
+                raise ValueError("model %d carries %d LODs where the file header says %d"
+                                 % (j, nlods, was))
+            for l in range(nlods):
+                struct.pack_into("<f", d, mo + lodoffset + l * LOD_STRIDE + 8, vals[l])
+    return bytes(d), was, uneven
+
+
 def pack_vert0(orig_id):
     return struct.pack("<h", orig_id)
 

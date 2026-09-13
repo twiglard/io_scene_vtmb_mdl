@@ -43,6 +43,10 @@ class Vtx:
                              % (path, self.version, VTX_VERSION))
 
         self.groups = []
+        # One list per model, in the order `model_i` counts, of that model's LOD switch
+        # points. `Mod_LoadStudioModelVertexData` reads body part 0 model 0 and no other
+        # (StudioRender 0x2c005360), so the rest are carried and never consulted.
+        self.switch_points = []
         model_i = 0
         for i in range(numbodyparts):
             bo = bodypartoffset + i * 8
@@ -50,9 +54,12 @@ class Vtx:
             for j in range(nmodels):
                 mo = bo + modeloffset + j * 8
                 nlods, lodoffset = _u(d, mo, "2i")
+                row = []
+                self.switch_points.append(row)
                 for l in range(nlods):
                     lo = mo + lodoffset + l * 12
-                    nmesh, meshoffset = _u(d, lo, "2i")
+                    nmesh, meshoffset, switch = _u(d, lo, "2if")
+                    row.append(switch)
                     for k in range(nmesh):
                         eo = lo + meshoffset + k * 8
                         nsg, _mflags, sgoffset = _u(d, eo, "hhi")

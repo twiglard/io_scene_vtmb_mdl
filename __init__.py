@@ -761,6 +761,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "at it, and the file keeps its length. Every flavour present is cut, "
                     "not only the .dx80.vtx, because the engine picks by -dxlevel and one "
                     "left alone still swaps. A model already at one LOD is untouched")
+    lod_switch: bpy.props.StringProperty(
+        name="LOD switch values", default="",
+        description="One switch value per LOD, comma separated, written over every .vtx "
+                    "beside the model -- empty keeps the ladder the donor has. A switch "
+                    "value is not a distance: ComputeModelLod turns the model's screen "
+                    "size into 100/size and picks the first LOD whose successor's value "
+                    "exceeds it, so the number rises as the model gets further away and "
+                    "the list ascends. The count must equal the file's numLODs and the "
+                    "first entry is read by nothing, which is why every shipped model "
+                    "writes 0 there. A negative last value is Valve's $shadowlod marker "
+                    "and not a free number -- the LOD stops being reachable by distance "
+                    "at all")
     write_flexes: bpy.props.BoolProperty(
         name="Shape keys as flexes", default=False,
         description="Rewrite each model's flexes from its shape keys -- the way to get a "
@@ -925,6 +937,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 box.prop(self, "write_flexes")
                 box.prop(self, "write_cloth")
                 box.prop(self, "cut_lods")
+                row = box.split(factor=SPLIT)
+                row.label(text="LOD switch values")
+                sub = row.row()
+                sub.enabled = not self.cut_lods
+                sub.prop(self, "lod_switch", text="")
                 box.prop(self, "write_2bone_vtx")
                 box.prop(self, "fit_hull")
                 row = box.split(factor=SPLIT)
@@ -1124,6 +1141,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 write_flexes=self.write_flexes,
                 write_cloth=self.write_cloth,
                 cut_lods=self.cut_lods,
+                lod_switch=self.lod_switch,
                 vtx_flavours=(("dx80", "dx7_2bone") if self.write_2bone_vtx
                               else ("dx80",)),
                 # Derived only for a dialog, where the field is on screen with the
@@ -1389,6 +1407,27 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             % (row["file"], row["was"], row["bytes"],
                                "" if row["bytes"] == 1 else "s",
                                ", ".join("%g" % x for x in row["dropped"])))
+        for row in r.get("lod_switch") or []:
+            if row["why"] is not None:
+                self.report({"WARNING"}, "%s kept its own switch values: %s"
+                            % (row["file"], row["why"]))
+                continue
+            self.report({"INFO"}, "%s now swaps at %s, %d byte%s changed"
+                        % (row["file"], ", ".join("%g" % x for x in row["now"]),
+                           row["bytes"], "" if row["bytes"] == 1 else "s"))
+            for k, a, b in row["uneven"]:
+                self.report({"WARNING"},
+                            "%s: LOD %d's switch value %g does not exceed LOD %d's %g, so "
+                            "LOD %d is never picked -- the engine takes the first LOD "
+                            "whose successor's value is above the metric"
+                            % (row["file"], k + 1, b, k, a, k))
+        if r.get("lod_shadow_flag") is False:
+            self.report({"WARNING"},
+                        "the last switch value is negative, which marks the shadow LOD, "
+                        "but studiohdr_t.flags is missing STUDIOHDR_FLAGS_HASSHADOWLOD "
+                        "(0x40) -- the LOD stops being reachable by distance and nothing "
+                        "draws it as a shadow either. This writer does not touch .mdl "
+                        "flags")
         cl = r.get("cloth")
         for e in r.get("cloth_edits") or []:
             moved = [w for w in ("stiffness" if e["sigma"] else None,
