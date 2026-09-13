@@ -624,6 +624,55 @@ def draw_eyeball(lay, obj):
         box.label(text="%s: %s" % (label, name or "-"))
 
 
+def draw_hitbox(lay, obj):
+    """One hitbox empty's own two numbers.
+
+    `vtmb_hitbox_group` is what `accessory_objects` classifies an empty as a box by, so the
+    poll below and the exporter agree by construction and the key must not be removed.
+    The group's meaning is the corpus convention `blender_scratch._hitgroup_of` derives --
+    nothing in the format says it, and `mingxiao.mdl` ships 8 and 9, so it is not capped
+    at 7.
+    """
+    lay.label(text="bone: %s" % (obj.parent_bone or "no bone"), icon="BONE_DATA")
+    lay.prop(obj, '["vtmb_hitbox_group"]', text="Hit group")
+    # Both creation paths stamp the ordinal -- the importer at blender_import.py:674 and the
+    # add operator at :528 -- but `lay.prop` on an absent key raises inside draw(), and
+    # `accessory_objects` reads it with a `or 0` default, so a box without one is legal.
+    if obj.get("vtmb_hitboxset_index") is None:
+        lay.label(text="set 0, no ordinal stamped", icon="MESH_CUBE")
+        return
+    lay.prop(obj, '["vtmb_hitboxset_index"]', text="Set")
+    k = int(obj.get("vtmb_hitboxset_index") or 0)
+    arm_obj = obj.parent
+    name = None
+    if arm_obj is not None:
+        for sib in arm_obj.children_recursive:
+            if (sib.get("vtmb_hitboxset") is not None
+                    and int(sib.get("vtmb_hitboxset_index") or 0) == k):
+                name = str(sib["vtmb_hitboxset"])
+                break
+    lay.label(text="set %d: %s" % (k, name or "default, unnamed"), icon="MESH_CUBE")
+    lay.label(text="1 head, 2 chest, 3 stomach, 4/5 arms, 6/7 legs, 0 generic -- a corpus "
+                   "convention, not a rule the format carries", icon="INFO")
+
+
+class VTMB_PT_hitbox(bpy.types.Panel):
+    bl_label = "VTMB hitbox"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None
+                and context.object.get("vtmb_hitbox_group") is not None)
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_hitbox(self.layout, context.object)
+
+
 class VTMB_PT_eyeball(bpy.types.Panel):
     bl_label = "VTMB eyeball"
     bl_space_type = "PROPERTIES"
@@ -1609,7 +1658,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_set_skin_family, VTMB_PT_skin_families,
            VTMB_PT_cloth,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
-           VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_flex,
+           VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_PT_action_events, VTMB_PT_action_params, VTMB_PT_action_seqtail,
            VTMB_PT_bone_flags, VTMB_PT_bone]
