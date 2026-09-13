@@ -1508,6 +1508,83 @@ def add_attachment(d, name, bone, local=None, type=0):
     return len(d.attachments) - 1
 
 
+# CBaseAnimating::SetModel (vampire.dll 0x10095166) ORs `1 << ordinal` into
+# m_nPhysicsChainDisableMask for every record whose bone is negative, and client.dll
+# 0x100967e0 reads the bit back the same way. Both shifts are `shl`/`shr %cl`, which mask the
+# count to 5 bits in hardware with no explicit AND on either side, so ordinal 32 addresses
+# chain 0's bit. Nothing in any of the four modules bounds numspringbones; the largest
+# shipped count is 25 (manbat).
+SPRING_MASK_BITS = 32
+
+
+# Each is the most common value the corpus carries for that field, over all 600 records in
+# 107 of the 4445 shipped files -- unk08 60.0 on 539 of them, gravity 3.0 on 202, damping 0.9
+# on 351, springexp 0.3 on 326, maxangledeg 30.0 on 259. Nothing in any of the four modules
+# bounds any of the five, so these are what Troika wrote rather than a legal range.
+SPRING_DEFAULTS = (("unk08", 60.0), ("gravity", 3.0), ("damping", 0.9),
+                   ("springexp", 0.3), ("maxangledeg", 30.0))
+
+
+def add_springbone(d, bone, endbone=-1, disabled=False, **fields):
+    """Append one spring bone chain, return its ordinal.
+
+    The five floats are `SPRING_DEFAULTS` unless named; there is no other spelling of them
+    in the addon, the panel's Add button reading the same table through
+    `blender_export.spring_defaults`.
+
+    `endbone` -1 runs the chain first-child to the leaf, which 600 of 600 shipped records
+    do. Anything else has to be the start bone or below it: SpringBoneChain_Construct
+    (client.dll 0x100ac1dd) walks UP from the end bone and ends at `candidate < startbone`
+    with no test that the start bone was ever reached, so a sideways end bone builds a
+    chain the start bone is not in, silently.
+
+    `disabled` writes the -1-bone form. On top of encoding the bone it makes SetModel set
+    the chain's mask bit, and it makes CBaseAnimating::LookupPhysicsChain -- which compares
+    the raw field -- never match, so nothing in the game switches the chain back on.
+    """
+    if not 0 <= bone < len(d.bones):
+        raise Refused("spring bone chain cites bone %d of %d" % (bone, len(d.bones)))
+    k = len(d.springbones)
+    if disabled and k >= SPRING_MASK_BITS:
+        raise Refused("spring bone chain %d cannot start switched off: the engine sets bit "
+                      "%d of a 32-bit mask for it, which belongs to chain %d"
+                      % (k, k % SPRING_MASK_BITS, k % SPRING_MASK_BITS))
+    if endbone != -1:
+        if not 0 <= endbone < len(d.bones):
+            raise Refused("spring bone chain %d ends at bone %d of %d, which is neither -1 "
+                          "nor a bone" % (k, endbone, len(d.bones)))
+        up, steps = endbone, 0
+        while up >= 0 and up != bone and steps <= len(d.bones):
+            up = struct.unpack_from("<i", d.bones[up].raw, 0x04)[0]
+            steps += 1
+        if up != bone:
+            raise Refused("spring bone chain %d starts at %r and ends at %r, which is not "
+                          "below it" % (k, d.bones[bone].name, d.bones[endbone].name))
+    vals = dict(SPRING_DEFAULTS)
+    for key in fields:
+        if key not in vals:
+            raise TypeError("add_springbone got no field called %r" % key)
+    vals.update(fields)
+    raw = bytearray(28)
+    struct.pack_into("<2i5f", raw, 0, -1 - bone if disabled else bone, endbone,
+                     *[vals[f] for f, _ in SPRING_DEFAULTS])
+    d.springbones.append(Rec(raw))
+    return k
+
+
+def remove_springbone(d, k):
+    """Drop one spring bone chain, return the record.
+
+    Nothing in the file names a chain by its ordinal -- the disable mask is runtime state
+    and animation events 2070 and 2071 carry a bone NAME through LookupPhysicsChain -- so
+    the records after it renumber with nothing to patch anywhere.
+    """
+    if not 0 <= k < len(d.springbones):
+        raise Refused("no spring bone chain %d to remove: the file has %d"
+                      % (k, len(d.springbones)))
+    return d.springbones.pop(k)
+
+
 def add_include(d, name):
     """Append one chained model, return its index.  `name` is the path the engine resolves,
     'models/character/pc/male/pcidles_allsequences.mdl'.
