@@ -1676,6 +1676,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if scene.get("face"):
             extra += ("; rewrote %d eyeball or mouth record%s"
                       % (scene["face"], "" if scene["face"] == 1 else "s"))
+        for name, key, live in scene.get("eye_radius_keys") or ():
+            self.report({"WARNING"}, "%r carries vtmb_eyeball_radius %.4f, which is "
+                                     "neither the sphere's %.4f nor what the file holds. "
+                                     "The sphere is what was written and the key has been "
+                                     "corrected to it" % (name, key, live))
+        for name, has_lids in scene.get("eye_lid_targets") or ():
+            self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
+                                     "neither, so this one is written as the scene has it "
+                                     "and no shipped file looks like it"
+                        % (name, "lid flexes and no aim points" if has_lids
+                           else "aim points and no lid flexes"))
         if scene.get("flex") and scene["flex"][0] + scene["flex"][1]:
             nc, nr, added = scene["flex"]
             extra += ("; wrote %d flex controller%s and %d rule%s"

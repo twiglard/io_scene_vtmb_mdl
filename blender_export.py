@@ -1968,13 +1968,48 @@ def _same_dir(a, b):
     return abs(a - b) <= DIR_EPS
 
 
-def _material_index(d, name):
-    """The mstudiotexture_t slot named `name`, appended if the file carries none."""
+def _material_index(d, name, added=None):
+    """The mstudiotexture_t slot named `name`, appended if the file carries none.
+
+    An append is collected rather than silent: it is the one route by which an eyeball
+    puts a material in a file, it runs after the mesh pass that fills
+    `scene["added_materials"]`, and a name reaching here by a typo would otherwise cost a
+    texture record and no `.vmt` with nothing said.
+    """
     for i, r in enumerate(d.textures):
         if r.name == name:
             return i
     build_mod.add_material(d, name, None)
+    if added is not None:
+        added.append(name)
     return len(d.textures) - 1
+
+
+# The three lid-flex name sets the corpus carries, and there is no fourth: over the 602
+# shipped records the eight names are these sixteen or all absent -- right on 196 records,
+# left on 196, none on 210 -- and NO record is partly written. So a scene picks a set and
+# never eight strings, which is what makes the half-written record unreachable.
+EYE_LID_FLEXES = {
+    "right": ("upper_right_lowerer", "upper_right_neutral", "upper_right_raiser",
+              "lower_right_lowerer", "lower_right_neutral", "lower_right_raiser",
+              "upper_right", "lower_right"),
+    "left": ("upper_left_lowerer", "upper_left_neutral", "upper_left_raiser",
+             "lower_left_lowerer", "lower_left_neutral", "lower_left_raiser",
+             "upper_left", "lower_left"),
+}
+
+
+def eyeball_radius(obj, scale):
+    """The record's radius in model units, which is the empty's own display size.
+
+    The import draws each eyeball as a SPHERE empty of exactly that size, so resizing the
+    sphere is the edit a person makes; `vtmb_eyeball_radius` records what the file held
+    and is compared against this rather than read, because a key that wins makes the
+    viewport lie about the number being written.  Shipped radii are 0.5 on 568 records,
+    0.577 on 20, 0.57 on 10 and 0.6 on 4, so the import's `max(..., 1e-4)` clamp is
+    reached by 0 of 602 and the round trip through the display size is exact.
+    """
+    return obj.empty_display_size / (scale or 1.0)
 
 
 _FLEXCTRL_RE = re.compile(
@@ -2294,6 +2329,11 @@ class _Named(object):
 def apply_face(d, m, arm_obj, scale):
     """The eyeball records and the one mouth record, written only where they differ.
 
+    Answers `{changed, materials, radius_keys, lid_targets}` -- the record count, the
+    material names an eyeball put in the file, the eyeballs whose `vtmb_eyeball_radius`
+    says something neither the sphere nor the file says, and the eyeballs holding lid
+    flexes without aim points or the other way round.
+
     Every index a scene holds is a NAME here and is resolved against this file: the two
     materials against mstudiotexture_t, the eight lid flexes and the mouth's flex against
     mstudioflexdesc_t, the mouth's bone against the bone array. The corpus is why -- the
@@ -2305,7 +2345,7 @@ def apply_face(d, m, arm_obj, scale):
     they are 0 on 602 of 602 shipped records and the QC `eyeball` command has no token
     that sets them, so the scene draws neither.
     """
-    changed = 0
+    out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": []}
     eyes = eyeball_objects(arm_obj)
     # A model record carries no name of its own in the description, so the name comes off
     # the parsed file walked beside it -- same file, same order.
@@ -2316,7 +2356,8 @@ def apply_face(d, m, arm_obj, scale):
             if not recs or not want:
                 continue
             for rec, obj in zip(recs, want):
-                changed += _apply_eyeball(d, rec, obj, scale)
+                out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
+    changed = out["changed"]
     mouth = arm_obj.get("vtmb_mouth")
     if mouth and d.mouths:
         raw = d.mouths[0].raw
@@ -2333,19 +2374,19 @@ def apply_face(d, m, arm_obj, scale):
                 or not all(_same(a, b) for a, b in zip(have[1:4], fwd))):
             struct.pack_into("<i3fi", raw, 0, bi, fwd[0], fwd[1], fwd[2], fi)
             changed += 1
-    return changed
+    out["changed"] = changed
+    return out
 
 
-def _apply_eyeball(d, rec, obj, scale):
+def _apply_eyeball(d, rec, obj, scale, out):
     raw = rec.raw
     local = obj.matrix_basis
     org = tuple(local[r][3] / scale for r in range(3))
     up = tuple(local.col[1][:3])
     fw = tuple(local.col[2][:3])
-    radius = float(obj.get("vtmb_eyeball_radius")
-                   or obj.empty_display_size / (scale or 1.0))
-    iris = _material_index(d, str(obj.get("vtmb_eyeball_iris") or ""))
-    glint = _material_index(d, str(obj.get("vtmb_eyeball_glint") or ""))
+    radius = eyeball_radius(obj, scale)
+    iris = _material_index(d, str(obj.get("vtmb_eyeball_iris") or ""), out["materials"])
+    glint = _material_index(d, str(obj.get("vtmb_eyeball_glint") or ""), out["materials"])
     iscale = float(obj.get("vtmb_eyeball_iris_scale") or 0.0)
     upt = [float(c) for c in (obj.get("vtmb_eyeball_uppertarget") or (0.0, 0.0, 0.0))]
     lot = [float(c) for c in (obj.get("vtmb_eyeball_lowertarget") or (0.0, 0.0, 0.0))]
@@ -2354,6 +2395,23 @@ def _apply_eyeball(d, rec, obj, scale):
     # empty scene list writes eight zeros and not a sentinel.
     ids = ([build_mod.flexdesc_index(d, x) if x else 0 for x in lids]
            if len(lids) == 8 else [0] * 8)
+    file_radius = struct.unpack_from("<f", raw, 0x18)[0]
+    key = obj.get("vtmb_eyeball_radius")
+    if key is not None:
+        key = float(key)
+        # The key is no longer the radius the export writes, so one that agrees with
+        # neither the sphere nor the file was hand-edited and is being ignored. Said once
+        # and then corrected, since a scene re-exported twice would otherwise hear it
+        # about a radius it wrote itself.
+        if not _same(key, radius) and not _same(key, file_radius):
+            out["radius_keys"].append((obj.name, key, radius))
+        if not _same(key, radius):
+            obj["vtmb_eyeball_radius"] = radius
+    # Lid flexes and the two aim points move together on all 602 shipped records -- 392
+    # carry both and 210 carry neither -- so either alone is a state the format has never
+    # held, and it is named rather than refused.
+    if (len(lids) == 8 and any(lids)) == all(c == 0.0 for c in list(upt) + list(lot)):
+        out["lid_targets"].append((obj.name, bool(len(lids) == 8 and any(lids))))
     have = (struct.unpack_from("<3f", raw, 0x08) + struct.unpack_from("<f", raw, 0x18)
             + struct.unpack_from("<3f", raw, 0x1c) + struct.unpack_from("<3f", raw, 0x28)
             + struct.unpack_from("<i", raw, 0x38) + struct.unpack_from("<f", raw, 0x3c)
@@ -3211,7 +3269,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)
-    scene["face"] = apply_face(d, m, arm_obj, scale)
+    face = apply_face(d, m, arm_obj, scale)
+    scene["face"] = face["changed"]
+    scene["eye_radius_keys"] = face["radius_keys"]
+    scene["eye_lid_targets"] = face["lid_targets"]
+    # After the mesh pass above rather than beside it: an eyeball is the one thing that
+    # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
+    for name in face["materials"]:
+        if name not in scene["added_materials"]:
+            scene["added_materials"].append(name)
     scene["flex"] = apply_flex(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.

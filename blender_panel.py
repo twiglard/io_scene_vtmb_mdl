@@ -617,27 +617,91 @@ class VTMB_PT_face(bpy.types.Panel):
         draw_face(self.layout, context, context.object)
 
 
+EYE_LID_LABELS = ("upper lowerer", "upper neutral", "upper raiser",
+                  "lower lowerer", "lower neutral", "lower raiser",
+                  "upper lid", "lower lid")
+
+
+def eyeball_scale(obj):
+    """The model scale the eyeball's own armature carries, 1.0 where it carries none."""
+    arm = obj.parent
+    return float((arm.get("vtmb_scale", 1.0) if arm is not None else 1.0) or 1.0)
+
+
 def draw_eyeball(lay, obj):
+    """One eyeball record, every field the format varies drawn as a property.
+
+    The radius is the empty's own display size and never `vtmb_eyeball_radius`: the import
+    draws the record as a SPHERE of exactly that size, so resizing the sphere is the edit a
+    person makes, and a key that won would make the viewport lie about the number written.
+    The key is what the file held and is shown beside it where the two disagree.
+
+    zoffset, the texture slot and the two pitch/yaw pairs get one label and no widget,
+    each being 0 on all 602 shipped records with the export writing zero -- the reason
+    `mstudioattachment_t.type` got none either.
+    """
     lay.label(text="eyeball %d of model %r"
                    % (int(obj.get("vtmb_eyeball") or 0),
                       str(obj.get("vtmb_eyeball_model") or "")), icon="HIDE_OFF")
     lay.label(text="bone: %s" % (obj.parent_bone or "not parented to a bone"))
-    lay.label(text="radius %.4f (the empty's display size)"
-                   % float(obj.get("vtmb_eyeball_radius") or 0.0))
-    lay.label(text="iris %s at scale %.4f"
-                   % (str(obj.get("vtmb_eyeball_iris") or "?"),
-                      float(obj.get("vtmb_eyeball_iris_scale") or 0.0)))
-    lay.label(text="glint %s" % str(obj.get("vtmb_eyeball_glint") or "?"))
+    scale = eyeball_scale(obj)
+    lay.prop(obj, "empty_display_size", text="Radius")
+    key = obj.get("vtmb_eyeball_radius")
+    if key is not None and abs(float(key) - obj.empty_display_size / scale) > 1e-6:
+        lay.label(text="the file held %.4f; the sphere is what gets written"
+                       % float(key), icon="INFO")
+    # `lay.prop` on an absent ID key raises inside draw(), and every one of these is
+    # stamped by the import alone -- nothing here creates an eyeball -- so a key missing
+    # is an older .blend and gets the value as a label instead. The two aim points are
+    # 3-float ID-property arrays and `["key"]` is the right path for one: it is what
+    # Blender's own Custom Properties panel uses, rna_prop_ui.py:228, and its MAX_DISPLAY_ROWS
+    # cutout at 8 elements is well above three.
+    for k, label in (("vtmb_eyeball_iris", "Iris material"),
+                     ("vtmb_eyeball_iris_scale", "Iris scale"),
+                     ("vtmb_eyeball_glint", "Glint material"),
+                     ("vtmb_eyeball_uppertarget", "Upper aim"),
+                     ("vtmb_eyeball_lowertarget", "Lower aim")):
+        if obj.get(k) is None:
+            lay.label(text="%s: not stashed" % label, icon="INFO")
+        else:
+            lay.prop(obj, '["%s"]' % k, text=label)
+    lay.label(text="a material name this file has not got is added to it, and the export "
+                   "says so", icon="INFO")
+    lay.prop(obj, "vtmb_eyeball_lids", text="Lid flexes")
     lids = [str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ())]
     if not lids:
-        lay.label(text="no lid flexes", icon="INFO")
+        lay.label(text="no lid flexes, which 210 of 602 shipped records also have",
+                  icon="INFO")
         return
     box = lay.box()
     box.label(text="lid flexes")
-    for label, name in zip(("upper lowerer", "upper neutral", "upper raiser",
-                            "lower lowerer", "lower neutral", "lower raiser",
-                            "upper lid", "lower lid"), lids):
+    for label, name in zip(EYE_LID_LABELS, lids):
         box.label(text="%s: %s" % (label, name or "-"))
+
+
+def _lid_side(obj):
+    """"none", "right", "left", or "other" for a set matching no shipped one."""
+    lids = tuple(str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ()))
+    if not any(lids):
+        return "none"
+    for side, names in blender_export.EYE_LID_FLEXES.items():
+        if lids == names:
+            return side
+    return "other"
+
+
+def _lids_get(self):
+    return ("none", "right", "left", "other").index(_lid_side(self))
+
+
+def _lids_set(self, v):
+    # "other" writes nothing: it is what an unrecognised set reads back as, and a scene
+    # holding one has said something this panel cannot restate.
+    side = ("none", "right", "left", "other")[int(v)]
+    if side == "other":
+        return
+    self["vtmb_eyeball_lidflexes"] = list(
+        blender_export.EYE_LID_FLEXES.get(side) or ())
 
 
 def draw_hitbox(lay, obj):
@@ -2219,6 +2283,21 @@ def register_props():
             get=(lambda k: lambda self: float(self.get("vtmb_cloth_%s" % k) or 0.0))(_k),
             set=(lambda k: lambda self, v: self.__setitem__("vtmb_cloth_%s" % k,
                                                             float(v)))(_k)))
+    bpy.types.Object.vtmb_eyeball_lids = bpy.props.EnumProperty(
+        name="Lid flexes", get=_lids_get, set=_lids_set,
+        items=(("none", "None", "All eight flexdesc indices zero, which is how 210 of "
+                                "the 602 shipped records say the eye has no lids"),
+               ("right", "Right eye", "upper_right_lowerer / _neutral / _raiser, the "
+                                      "three lower_right ones, then upper_right and "
+                                      "lower_right"),
+               ("left", "Left eye", "The same eight names with _left, which 196 shipped "
+                                    "records carry"),
+               ("other", "Other", "A set matching neither shipped one. Selecting it "
+                                  "writes nothing")),
+        description="The eight lid flexes as one choice. They are written as a matched "
+                    "set because no shipped record is partly written -- all eight are "
+                    "names on 392 records and all eight are absent on 210 -- and because "
+                    "an index the file has not got is appended rather than refused")
     bpy.types.Object.vtmb_action_index = bpy.props.IntProperty(
         name="Action", default=0, min=0,
         description="Which of the blend's actions the VTMB animations list is on. It "
@@ -2258,7 +2337,7 @@ def unregister_props():
     if hasattr(bpy.types.Object, "vtmb_action_index"):
         del bpy.types.Object.vtmb_action_index
     names = ["vtmb_cloth_on", "vtmb_cloth_flip_on", "vtmb_cloth_preset_name",
-             "vtmb_cloth_pin_text"]
+             "vtmb_cloth_pin_text", "vtmb_eyeball_lids"]
     for k, _l, _lo, _hi, _d in CLOTH_NUMBERS:
         names += ["vtmb_cloth_%s_on" % k, "vtmb_cloth_%s_num" % k]
     for attr in names:
