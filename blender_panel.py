@@ -93,6 +93,26 @@ def _activity_set(action, value):
     action["vtmb_activity"] = str(value).strip()
 
 
+def _activity_search(self, context, edit_text):
+    """The activities this model's own sequences already claim.
+
+    Offered rather than a table of the game's, so no list of names read out of Troika's
+    files ships in the addon at all. `SUGGESTION` is what keeps the field a free string,
+    which it has to stay: the format stores a name and the engine resolves it, so an
+    activity no shipped model uses is still legal.
+    """
+    arm = _action_armature(context, self)
+    if arm is None:
+        obj = getattr(context, "object", None)
+        arm = obj if obj is not None and obj.type == "ARMATURE" else None
+    got = set()
+    for seq in (arm.get("vtmb_sequences") if arm is not None else None) or ():
+        name = str(seq.get("activity") or "")
+        if name and (not edit_text or edit_text.lower() in name.lower()):
+            got.add(name)
+    return sorted(got)
+
+
 def panel_action(context):
     """The action a sidebar panel is about: the Action editor's, else the object's."""
     act = getattr(context.space_data, "action", None)
@@ -1272,22 +1292,28 @@ class VTMB_PT_armature(bpy.types.Panel):
         lay.operator(VTMB_OT_check_paths.bl_idname, icon="VIEWZOOM")
 
 
-def draw_action_fields(lay, act):
+def draw_action_fields(lay, act, arm_obj=None):
     """The three per-action fields, wherever they are hosted.
 
     Two panels draw them -- the Action editor's sidebar, which is about the action on
     screen, and the Object Data tab's list, which is about the model's whole set -- and
     `operator-check.py` reads the `.prop(act, ...)` calls out of this one function, so a
     field added here is a field both hosts get and the check counts.
+
+    `arm_obj` is only what `_activity_line` resolves the sequence stash through. The Action
+    editor has no armature in its context and passes what `_action_armature` finds, which is
+    None where no armature's stash names the action.
     """
     col = lay.column(align=True)
     col.prop(act, "vtmb_root_motion_choice", text="")
     if act.get(blender_export.MODE_ATTR) is None:
-        col.label(text="    -> " + _fallback_line(act))
+        col.label(text="    → " + _fallback_line(act))
 
     col = lay.column(align=True)
     col.prop(act, "vtmb_loops")
     col.prop(act, "vtmb_activity_text")
+    if act.get("vtmb_activity") is None:
+        col.label(text="    → " + _activity_line(arm_obj, act))
 
     nmv = act.get("vtmb_movements")
     if nmv is not None:
@@ -1410,7 +1436,7 @@ class VTMB_PT_actions(bpy.types.Panel):
         if act is None:
             lay.label(text="the blend holds no action", icon="INFO")
             return
-        draw_action_fields(lay, act)
+        draw_action_fields(lay, act, obj)
         ad = obj.animation_data
         if ad is None or ad.action is not act:
             lay.label(text="not the assigned action -- an export with target Active "
@@ -1433,7 +1459,7 @@ class VTMB_PT_action(bpy.types.Panel):
         lay = self.layout
         lay.use_property_split = False
         lay.label(text=act.name, icon="ACTION")
-        draw_action_fields(lay, act)
+        draw_action_fields(lay, act, _action_armature(context, act))
 
 
 # Only the ids whose handler carries its own name: HandleAnimEvent's third arm, 4005,
@@ -1620,7 +1646,7 @@ def draw_action_seqtail(lay, context, act):
     node = [int(x) for x in seq.get("node") or (0, 0, 0)]
     phase = [float(x) for x in seq.get("phase") or (0.0, 0.0)]
     box = lay.box()
-    box.label(text="transition node %d -> %d, flags %d" % tuple(node))
+    box.label(text="transition node %d → %d, flags %d" % tuple(node))
     box.label(text="phase %g .. %g" % tuple(phase))
 
     box = lay.box()
@@ -2129,6 +2155,21 @@ def _spring_bone(context):
     return obj.pose.bones.get(bone.name)
 
 
+def _activity_line(arm_obj, act):
+    """What an Activity box the scene has never filled in resolves to.
+
+    Absent and empty are different states -- `_activity_set` stores `""` for "no activity"
+    and only an action the panel has never written has no key at all -- and the box draws
+    both as empty. So the absent one says what the file holds instead.
+    """
+    if arm_obj is None:
+        return "no armature here names this action"
+    seq = _action_seq(arm_obj, act)[1]
+    if seq is None:
+        return "no sequence of this file names this action"
+    return str(seq.get("activity") or "") or "no activity"
+
+
 def _fallback_line(act):
     """What Not set resolves to, so the field is never silently a guess."""
     try:
@@ -2613,10 +2654,13 @@ def register_props():
                     "read looping from it")
     bpy.types.Action.vtmb_activity_text = bpy.props.StringProperty(
         name="Activity", get=_activity_get, set=_activity_set,
+        search=_activity_search, search_options={"SORT", "SUGGESTION"},
         description="The activity the sequence written for this action claims, e.g. "
                     "ACT_IDLE. Emptying it writes a sequence with no activity; an action "
                     "that has never carried one instead keeps whatever the donor says, "
-                    "and on the no-donor export takes the dialog's")
+                    "and on the no-donor export takes the dialog's. The picker offers the "
+                    "activities this model's own sequences claim and still accepts any "
+                    "other name, the engine resolving the string rather than an index")
 
 
 def unregister_props():

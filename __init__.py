@@ -54,14 +54,18 @@ def _pair(box, key, value, icon="NONE"):
 
 
 def _mode_tally(actions):
-    """How the actions of a whole-scene write split across the four modes."""
+    """`(label, count)` per root-motion mode present, in `ROOT_MOTION_MODES` order.
+
+    Three or more counts stop reading as a sentence, so the caller joins a short split and
+    draws a row each above that.
+    """
     got = {}
     for act in actions:
         mode = blender_export.root_motion_mode(
             act, blender_export.PER_ACTION, donor=False, default="extract")
         got[mode] = got.get(mode, 0) + 1
-    return ", ".join("%d %s" % (got[k], ROOT_MOTION_LABELS[k])
-                     for k in blender_export.ROOT_MOTION_MODES if k in got) or "no actions"
+    return [(ROOT_MOTION_LABELS[k], got[k])
+            for k in blender_export.ROOT_MOTION_MODES if k in got]
 
 
 def _write_vmts(context, arm_obj, dest, names, enabled):
@@ -1969,10 +1973,19 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             # This operator writes every action, so one action's answer says nothing --
             # what is reported is the split across all of them.
             try:
-                _pair(box, "root motion", _mode_tally(actions)
-                      if self.root_motion == blender_export.PER_ACTION
-                      else "%s, forced by the caller"
-                           % ROOT_MOTION_LABELS[self.root_motion])
+                if self.root_motion != blender_export.PER_ACTION:
+                    _pair(box, "root motion", "%s, forced by the caller"
+                          % ROOT_MOTION_LABELS[self.root_motion])
+                else:
+                    rows = _mode_tally(actions)
+                    if len(rows) < 3:
+                        _pair(box, "root motion",
+                              ", ".join("%d %s" % (n, lab) for lab, n in rows)
+                              or "no actions")
+                    else:
+                        _pair(box, "root motion", "%d actions" % len(actions))
+                        for lab, n in rows:
+                            _pair(box, "    " + lab, str(n))
             except (ValueError, KeyError) as exc:
                 box.label(text=str(exc), icon="ERROR")
             if self.root_motion == blender_export.PER_ACTION:
