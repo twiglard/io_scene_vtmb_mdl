@@ -1985,6 +1985,19 @@ def _material_index(d, name, added=None):
     return len(d.textures) - 1
 
 
+def _flexdesc_index(d, name, added=None):
+    """The mstudioflexdesc_t slot named `name`, appended if the file carries none.
+
+    Collected the way `_material_index` collects a material: a flex name reaching here by
+    a typo costs a descriptor the engine will never weight and nothing would be said.
+    """
+    was = len(d.flexdescs)
+    i = build_mod.flexdesc_index(d, name)
+    if added is not None and len(d.flexdescs) > was:
+        added.append(name)
+    return i
+
+
 # The three lid-flex name sets the corpus carries, and there is no fourth: over the 602
 # shipped records the eight names are these sixteen or all absent -- right on 196 records,
 # left on 196, none on 210 -- and NO record is partly written. So a scene picks a set and
@@ -2329,10 +2342,11 @@ class _Named(object):
 def apply_face(d, m, arm_obj, scale):
     """The eyeball records and the one mouth record, written only where they differ.
 
-    Answers `{changed, materials, radius_keys, lid_targets}` -- the record count, the
-    material names an eyeball put in the file, the eyeballs whose `vtmb_eyeball_radius`
-    says something neither the sphere nor the file says, and the eyeballs holding lid
-    flexes without aim points or the other way round.
+    Answers `{changed, materials, radius_keys, lid_targets, flexdescs}` -- the record
+    count, the material names an eyeball put in the file, the eyeballs whose
+    `vtmb_eyeball_radius` says something neither the sphere nor the file says, the
+    eyeballs holding lid flexes without aim points or the other way round, and the flex
+    names a lid or the mouth appended to the file's mstudioflexdesc_t array.
 
     Every index a scene holds is a NAME here and is resolved against this file: the two
     materials against mstudiotexture_t, the eight lid flexes and the mouth's flex against
@@ -2345,7 +2359,8 @@ def apply_face(d, m, arm_obj, scale):
     they are 0 on 602 of 602 shipped records and the QC `eyeball` command has no token
     that sets them, so the scene draws neither.
     """
-    out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": []}
+    out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
+           "flexdescs": []}
     eyes = eyeball_objects(arm_obj)
     # A model record carries no name of its own in the description, so the name comes off
     # the parsed file walked beside it -- same file, same order.
@@ -2357,25 +2372,46 @@ def apply_face(d, m, arm_obj, scale):
                 continue
             for rec, obj in zip(recs, want):
                 out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
-    changed = out["changed"]
-    mouth = arm_obj.get("vtmb_mouth")
-    if mouth and d.mouths:
-        raw = d.mouths[0].raw
-        bone = str(mouth.get("bone") or "")
-        bi = next((b.index for b in m.bones if b.name == bone), None)
-        flex = str(mouth.get("flex") or "")
-        have = struct.unpack_from("<i3fi", raw, 0)
-        fwd = tuple(float(c) for c in (mouth.get("forward") or (0.0, -1.0, 0.0)))
-        fi = build_mod.flexdesc_index(d, flex) if flex else have[4]
-        if bi is None:
-            raise ValueError("the mouth is on bone %r, which is not one this model carries"
-                             % bone)
-        if (have[0] != bi or have[4] != fi
-                or not all(_same(a, b) for a, b in zip(have[1:4], fwd))):
-            struct.pack_into("<i3fi", raw, 0, bi, fwd[0], fwd[1], fwd[2], fi)
-            changed += 1
-    out["changed"] = changed
+    out["changed"] += _apply_mouth(d, m, arm_obj, out)
     return out
+
+
+def _apply_mouth(d, m, arm_obj, out):
+    """The one mstudiomouth_t, written only where the scene says something else.
+
+    All three fields are the scene's to set.  Over the 200 shipped carriers the names are
+    unanimous -- `Bip01 Head`, (0, -1, 0) and `mouth` on 200 of 200 -- but that is Troika's
+    rig and not the format: those 200 span 113 distinct bone sets which are all one rig
+    family, every one carrying the whole Biped core, and 504 models carry a `Bip01 Head`
+    where only 200 carry a mouth.  R_MouthSetupVertexShader reads every one of the three.
+
+    The bone and the flex are NAMES in the stash: the bone index is 6 on 187 carriers, 12
+    on 8, 7 on 3 and 14 on 2, and the flexdesc index is 16 on 196 and 0 on 4, so a stored
+    index would say the wrong thing the moment a slot moves.
+    """
+    mouth = arm_obj.get("vtmb_mouth")
+    if not mouth or not d.mouths:
+        return 0
+    raw = d.mouths[0].raw
+    have = struct.unpack_from("<i3fi", raw, 0)
+    # A key absent means the scene never said, so the file's own value stands -- the rule
+    # a spring bone's end bone and an out-of-range blend cell already follow.
+    bone = str(mouth.get("bone") or "")
+    bi = have[0]
+    if bone:
+        bi = next((b.index for b in m.bones if b.name == bone), None)
+        if bi is None:
+            raise ValueError("the mouth is on bone %r, which is not one this model "
+                             "carries" % bone)
+    fwd = (tuple(float(c) for c in mouth["forward"])
+           if mouth.get("forward") is not None else have[1:4])
+    flex = str(mouth.get("flex") or "")
+    fi = _flexdesc_index(d, flex, out["flexdescs"]) if flex else have[4]
+    if (have[0] != bi or have[4] != fi
+            or not all(_same(a, b) for a, b in zip(have[1:4], fwd))):
+        struct.pack_into("<i3fi", raw, 0, bi, fwd[0], fwd[1], fwd[2], fi)
+        return 1
+    return 0
 
 
 def _apply_eyeball(d, rec, obj, scale, out):
@@ -2393,7 +2429,7 @@ def _apply_eyeball(d, rec, obj, scale, out):
     lids = [str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ())]
     # A shipped record says "no lid flexes" by holding zero in all eight, never -1, so an
     # empty scene list writes eight zeros and not a sentinel.
-    ids = ([build_mod.flexdesc_index(d, x) if x else 0 for x in lids]
+    ids = ([_flexdesc_index(d, x, out["flexdescs"]) if x else 0 for x in lids]
            if len(lids) == 8 else [0] * 8)
     file_radius = struct.unpack_from("<f", raw, 0x18)[0]
     key = obj.get("vtmb_eyeball_radius")
@@ -3273,6 +3309,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["face"] = face["changed"]
     scene["eye_radius_keys"] = face["radius_keys"]
     scene["eye_lid_targets"] = face["lid_targets"]
+    scene["face_flexdescs"] = face["flexdescs"]
     # After the mesh pass above rather than beside it: an eyeball is the one thing that
     # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
     for name in face["materials"]:

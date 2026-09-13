@@ -1681,6 +1681,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "neither the sphere's %.4f nor what the file holds. "
                                      "The sphere is what was written and the key has been "
                                      "corrected to it" % (name, key, live))
+        added_fd = scene.get("face_flexdescs") or ()
+        if added_fd:
+            self.report({"WARNING"}, "%d flex name%s the file has not got, added to it so "
+                                     "the record can name %s: %s. Nothing weights a "
+                                     "descriptor no flex controller drives"
+                        % (len(added_fd), "" if len(added_fd) == 1 else "s",
+                           "it" if len(added_fd) == 1 else "them",
+                           ", ".join(added_fd)))
         for name, has_lids in scene.get("eye_lid_targets") or ():
             self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
                                      "neither, so this one is written as the scene has it "

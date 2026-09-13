@@ -571,18 +571,44 @@ def draw_accessories(lay, context, arm_obj):
 
 
 def draw_face(lay, context, arm_obj):
-    """The mouth and the eyeballs, both named rather than indexed.
+    """The one mouth record as properties, and the eyeballs named rather than indexed.
 
-    Nothing here is editable in place: the mouth's bone is the empty's parent and the
-    eyeball's own numbers are on the eyeball, which VTMB_PT_eyeball draws.
+    The mouth's bone and flex live in the `vtmb_mouth` stash as NAMES and never as indices:
+    over the 200 shipped carriers the bone index is 6 on 187, 12 on 8, 7 on 3 and 14 on 2
+    and the flexdesc index is 16 on 196 and 0 on 4, while the names are `Bip01 Head` and
+    `mouth` on 200 of 200 and forward is (0, -1, 0) on 200 of 200.
+
+    That unanimity is Troika's rig and not the format, which is why all three are drawn:
+    the 200 carriers span 113 distinct bone sets but every one holds the whole Biped core,
+    504 models carry a `Bip01 Head` and only 200 carry a mouth, and
+    CStudioRender::R_MouthSetupVertexShader reads all three -- the bone as an index into
+    m_BoneToWorld, forward rotated by that matrix into the material's $forward, the flex as
+    an index into m_FlexWeights -- so a rig that is not a Biped needs every one of them.
+
+    The eyeball's own numbers are on the eyeball, which VTMB_PT_eyeball draws.
     """
     mouth = arm_obj.get("vtmb_mouth")
-    if mouth:
-        lay.label(text="mouth: flex %r on %s"
-                       % (str(mouth.get("flex") or "?"), str(mouth.get("bone") or "?")),
-                  icon="USER")
-    else:
+    if not mouth:
         lay.label(text="no mouth", icon="INFO")
+    else:
+        box = lay.box()
+        box.label(text="mouth", icon="USER")
+        # A nested id-property path is a real RNA path in 5.2: `prop` and `prop_search`
+        # both take `["vtmb_mouth"]["bone"]` and a write through one reaches the stash.
+        # `prop` on an absent key still raises inside draw(), and the import is the only
+        # thing that stamps these, so a key missing is an older .blend and gets a label.
+        if mouth.get("bone") is None:
+            box.label(text="bone: not stashed", icon="INFO")
+        else:
+            box.prop_search(arm_obj, '["vtmb_mouth"]["bone"]', *bone_search(arm_obj),
+                            text="Bone")
+        for k, label in (("forward", "Forward"), ("flex", "Jaw flex")):
+            if mouth.get(k) is None:
+                box.label(text="%s: not stashed" % label, icon="INFO")
+            else:
+                box.prop(arm_obj, '["vtmb_mouth"]["%s"]' % k, text=label)
+        box.label(text="a flex name this file has not got is added to it, and the export "
+                       "says so", icon="INFO")
     eyes = blender_export.eyeball_objects(arm_obj)
     n = sum(len(v) for v in eyes.values())
     if not n:
@@ -1636,13 +1662,13 @@ def _bone_pair(lay, key, value):
     row.label(text=value)
 
 
-def spring_end_search(arm_obj):
-    """The collection an end-bone picker searches, as (owner, property name).
+def bone_search(arm_obj):
+    """The collection a bone picker on this armature searches, as (owner, property name).
 
     In Edit mode the live bones are `edit_bones`; `armature.bones` is still populated but
     frozen at the last Object-mode state, so a picker aimed at it offers a name a rename has
     already taken away and omits the one it gave. Outside Edit mode `edit_bones` is empty.
-    This panel draws in Edit mode the way Blender's own bone panels do, so the mode decides.
+    The bone panels draw in Edit mode the way Blender's own do, so the mode decides.
     """
     arm = arm_obj.data
     return arm, ("edit_bones" if arm_obj.mode == "EDIT" else "bones")
@@ -1799,7 +1825,7 @@ class VTMB_PT_bone(bpy.types.Panel):
             col.label(text="ends where the file says -- this scene has never named a bone")
         else:
             col.prop_search(pb, '["vtmb_spring_end"]',
-                            *spring_end_search(context.object), text="Ends at")
+                            *bone_search(context.object), text="Ends at")
             col.label(text="empty runs the chain first-child to the leaf")
         off = pb.get("vtmb_spring_disabled")
         if off is None:
