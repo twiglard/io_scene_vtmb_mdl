@@ -2610,3 +2610,80 @@ def rename_animation(d, i, name):
                           % (k, name))
     was, d.anims[i].name = d.anims[i].name, name
     return was
+
+
+def remove_sequence(d, i):
+    """Drop sequence `i`, and answer what the file lost with it.
+
+    Autolayers are sequence INDICES in the record -- `+0x294` the count, `+0x298` the array
+    -- so every surviving list renumbers behind the hole and a list naming the dropped
+    sequence loses that entry: there is no replacement to invent and the engine walks
+    `numautolayers` unconditionally.  One model ships a list `mdl.py`'s reader accepts,
+    `move_and_ranged.mdl` in two copies -- 340 entries over 229 of its 564 sequences and 345
+    over 232 of 602, 0 of them naming a sequence the file has not got.  The other eight
+    files with a non-zero count carry 764 in the count and in the index both, which is the
+    seqdesc stride and `anomalies` B1's write cursor, and the `0 < n < 64` guard drops them.
+
+    The four sequence-NAME fields -- `dodge`, `block`, `+0x2e8` and `+0x2ec` -- are strings
+    the engine resolves at load time, so one naming the dropped label is left standing and
+    reported instead: an unresolvable name is what the file already carries wherever a
+    sequence is absent, and rewriting it would be choosing a different sequence.
+
+    The last sequence is not refused.  `numseq` 0 ships on 10 of the 4445 models, every one
+    an `*allsequences.mdl` include stub carrying `numanim` 0 as well.
+
+    An animation no surviving sequence plays is reported and not refused.  0 of the 4445
+    models ship one -- every shipped animation is cited by exactly one sequence -- but
+    nothing in the file requires it and a scene part-way through an edit has it.
+
+    Returns (label, [(label, entries lost)], [orphaned animation names],
+             [(label, which name field)]).
+    """
+    if not 0 <= i < len(d.seqs):
+        raise Refused("no sequence %d to remove: the file has %d" % (i, len(d.seqs)))
+    label = d.seqs[i].name or ""
+    del d.seqs[i]
+    lost, naming = [], []
+    for r in d.seqs:
+        al = list(r.extra.get("autolayers") or [])
+        if al:
+            kept = [x - 1 if x > i else x for x in al if x != i]
+            if len(kept) != len(al):
+                lost.append((r.name or "", len(al) - len(kept)))
+            if kept != al:
+                r.extra["autolayers"] = kept
+        for key in ("dodge", "block", "seq2e8", "seq2ec"):
+            if label and r.extra.get(key) == label:
+                naming.append((r.name or "", key))
+    played = set()
+    for r in d.seqs:
+        played.update(_seq_anims(r.raw))
+    orphans = [a.name for k, a in enumerate(d.anims) if k not in played]
+    return label, lost, orphans, naming
+
+
+def reorder_sequences(d, order):
+    """Permute `d.seqs` into `order`, a list of current indices, and answer how many moved.
+
+    A record's blend grid names animations and not sequences, so it travels with the record
+    untouched, and the four tail fields name a sequence by string.  The autolayer array is
+    the one thing that has to follow the permutation, and does.
+
+    `order` names every index once.  A partial order would leave the records it omits where
+    they are, and an autolayer pointing into the part that moved could then be renumbered
+    two ways.
+    """
+    order = [int(x) for x in order]
+    if sorted(order) != list(range(len(d.seqs))):
+        raise Refused("reordering %d sequences wants each index exactly once, got %s"
+                      % (len(d.seqs), order if len(order) < 12 else
+                         "%d value(s)" % len(order)))
+    at = [0] * len(order)
+    for new, old in enumerate(order):
+        at[old] = new
+    d.seqs[:] = [d.seqs[k] for k in order]
+    for r in d.seqs:
+        al = list(r.extra.get("autolayers") or [])
+        if al:
+            r.extra["autolayers"] = [at[x] if 0 <= x < len(at) else x for x in al]
+    return sum(1 for new, old in enumerate(order) if new != old)

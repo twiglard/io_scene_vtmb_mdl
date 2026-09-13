@@ -260,10 +260,17 @@ def sequence_stash(m):
     Blends, pose parameters, autolayers and a knockback's bone are stored as names because
     an index means nothing once the file is re-emitted. Matched back by position, so
     anything that changes how many sequences the file has has to write this again --
-    `apply_sequences` refuses a stash claiming more sequences than are there.
+    `apply_sequences` refuses a stash claiming more sequences than are there, bar the ones
+    the scene has marked as added.
+
+    `src` is the ordinal the record had in this file, and it is the identity a reordered
+    stash is resolved through: position alone cannot say that two entries were swapped
+    rather than that both were edited, and writing one entry's events and knockbacks onto
+    the other's record is refused by `_apply_knockbacks` the moment their counts differ.
     """
     labels = [x.label for x in m.seqs]
-    return [{"label": s.label, "activity": s.activity, "flags": s.flags,
+    return [{"src": s.index,
+             "label": s.label, "activity": s.activity, "flags": s.flags,
              "groupsize": list(s.groupsize),
              "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
                          for i in col] for col in s.blends],

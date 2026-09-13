@@ -1652,6 +1652,367 @@ def _fallback_line(act):
     return mode
 
 
+def _write_stash(arm_obj, stash):
+    """Replace the whole sequence stash. An ID-property list is not mutable in place."""
+    arm_obj["vtmb_sequences"] = [dict(x) for x in stash]
+
+
+def _file_anims(arm_obj):
+    """The animation names the file carries, as a blend cell has to spell them.
+
+    `vtmb_anim_name` and not the action's own name: Blender deduplicates, so two animations
+    called the same thing are `walk` and `walk.001` in the scene, and a cell written under
+    the suffixed name would name an animation the file has not got. The stamp is what the
+    record was called and `_restamp_renamed_anims` carries it forward over a rename.
+    """
+    src = arm_obj.get("vtmb_source")
+    out = []
+    for act in bpy.data.actions:
+        if act.get("vtmb_source") != src or act.get("vtmb_anim_index") is None:
+            continue
+        out.append(str(act.get("vtmb_anim_name") or act.name))
+    return sorted(set(out))
+
+
+def _anim_items(self, context):
+    """The enum behind a blend cell: every animation of the armature's own file."""
+    act = panel_action(context)
+    arm_obj = _action_armature(context, act) if act is not None else None
+    names = _file_anims(arm_obj) if arm_obj is not None else []
+    # `~none` and not "": an enum identifier has to be non-empty, and the same spelling is
+    # what the export dialog's own dropdowns use for "nothing".
+    return [(n, n, "") for n in names] or [("~none", "no animation of this file", "")]
+
+
+def _seq_here(context):
+    """(armature, stash index, the stash) for the panel's action, else (None, None, None)."""
+    act = panel_action(context)
+    if act is None:
+        return None, None, None
+    arm_obj = _action_armature(context, act)
+    if arm_obj is None:
+        return None, None, None
+    k, _seq = _action_seq(arm_obj, act)
+    if k is None:
+        return None, None, None
+    return arm_obj, k, [dict(x) for x in arm_obj.get("vtmb_sequences") or ()]
+
+
+class VTMB_OT_rename_sequence(bpy.types.Operator):
+    bl_idname = "vtmb.rename_sequence"
+    bl_label = "Rename sequence"
+    bl_description = ("Give this action's sequence another label. The name is what the "
+                      "engine looks a sequence up by and what another sequence's "
+                      "auto-layer, dodge and block fields name, so those follow it")
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: bpy.props.StringProperty(name="Label")
+
+    def invoke(self, context, event):
+        _arm, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        self.name = str(stash[k].get("label") or "")
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        name = self.name.strip()
+        if not name:
+            self.report({"ERROR"}, "a sequence label cannot be empty")
+            return {"CANCELLED"}
+        for j, x in enumerate(stash):
+            if j != k and str(x.get("label") or "") == name:
+                self.report({"ERROR"}, "sequence %d is already called %r, and the engine "
+                                       "looks one up by name" % (j, name))
+                return {"CANCELLED"}
+        was = str(stash[k].get("label") or "")
+        stash[k]["label"] = name
+        for x in stash:
+            x["autolayers"] = [name if str(v) == was else str(v)
+                               for v in x.get("autolayers") or ()]
+            for key in ("dodge", "block", "name2e8", "name2ec"):
+                if str(x.get(key) or "") == was:
+                    x[key] = name
+        _write_stash(arm_obj, stash)
+        self.report({"INFO"}, "sequence %d: %s -> %s" % (k, was, name))
+        return {"FINISHED"}
+
+
+class VTMB_OT_add_sequence(bpy.types.Operator):
+    bl_idname = "vtmb.add_sequence"
+    bl_label = "Add sequence"
+    bl_description = ("Append a second sequence playing this action's animation. 0 of the "
+                      "4445 shipped models carry an animation two sequences cite, and the "
+                      "panels here reach the earlier of the two")
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: bpy.props.StringProperty(name="Label")
+
+    def invoke(self, context, event):
+        _arm, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        self.name = "%s_2" % str(stash[k].get("label") or "sequence")
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        name = self.name.strip()
+        if not name or any(str(x.get("label") or "") == name for x in stash):
+            self.report({"ERROR"}, "%r is empty or already a sequence of this file"
+                        % self.name)
+            return {"CANCELLED"}
+        act = panel_action(context)
+        anim = str(act.get("vtmb_anim_name") or act.name)
+        # `new` is the mark `apply_sequences` appends on, and an added sequence has to be
+        # last in the stash because `add_sequence` appends the record.
+        # A tail field left out is one `_apply_seq_tail` skips on a None, so
+        # `add_sequence`'s own template stands.
+        stash.append({"new": 1, "label": name, "activity": "",
+                      "flags": int(act.get("vtmb_seq_flags") or 0),
+                      "groupsize": [1, 1], "blends": [[anim]],
+                      "events": [], "params": [], "autolayers": []})
+        _write_stash(arm_obj, stash)
+        self.report({"INFO"}, "sequence %d appended, %r, blending %s"
+                    % (len(stash) - 1, name, anim))
+        return {"FINISHED"}
+
+
+class VTMB_OT_remove_sequence(bpy.types.Operator):
+    bl_idname = "vtmb.remove_sequence"
+    bl_label = "Remove sequence"
+    bl_description = ("Drop this action's sequence from the file. Its animation stays and "
+                      "nothing will play it -- 0 of the 4445 shipped models carry one no "
+                      "sequence cites")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        gone = stash.pop(k)
+        label = str(gone.get("label") or "")
+        if gone.get("new"):
+            # Never written, so there is nothing for the export to remove.
+            _write_stash(arm_obj, stash)
+            self.report({"INFO"}, "dropped %r, which this scene had added" % label)
+            return {"FINISHED"}
+        tomb = [str(x) for x in arm_obj.get("vtmb_seqs_removed") or ()]
+        arm_obj["vtmb_seqs_removed"] = tomb + [label]
+        for x in stash:
+            x["autolayers"] = [str(v) for v in x.get("autolayers") or ()
+                               if str(v) != label]
+        _write_stash(arm_obj, stash)
+        self.report({"INFO"}, "sequence %d, %r, marked for removal on the next export"
+                    % (k, label))
+        return {"FINISHED"}
+
+
+class VTMB_OT_move_sequence(bpy.types.Operator):
+    bl_idname = "vtmb.move_sequence"
+    bl_label = "Move sequence"
+    bl_description = ("Swap this action's sequence with its neighbour. Order is what an "
+                      "auto-layer resolves to an index, and those follow the move")
+    bl_options = {"REGISTER", "UNDO"}
+
+    up: bpy.props.BoolProperty(default=True)
+
+    def execute(self, context):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        j = k - 1 if self.up else k + 1
+        if not 0 <= j < len(stash):
+            self.report({"ERROR"}, "sequence %d is already %s of %d"
+                        % (k, "first" if self.up else "last", len(stash)))
+            return {"CANCELLED"}
+        if stash[k].get("new") or stash[j].get("new"):
+            self.report({"ERROR"}, "a sequence the scene added is appended by the export, "
+                                   "so it cannot be moved before one the file has")
+            return {"CANCELLED"}
+        stash[k], stash[j] = stash[j], stash[k]
+        _write_stash(arm_obj, stash)
+        self.report({"INFO"}, "sequence %r is now %d of %d"
+                    % (str(stash[j].get("label") or ""), j, len(stash)))
+        return {"FINISHED"}
+
+
+class VTMB_OT_set_blend(bpy.types.Operator):
+    bl_idname = "vtmb.set_blend"
+    bl_label = "Set blend cell"
+    bl_description = ("Name the animation one cell of this sequence's blend grid plays. "
+                      "The file holds an index and the stash a name, because an index "
+                      "means nothing once the file is re-emitted")
+    bl_options = {"REGISTER", "UNDO"}
+
+    x: bpy.props.IntProperty(default=0)
+    y: bpy.props.IntProperty(default=0)
+    anim: bpy.props.EnumProperty(name="Animation", items=_anim_items)
+
+    def invoke(self, context, event):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        cells = [list(c) for c in stash[k].get("blends") or ()]
+        if self.x < len(cells) and self.y < len(cells[self.x]):
+            was = str(cells[self.x][self.y])
+            if was in _file_anims(arm_obj):
+                self.anim = was
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        cells = [[str(v) for v in col] for col in stash[k].get("blends") or ()]
+        if not (0 <= self.x < len(cells) and 0 <= self.y < len(cells[self.x])):
+            self.report({"ERROR"}, "this sequence has no blend cell %d, %d"
+                        % (self.x, self.y))
+            return {"CANCELLED"}
+        if not self.anim or self.anim == "~none":
+            self.report({"ERROR"}, "no animation of this file to name")
+            return {"CANCELLED"}
+        was, cells[self.x][self.y] = cells[self.x][self.y], self.anim
+        stash[k]["blends"] = cells
+        _write_stash(arm_obj, stash)
+        self.report({"INFO"}, "blend %d, %d: %s -> %s"
+                    % (self.x, self.y, was or "(kept)", self.anim))
+        return {"FINISHED"}
+
+
+class VTMB_OT_resize_blends(bpy.types.Operator):
+    bl_idname = "vtmb.resize_blends"
+    bl_label = "Resize blend grid"
+    bl_description = ("How many blends this sequence has along each axis. 13715 of the "
+                      "14012 shipped sequences are 1x1; the grid sits inside the 764-byte "
+                      "record at a 0x20 stride, so 16 by 16 is the most it holds")
+    bl_options = {"REGISTER", "UNDO"}
+
+    gx: bpy.props.IntProperty(name="Blends along X", default=1, min=1, max=16)
+    gy: bpy.props.IntProperty(name="Blends along Y", default=1, min=1, max=16)
+
+    def invoke(self, context, event):
+        _arm, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        cells = [list(c) for c in stash[k].get("blends") or ()]
+        self.gx = max(1, len(cells))
+        self.gy = max(1, max((len(c) for c in cells), default=1))
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm_obj, k, stash = _seq_here(context)
+        if k is None:
+            self.report({"ERROR"}, "no imported sequence names this action")
+            return {"CANCELLED"}
+        cells = [[str(v) for v in col] for col in stash[k].get("blends") or ()]
+        fill = cells[0][0] if cells and cells[0] else ""
+        if not fill:
+            self.report({"ERROR"}, "this sequence's first blend names no animation, so a "
+                                   "new cell has nothing to copy")
+            return {"CANCELLED"}
+        was = sum(min(len(c), self.gy) for c in cells[:self.gx])
+        out = []
+        for x in range(self.gx):
+            col = list(cells[x]) if x < len(cells) else []
+            col = (col + [fill] * self.gy)[:self.gy]
+            out.append([c or fill for c in col])
+        stash[k]["blends"] = out
+        stash[k]["groupsize"] = [self.gx, self.gy]
+        _write_stash(arm_obj, stash)
+        self.report({"INFO"}, "sequence %d blends %d x %d, %d cell(s) filled with %s"
+                    % (k, self.gx, self.gy, self.gx * self.gy - was, fill))
+        return {"FINISHED"}
+
+
+def draw_action_sequence(lay, context, act):
+    """The sequence list itself: which record this action drives, its label, its blend grid
+    and where it sits among the others.
+
+    Every cross-reference in the stash is a NAME -- a blend cell an animation's, an
+    auto-layer and the four tail fields a sequence's -- so a rename, a removal and a move
+    cost the stash nothing but their own entry. The export resolves them and renumbers the
+    autolayer array, which is the one index the record itself keeps.
+    """
+    arm_obj = _action_armature(context, act)
+    if arm_obj is None:
+        lay.label(text="no imported sequence names this action", icon="INFO")
+        return
+    k, seq = _action_seq(arm_obj, act)
+    stash = list(arm_obj.get("vtmb_sequences") or ())
+    anim = str(act.get("vtmb_anim_name") or act.name)
+    also = [j for j, x in enumerate(stash)
+            if j != k and any(str(v) == anim for col in x.get("blends") or ()
+                              for v in col)]
+
+    row = lay.row(align=True)
+    row.label(text="%s  (%d of %d)" % (str(seq.get("label") or ""), k, len(stash)),
+              icon="ACTION")
+    row.operator("vtmb.rename_sequence", text="", icon="GREASEPENCIL")
+    row = lay.row(align=True)
+    row.operator("vtmb.move_sequence", text="Up", icon="TRIA_UP").up = True
+    row.operator("vtmb.move_sequence", text="Down", icon="TRIA_DOWN").up = False
+    row.operator("vtmb.remove_sequence", text="", icon="X")
+    lay.operator("vtmb.add_sequence", icon="ADD")
+    if seq.get("new"):
+        lay.label(text="added here, appended on the next export", icon="INFO")
+    tomb = [str(x) for x in arm_obj.get("vtmb_seqs_removed") or ()]
+    if tomb:
+        lay.label(text="%d removal%s pending: %s"
+                       % (len(tomb), "" if len(tomb) == 1 else "s", ", ".join(tomb[:3])),
+                  icon="TRASH")
+    if also:
+        # `_action_seq` takes the first entry whose first blend names this action, so the
+        # others are reachable from no panel.
+        lay.label(text="%d other sequence%s play%s %s, and this panel does not reach %s"
+                       % (len(also), "" if len(also) == 1 else "s",
+                          "s" if len(also) == 1 else "", anim,
+                          "it" if len(also) == 1 else "them"),
+                  icon="ERROR")
+
+    cells = [[str(v) for v in col] for col in seq.get("blends") or ()]
+    gy = max((len(c) for c in cells), default=0)
+    box = lay.box()
+    row = box.row(align=True)
+    row.label(text="blends %d x %d" % (len(cells), gy))
+    row.operator("vtmb.resize_blends", text="", icon="MOD_ARRAY")
+    for x, col in enumerate(cells):
+        for y, name in enumerate(col):
+            r = box.row(align=True)
+            r.label(text="%d, %d" % (x, y))
+            op = r.operator("vtmb.set_blend", text=name or "(kept)")
+            op.x, op.y = x, y
+
+
+class VTMB_PT_action_sequence(bpy.types.Panel):
+    bl_label = "VTMB sequence"
+    bl_space_type = "DOPESHEET_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "VTMB"
+
+    @classmethod
+    def poll(cls, context):
+        return panel_action(context) is not None
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_action_sequence(self.layout, context, panel_action(context))
+
+
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
@@ -1660,6 +2021,9 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
+           VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,
+           VTMB_OT_move_sequence, VTMB_OT_set_blend, VTMB_OT_resize_blends,
+           VTMB_PT_action_sequence,
            VTMB_PT_action_events, VTMB_PT_action_params, VTMB_PT_action_seqtail,
            VTMB_PT_bone_flags, VTMB_PT_bone]
 

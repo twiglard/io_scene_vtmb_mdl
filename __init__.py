@@ -276,8 +276,9 @@ def _base_path(op, context):
     return (ad.action.get("vtmb_source") if ad and ad.action else None) or ""
 
 
-def _restamp_sequences(obj, written, src, added, dropped_seqs):
-    """Write `vtmb_sequences` again when the export moved how many sequences the file has.
+def _restamp_sequences(obj, written, src, added, dropped_seqs, seqlist=None):
+    """Write `vtmb_sequences` again when the export moved how many sequences the file has,
+    or which order they are in.
 
     `apply_sequences` matches the stash to the file by position, so an append leaves the
     new sequence in the file and in no panel -- its events, pose parameters and record
@@ -285,11 +286,20 @@ def _restamp_sequences(obj, written, src, added, dropped_seqs):
     stash claiming more than are there, which every later export refuses outright.
     `sequence_stash` states the rule and this is the whole of it.
 
+    It also answers the marks the scene put on the list: a fresh stash carries no `new` on
+    any entry and the tombstone list goes with it, so a second export cannot append or
+    remove the same sequence twice.
+
     Only when the file just written is the one the stash describes: the stash belongs to
-    the armature's own model, and an export to another path leaves that model alone.
+    the armature's own model, and an export to another path leaves that model alone --
+    which is why the marks survive a save-as, where the next export to that path has the
+    donor's own list to apply them to again.
+
     Returns how many sequences moved, and 0 when nothing was written.
     """
-    moved = len(dropped_seqs) + len(added)
+    sl = seqlist or {}
+    moved = (len(dropped_seqs) + len(added) + len(sl.get("added") or ())
+             + len(sl.get("removed") or ()) + int(sl.get("reordered") or 0))
     if not moved or not blender_export.same_file(written, src):
         return 0
     obj["vtmb_sequences"] = blender_import.sequence_stash(mdl.Mdl(written))
@@ -1443,20 +1453,57 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "now faces across the travel direction the movement "
                                      "blocks still state" % ", ".join(root))
         gone = r["dropped"]
-        moved = len(r["added"]) + len(gone["seqs"])
+        sl = r["scene"].get("seqlist") or {}
+        listed = (len(sl.get("added") or ()) + len(sl.get("removed") or ())
+                  + int(sl.get("reordered") or 0))
+        moved = len(r["added"]) + len(gone["seqs"]) + listed
         stamped = _restamp_sequences(obj, self.filepath, src, r["added"],
-                                     gone["seqs"])
+                                     gone["seqs"], sl)
+        if sl.get("removed"):
+            self.report({"INFO"}, "removed %d sequence%s: %s"
+                        % (len(sl["removed"]), "" if len(sl["removed"]) == 1 else "s",
+                           ", ".join(sl["removed"])))
+        if sl.get("added"):
+            self.report({"INFO"}, "appended %d sequence%s: %s"
+                        % (len(sl["added"]), "" if len(sl["added"]) == 1 else "s",
+                           ", ".join(sl["added"])))
+        if sl.get("reordered"):
+            self.report({"INFO"}, "%d sequence%s in another position, and every auto-layer "
+                                  "index with them"
+                        % (sl["reordered"], "" if sl["reordered"] == 1 else "s"))
+        if sl.get("missing"):
+            self.report({"WARNING"}, "%s has no sequence called %s, so the removal this "
+                                     "scene is holding had nothing to answer"
+                        % (os.path.basename(src), ", ".join(sl["missing"])))
+        if sl.get("orphans"):
+            self.report({"WARNING"}, "%d animation%s no sequence plays now: %s. The engine "
+                                     "reaches an animation only through a sequence, and 0 "
+                                     "of the 4445 shipped models carry one"
+                        % (len(sl["orphans"]),
+                           "" if len(sl["orphans"]) == 1 else "s",
+                           ", ".join(sl["orphans"][:4])))
+        if sl.get("autolayers_lost"):
+            self.report({"WARNING"}, "auto-layer entries dropped with it: %s"
+                        % ", ".join("%s lost %d" % (n, c)
+                                    for n, c in sl["autolayers_lost"][:4]))
+        if sl.get("dangling"):
+            self.report({"WARNING"}, "%s still names the removed sequence, and the engine "
+                                     "resolves that at load time to nothing"
+                        % ", ".join("%s at %s" % (n, f) for n, f in sl["dangling"][:4]))
+        if sl.get("twice"):
+            self.report({"WARNING"}, "%d animation%s played by more than one sequence: %s. "
+                                     "0 of the 4445 shipped models carry one, and the "
+                                     "panels reach the earlier sequence of each"
+                        % (len(sl["twice"]), "" if len(sl["twice"]) == 1 else "s",
+                           ", ".join(sl["twice"][:4])))
         if moved and not stamped:
             # The stash describes the armature's own model, which this export left alone,
             # so what it moved is reachable only by importing what it wrote.
             self.report({"WARNING"},
-                        "%d sequence%s %s %s, and this armature's sequence list describes "
+                        "%d sequence%s moved and this armature's sequence list describes "
                         "%s, which is what the export read. Import the written file to "
                         "edit the sequences it holds"
-                        % (moved, "" if moved == 1 else "s",
-                           "appended to" if not gone["seqs"] else
-                           "removed from" if not r["added"] else "moved in",
-                           os.path.basename(self.filepath), os.path.basename(src)))
+                        % (moved, "" if moved == 1 else "s", os.path.basename(src)))
         if gone["anim"]:
             self.report({"WARNING"}, "removed animation %s%s. Its action is still in the "
                                      "blend and will be offered as an append"

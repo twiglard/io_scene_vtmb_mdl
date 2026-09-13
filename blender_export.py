@@ -2399,15 +2399,87 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     A blend cell the stash holds as `""` is one whose index named no animation of the file
     -- 8 of the 14012 shipped sequences, over 4 models -- so there is no name to resolve
     and the word the file already carries stands, the rule a knockback record on a deleted
-    bone follows. Returns (what moved, those cells).
+    bone follows.
+
+    The list itself is the scene's as well. `vtmb_seqs_removed` names the labels a removal
+    tombstoned, `src` on an entry is the file ordinal it came from and is what a reorder is
+    resolved through, and a trailing entry marked `new` is one the scene authored, which
+    `add_sequence` appends. All three are positive marks rather than absences, the
+    spring-chain rule: a stash with no `src` on it is an older `.blend` and is matched by
+    position exactly as it was, and one shorter than the file with nothing tombstoned still
+    leaves the trailing records alone.
+
+    Returns (what moved, those cells, what the list edits did).
     """
-    stash = arm_obj.get("vtmb_sequences")
-    if not stash:
-        return 0
-    if len(stash) > len(d.seqs):
-        raise ValueError("the armature carries %d sequences and the file has %d"
-                         % (len(stash), len(d.seqs)))
+    stash = list(arm_obj.get("vtmb_sequences") or ())
+    moves = {"added": [], "removed": [], "reordered": 0, "orphans": [],
+             "autolayers_lost": [], "dangling": [], "missing": [], "twice": []}
     index = {n: k for k, n in enumerate(anim_names)}
+    n = 0
+
+    # Resolved to the record OBJECT before anything is dropped: a removal renumbers every
+    # later ordinal, and a `src` names the file as the import read it.
+    byord = list(d.seqs)
+    for label in [str(x) for x in (arm_obj.get("vtmb_seqs_removed") or ())]:
+        at = [k for k, r in enumerate(d.seqs) if (r.name or "") == label]
+        if not at:
+            # The donor no longer has it, so the tombstone has nothing to answer. Reported
+            # rather than refused: an export to another path leaves the mark standing, and
+            # the next export to that path removes the sequence off the donor again.
+            moves["missing"].append(label)
+            continue
+        was, lost, orphans, naming = build_mod.remove_sequence(d, at[0])
+        moves["removed"].append(was)
+        moves["autolayers_lost"] += lost
+        moves["dangling"] += naming
+        moves["orphans"] = orphans
+        n += 1
+
+    fresh = 0
+    while fresh < len(stash) and stash[len(stash) - 1 - fresh].get("new"):
+        fresh += 1
+    head = stash[:len(stash) - fresh]
+    for k, x in enumerate(head):
+        if x.get("new"):
+            raise ValueError("the armature's sequence %d of %d is one the scene added, and "
+                             "an added sequence is appended, so it has to be the last"
+                             % (k, len(stash)))
+    if len(head) > len(d.seqs):
+        raise ValueError("the armature carries %d sequence%s the file is supposed to already "
+                         "have, %d of them marked as added, and the file has %d"
+                         % (len(head), "" if len(head) == 1 else "s", fresh, len(d.seqs)))
+
+    live = {id(r): k for k, r in enumerate(d.seqs)}
+    want, keyed = [], bool(head)
+    for x in head:
+        src = x.get("src")
+        at = (live.get(id(byord[int(src)]))
+              if src is not None and 0 <= int(src) < len(byord) else None)
+        if at is None:
+            keyed = False
+            break
+        want.append(at)
+    if keyed and len(set(want)) == len(want):
+        order = want + [k for k in range(len(d.seqs)) if k not in set(want)]
+        if order != list(range(len(d.seqs))):
+            moves["reordered"] = build_mod.reorder_sequences(d, order)
+            n += moves["reordered"]
+
+    for x in stash[len(head):]:
+        cells = [list(col) for col in x.get("blends") or ()]
+        first = str(cells[0][0]) if cells and cells[0] else ""
+        if first not in index:
+            raise ValueError("the sequence the scene added blends animation %r, which the "
+                             "file does not have" % first)
+        build_mod.add_sequence(d, str(x.get("label") or first), index[first],
+                               x.get("activity"), int(x.get("flags") or 0))
+        moves["added"].append(str(x.get("label") or first))
+        n += 1
+
+    if not stash:
+        # Nothing to match, and the two-value early return this used to take made every
+        # caller unpack an int -- BUGS 136.
+        return n, [], moves
     pp = [r.name or "" for r in getattr(d, "poseparams", [])]
     # Taken from the STASH, not from the file: a scene that renamed a sequence has to be
     # able to name it in another sequence's autolayer list under the new name.
@@ -2417,7 +2489,7 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     for k, rec in enumerate(d.seqs):
         labels.setdefault(rec.name or "", k)
     bones = knockback_bones(d, m)
-    n, out_of_range = 0, []
+    out_of_range = []
     for rec, s in zip(d.seqs, stash):
         label = s.get("label")
         if label and rec.name != label:
@@ -2463,7 +2535,16 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     # the action, and the stash has just rewritten it.
     for k, act in _first_citers(d, actions).items():
         n += _apply_seq_action(d.seqs[k], act)
-    return n, out_of_range
+    # Last, off the grid the stash has just written. 0 of the 4445 shipped models carry an
+    # animation two sequences cite, so an added sequence naming one another already plays
+    # makes the first of them, and `_action_seq` reaches only the earlier of the two.
+    cited = {}
+    for rec in d.seqs:
+        for a in set(build_mod._seq_anims(rec.raw)):
+            cited[a] = cited.get(a, 0) + 1
+    moves["twice"] = [anim_names[a] if 0 <= a < len(anim_names) else "animation %d" % a
+                      for a, c in sorted(cited.items()) if c > 1]
+    return n, out_of_range, moves
 
 
 def _first_citers(d, actions):
@@ -2996,12 +3077,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0,
              "spring_ends": 0, "spring_switched": 0, "spring_unclaimed": [],
+             "spring_added": [], "spring_removed": [], "spring_stamps": {},
+             "spring_gone": [], "spring_over_mask": 0,
              "stale": 0,
              "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
              "slots_moved": 0, "slots_gone": [],
              "renamed_anims": [], "unstamped_renames": [],
+             "seqlist": {},
              "dup_models": dup_models, "dup_bones": dup_bones,
              "blind_bones": []}
     poses = read_bones(m, arm_obj, scale, scene["blind_bones"])
@@ -3037,8 +3121,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.add_material(d, name, None)
         have.add(name)
         scene["added_materials"].append(name)
-    (scene["springs"], scene["spring_ends"], scene["spring_switched"],
-     scene["spring_unclaimed"]) = apply_springbones(d, m, arm_obj)
+    sp = apply_springbones(d, m, arm_obj)
+    scene["springs"] = sp["changed"]
+    for key in ("ends", "switched", "unclaimed", "added", "removed", "stamps",
+                "gone", "over_mask"):
+        scene["spring_" + key] = sp[key]
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)
@@ -3053,7 +3140,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # renumbers the list.
     renames, scene["unstamped_renames"] = renamed_anims(anim_names, source, arm_obj)
     pending_renames = [(d.anims[i], anim_names[i], n) for i, n in sorted(renames.items())]
-    scene["sequences"], scene["blends_out_of_range"] = apply_sequences(
+    scene["sequences"], scene["blends_out_of_range"], scene["seqlist"] = apply_sequences(
         d, m, arm_obj, anim_names,
         sequence_actions(anim_names, source, arm_obj, actions))
 
