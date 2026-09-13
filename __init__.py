@@ -68,15 +68,19 @@ def _mode_tally(actions):
             for k in blender_export.ROOT_MOTION_MODES if k in got]
 
 
-def _write_vmts(context, arm_obj, dest, names, enabled):
+def _write_vmts(context, dirs, dest, names, enabled):
     """The `.vmt` for each material the export just added, and what to say about it.
 
-    The directory is the first the armature carries, because a name resolves against the
-    whole list as a cross product and the first is the only one a writer can pick without
-    guessing. With no directory at all there is nowhere to put the file and the operator
-    says so instead of inventing `models/`.
+    The directory is the first of `dirs`, because a name resolves against the whole list
+    as a cross product and the first is the only one a writer can pick without guessing.
+    With no directory at all there is nowhere to put the file and the operator says so
+    instead of inventing `models/`.
+
+    `dirs` is passed rather than read off the armature because the two export paths
+    disagree about where it comes from: a donor carries its own list and the import stamps
+    it, while the no-donor dialog writes whatever its Material dirs field says into the
+    file, which is the list the `.vmt` has to sit under.
     """
-    dirs = blender_scratch.scene_cdtextures(arm_obj)
     where = os.path.join(paths.content_root(dest) or os.path.dirname(dest),
                          paths.MATERIALS_DIR)
     rel = [os.path.join(dirs[0] if dirs else "", n + ".vmt") for n in names]
@@ -155,14 +159,13 @@ def _image_rgba(img):
         return None
 
 
-def _write_tths(context, arm_obj, dest, names, enabled, fmt="auto"):
+def _write_tths(context, dirs, dest, names, enabled, fmt="auto"):
     """The `.tth`/`.ttz` pair for each material the export just added.
 
     Same directory and same stem as the `.vmt` beside it, because that file's
     `$basetexture` names exactly this path and nothing else in the `.mdl` says where an
     image is. The pixels come from the material's own Image Texture node.
     """
-    dirs = blender_scratch.scene_cdtextures(arm_obj)
     if not dirs:
         return ""
     where = os.path.join(paths.content_root(dest) or os.path.dirname(dest),
@@ -1713,9 +1716,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                       % (len(scene["added_materials"]),
                          "" if len(scene["added_materials"]) == 1 else "s",
                          ", ".join(scene["added_materials"])))
-            extra += _write_vmts(context, obj, self.filepath,
+            dirs = blender_scratch.scene_cdtextures(obj)
+            extra += _write_vmts(context, dirs, self.filepath,
                                  scene["added_materials"], self.write_vmt)
-            extra += _write_tths(context, obj, self.filepath,
+            extra += _write_tths(context, dirs, self.filepath,
                                  scene["added_materials"], self.write_tth,
                                  self.tth_format)
         if scene.get("slots_moved"):
@@ -1842,6 +1846,37 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     "separated by ;, because nothing binds a directory to a particular "
                     "material and 615 of the 4445 shipped models need more than one. An "
                     "import fills this in from the file it read")
+    write_vmt: bpy.props.BoolProperty(
+        name="Write .vmt for every material", default=False,
+        description="Also write a materials/<dir>/<name>.vmt beside the model for each "
+                    "material this export writes. Every material here is one the export "
+                    "added -- there is no donor to have carried a texture record -- so "
+                    "without this the model resolves nothing and draws as the purple "
+                    "checkerboard. The .mdl carries only a name and the directory list "
+                    "above, so nothing else says which image a material means. An "
+                    "existing .vmt is never overwritten")
+    write_tth: bpy.props.BoolProperty(
+        name="Write .tth/.ttz for every material", default=False,
+        description="The image on each material's Image Texture node, written as the "
+                    ".tth/.ttz pair the .vmt's $basetexture names. A full mip chain, in "
+                    "whichever format the box below names. A material with no Image "
+                    "Texture, or with several and none of them feeding Base Color, is "
+                    "named in the report and skipped. Neither half of an existing pair "
+                    "is overwritten. Nothing looks for the image at all unless a .vmt is "
+                    "there too")
+    tth_format: bpy.props.EnumProperty(
+        name="Texture format", default="auto",
+        items=[("auto", "Automatic",
+                "DXT5 where the image uses alpha at all, DXT1 where it does not"),
+               ("dxt1", "DXT1", "0.5 bytes a texel and no alpha"),
+               ("dxt5", "DXT5", "1 byte a texel, alpha to about 1/16 of a step"),
+               ("bgra", "BGRA8888 (uncompressed)",
+                "4 bytes a texel and no compression loss -- 16 of the 83 shipped normal "
+                "maps carry it")],
+        description="What format the .tth/.ttz pair stores. The corpus is DXT5 x51, "
+                    "BGRA8888 x16, DXT1 x13 and BGR888 x3 over the 83 normal maps that "
+                    "decode, so compressed is the shipped norm and uncompressed is 4x to "
+                    "8x the size")
     activity: bpy.props.StringProperty(
         name="Activity", default="ACT_IDLE",
         description="The activity every sequence claims. An action carrying its own "
@@ -1937,6 +1972,11 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 _pair(box, "the imported model said", ";".join(stamped[:2])
                       + (" and %d more" % (len(stamped) - 2) if len(stamped) > 2 else ""),
                       icon="ERROR")
+            box.prop(self, "write_vmt")
+            box.prop(self, "write_tth")
+            row = box.row()
+            row.enabled = self.write_tth
+            row.prop(self, "tth_format")
 
         box = _section(lay, "vtmb_s_geom", "Geometry", icon="MESH_DATA")
         if box is not None:
@@ -2091,6 +2131,18 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         for kind, bad in sorted(unresolved.items()):
             self.report({"WARNING"}, "%d %s resolve against nothing and will not draw: %s"
                         % (len(bad), kind, ", ".join(bad[:4])))
+        mats = r.get("material_names") or []
+        if mats:
+            dirs = paths.cdtexture_list(self.cdtexture)
+            said = _write_vmts(context, dirs, self.filepath, mats, self.write_vmt)
+            said += _write_tths(context, dirs, self.filepath, mats, self.write_tth,
+                                self.tth_format)
+            if said:
+                self.report({"INFO"}, "%d material%s: %s%s%s"
+                            % (len(mats), "" if len(mats) == 1 else "s",
+                               ", ".join(mats[:3]),
+                               "" if len(mats) <= 3 else " and %d more" % (len(mats) - 3),
+                               said))
         self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
                               "%d materials, %d animations (%d with root motion), "
                               "%d sequences, %d chained, %d hitboxes, %d faces, "

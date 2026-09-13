@@ -1009,6 +1009,11 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "with_root_motion": moved, "unfitted": unfitted,
             "unkeepable": unkeepable,
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),
+            # Every material here is one this export added -- there is no donor to have
+            # carried a texture record -- so the caller writing .vmt files needs the names
+            # and not only the count, and taking them off d.textures is what stops the
+            # list drifting from what add_material actually put in the file.
+            "material_names": [r.name for r in d.textures],
             "anims": len(d.anims), "seqs": len(d.seqs),
             "includes": len(d.includes),
             "springs": len(d.springbones),
