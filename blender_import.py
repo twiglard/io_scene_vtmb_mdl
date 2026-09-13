@@ -675,7 +675,10 @@ def build_accessories(context, m, arm_obj, name, scale):
             bone = dbs.get(m.bones[x.bone].name)
             if bone is None:
                 continue
-            obj = bpy.data.objects.new("%s.box%d" % (root.name, x.index), None)
+            # Named after its hit group so the viewport says which body part it is; the
+            # name is a hint and `vtmb_hitbox_group` is the value, nothing parsing either.
+            obj = bpy.data.objects.new(
+                "%s.%s%d" % (root.name, mdl_mod.hitgroup_name(x.group), x.index), None)
             obj.empty_display_type = "CUBE"
             obj.empty_display_size = 1.0
             coll.objects.link(obj)

@@ -42,6 +42,22 @@ HDR_NUMMOUTHS = 376
 # other stride parses the corpus. The 24 trailing -1s are the pose-parameter remap.
 INCLUDE_STRIDE = 116
 
+# `mstudiobbox_t.group` is Source's hit group, and these are its only names:
+# `HITGROUP_*` in source-2003 `dlls/basecombatcharacter.h:36-44` and source-2013
+# `game/shared/shareddefs.h:376-384`, identical in both trees.  Corpus over 14151 boxes:
+# 0 x5567, 1 x990, 2 x995, 3 x517, 4 x1566, 5 x1583, 6 x1455, 7 x1456, and 8 and 9 x11
+# each on `mingxiao.mdl` alone -- neither tree names those two, so they read as their
+# number.  10, GEAR, is 0 of 14151.  The field reaches the engine as `trace_t + 0x44`,
+# written by `SweepBoxToStudio` client.dll 0x1008b8a0.
+HITGROUPS = {0: "generic", 1: "head", 2: "chest", 3: "stomach",
+             4: "leftarm", 5: "rightarm", 6: "leftleg", 7: "rightleg", 10: "gear"}
+
+
+def hitgroup_name(g):
+    """The Source name for a hit group, or its bare number where neither tree has one."""
+    return HITGROUPS.get(int(g), str(int(g)))
+
+
 FLEXCTRL_STRIDE = 20
 FLEXRULE_STRIDE = 12
 FLEXOP_STRIDE = 8

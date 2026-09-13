@@ -494,8 +494,17 @@ class VTMB_OT_add_hitbox(bpy.types.Operator):
                       "Source hit group and nothing in the file derives it")
     bl_options = {"REGISTER", "UNDO"}
 
-    group: bpy.props.IntProperty(name="Group", default=0, min=0)
+    # An enum over the eight groups both reference trees name and the corpus uses. 8 and 9
+    # ship on `mingxiao.mdl` alone and have no name anywhere, so they are reachable by
+    # typing the number into the box's own panel and not from here.
+    group: bpy.props.EnumProperty(
+        name="Group", default="0",
+        items=[(str(g), "%d -- %s" % (g, mdl_mod.hitgroup_name(g)), "") for g in range(8)])
     set_index: bpy.props.IntProperty(name="Set", default=0, min=0)
+    set_name: bpy.props.StringProperty(
+        name="Set name", default="default",
+        description="Only used where the set does not exist yet. 4444 of the 4445 shipped "
+                    "models call theirs 'default'; mingxiao.mdl is the one with seven")
 
     @classmethod
     def poll(cls, context):
@@ -507,13 +516,15 @@ class VTMB_OT_add_hitbox(bpy.types.Operator):
         arm_obj, bone = context.object, context.active_bone
         _attach, boxes, names = accessories_of(arm_obj)
         if self.set_index not in names:
-            root = bpy.data.objects.new("%s.default" % arm_obj.name, None)
+            root = bpy.data.objects.new("%s.%s" % (arm_obj.name, self.set_name), None)
             root.empty_display_type = "PLAIN_AXES"
             _link_beside(arm_obj, root)
             root.parent = arm_obj
-            root["vtmb_hitboxset"] = "default"
+            root["vtmb_hitboxset"] = self.set_name
             root["vtmb_hitboxset_index"] = self.set_index
-        obj = bpy.data.objects.new("%s.box" % arm_obj.name, None)
+        group = int(self.group)
+        obj = bpy.data.objects.new(
+            "%s.%s" % (arm_obj.name, mdl_mod.hitgroup_name(group)), None)
         obj.empty_display_type = "CUBE"
         obj.empty_display_size = 1.0
         _link_beside(arm_obj, obj)
@@ -524,7 +535,7 @@ class VTMB_OT_add_hitbox(bpy.types.Operator):
         # Half the bone's own length, so a new box is visible without being the whole model.
         h = max(bone.length, 1e-4) * 0.5
         obj.matrix_basis = mathutils.Matrix.Diagonal((h, h, h, 1.0))
-        obj["vtmb_hitbox_group"] = self.group
+        obj["vtmb_hitbox_group"] = group
         obj["vtmb_hitboxset_index"] = self.set_index
         return {"FINISHED"}
 
@@ -548,10 +559,15 @@ def draw_accessories(lay, context, arm_obj):
     for obj in attach:
         lay.label(text="%s on %s" % (obj.get("vtmb_attachment") or obj.name,
                                      obj.parent_bone or "no bone"), icon="EMPTY_ARROWS")
-    for k in sorted(boxes):
-        lay.label(text="%s: %d box%s" % (names.get(k, "default"), len(boxes[k]),
-                                         "" if len(boxes[k]) == 1 else "es"),
+    for k in sorted(set(boxes) | set(names)):
+        kids = boxes.get(k, ())
+        lay.label(text="%s: %d box%s" % (names.get(k, "default"), len(kids),
+                                         "" if len(kids) == 1 else "es"),
                   icon="MESH_CUBE")
+        for obj in kids:
+            lay.label(text="    %s on %s"
+                      % (mdl_mod.hitgroup_name(obj.get("vtmb_hitbox_group") or 0),
+                         obj.parent_bone or "no bone"))
 
 
 def draw_face(lay, context, arm_obj):
@@ -629,12 +645,15 @@ def draw_hitbox(lay, obj):
 
     `vtmb_hitbox_group` is what `accessory_objects` classifies an empty as a box by, so the
     poll below and the exporter agree by construction and the key must not be removed.
-    The group's meaning is the corpus convention `blender_scratch._hitgroup_of` derives --
-    nothing in the format says it, and `mingxiao.mdl` ships 8 and 9, so it is not capped
-    at 7.
+    The group's meaning is Source's, `mdl.HITGROUPS` off both reference trees, and the
+    name is drawn beside the number so the field says which body part it is.  Nothing in
+    the format caps it: `mingxiao.mdl` ships 8 and 9, which neither tree names, so those
+    read back as their number.
     """
     lay.label(text="bone: %s" % (obj.parent_bone or "no bone"), icon="BONE_DATA")
-    lay.prop(obj, '["vtmb_hitbox_group"]', text="Hit group")
+    row = lay.row(align=True)
+    row.prop(obj, '["vtmb_hitbox_group"]', text="Hit group")
+    row.label(text=mdl_mod.hitgroup_name(obj.get("vtmb_hitbox_group") or 0))
     # Both creation paths stamp the ordinal -- the importer at blender_import.py:674 and the
     # add operator at :528 -- but `lay.prop` on an absent key raises inside draw(), and
     # `accessory_objects` reads it with a `or 0` default, so a box without one is legal.
@@ -652,8 +671,10 @@ def draw_hitbox(lay, obj):
                 name = str(sib["vtmb_hitboxset"])
                 break
     lay.label(text="set %d: %s" % (k, name or "default, unnamed"), icon="MESH_CUBE")
-    lay.label(text="1 head, 2 chest, 3 stomach, 4/5 arms, 6/7 legs, 0 generic -- a corpus "
-                   "convention, not a rule the format carries", icon="INFO")
+    lay.label(text="%s -- Source's own HITGROUP names, which the corpus agrees with; "
+                   "nothing in this format says so" % ", ".join(
+                       "%d %s" % (g, mdl_mod.HITGROUPS[g]) for g in range(8)),
+              icon="INFO")
 
 
 class VTMB_PT_hitbox(bpy.types.Panel):
@@ -1575,6 +1596,96 @@ SPRING_FIELDS = (
 )
 
 
+def spring_unk08_line(pb):
+    """What the panel says about record `+0x08`, or None where the bone carries no chain.
+
+    Drawn and not edited, and the reason is a measurement rather than caution: no code in
+    any of the four modules reads it. `ref/2531/studio-verified.h` carries the sweep --
+    24 341 candidate `[reg+0x8]` sites narrowed to ten by requiring a `+0x18c` operand and
+    a 0x1c stride nearby, all ten refuted by hand, and a disp32 scan over every other PE in
+    the install finding no walker either. The corpus writes 60.0 on 539 of its 600 records,
+    9.0 on 41 and 30.0 on 20.
+
+    The word is *carried* and never *refused*: `apply_springbones` retunes all five of
+    `blender_export.SPRING_KEYS`, so a value set by hand or by a script does reach the file.
+    """
+    val = pb.get("vtmb_spring_unk08")
+    if val is None:
+        return None
+    return ("unk08 %g, carried unchanged -- nothing in the game reads record +0x08"
+            % float(val))
+
+
+# Every key a chain puts on its pose bone. `vtmb_spring_index` is the ordinal the import
+# stamped and `vtmb_spring_new` is what this panel writes for a chain the scene authored;
+# `vtmb_spring_removed` is the tombstone that says drop the record -- deleting the keys
+# cannot, an unclaimed record being carried verbatim.
+SPRING_ALL = ("vtmb_spring_index", "vtmb_spring_new", "vtmb_spring_removed",
+              "vtmb_spring_end",
+              "vtmb_spring_disabled") + tuple(k for _a, k, _f in blender_export.SPRING_KEYS)
+
+
+def _has_chain(pb):
+    return (pb.get("vtmb_spring_index") is not None
+            or pb.get("vtmb_spring_gravity") is not None)
+
+
+class VTMB_OT_add_spring_bone(bpy.types.Operator):
+    bl_idname = "vtmb.add_spring_bone"
+    bl_label = "Add spring bone chain"
+    bl_description = ("Author a spring bone chain starting at this bone. It runs "
+                      "first-child to the leaf, and the five fields start at the most "
+                      "common value the shipped models carry for each. The export appends "
+                      "the record; the no-donor path writes it too")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        pb = _spring_bone(context)
+        return pb is not None and not _has_chain(pb)
+
+    def execute(self, context):
+        pb = _spring_bone(context)
+        for key, value in blender_export.spring_defaults().items():
+            pb[key] = value
+        pb["vtmb_spring_end"] = ""
+        pb["vtmb_spring_disabled"] = False
+        pb["vtmb_spring_new"] = True
+        self.report({"INFO"}, "spring bone chain authored on %r, and appended to the file "
+                              "by the next export" % pb.name)
+        return {"FINISHED"}
+
+
+class VTMB_OT_remove_spring_bone(bpy.types.Operator):
+    bl_idname = "vtmb.remove_spring_bone"
+    bl_label = "Remove spring bone chain"
+    bl_description = ("Drop this chain. One the file carries is marked here and removed by "
+                      "the next export, which renumbers every later chain; one this scene "
+                      "authored and has not written yet is taken off the bone outright")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        pb = _spring_bone(context)
+        return (pb is not None and _has_chain(pb)
+                and pb.get("vtmb_spring_removed") is None)
+
+    def execute(self, context):
+        pb = _spring_bone(context)
+        if pb.get("vtmb_spring_index") is None:
+            # Nothing in the file answers to this one, so there is no record to tombstone.
+            for key in SPRING_ALL:
+                if key in pb:
+                    del pb[key]
+            self.report({"INFO"}, "the chain authored on %r is gone. Nothing was written, "
+                                  "so the file has nothing to drop" % pb.name)
+            return {"FINISHED"}
+        pb["vtmb_spring_removed"] = True
+        self.report({"INFO"}, "chain %d is marked for removal. Untick the box to keep it"
+                    % int(pb["vtmb_spring_index"]))
+        return {"FINISHED"}
+
+
 class VTMB_PT_bone(bpy.types.Panel):
     bl_label = "VTMB spring bone"
     bl_space_type = "PROPERTIES"
@@ -1584,15 +1695,39 @@ class VTMB_PT_bone(bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         pb = _spring_bone(context)
-        return pb is not None and pb.get("vtmb_spring_index") is not None
+        return pb is not None and (_has_chain(pb) or pb.get(FLAGS_ATTR) is not None
+                                   or pb.get("vtmb_bone_name") is not None)
 
     def draw(self, context):
         pb = _spring_bone(context)
         lay = self.layout
         lay.use_property_split = True
 
+        if not _has_chain(pb):
+            col = lay.column(align=True)
+            col.operator(VTMB_OT_add_spring_bone.bl_idname, icon="ADD")
+            col.label(text="no chain starts at this bone", icon="INFO")
+            return
+
         col = lay.column(align=True)
-        col.label(text="chain %d" % int(pb["vtmb_spring_index"]), icon="PHYSICS")
+        k = pb.get("vtmb_spring_index")
+        if k is not None:
+            col.label(text="chain %d" % int(k), icon="PHYSICS")
+        elif pb.get("vtmb_spring_new"):
+            col.label(text="a new chain -- the export appends it", icon="PHYSICS")
+        else:
+            # The fields are here and no record answers to them, which is what deleting the
+            # ordinal leaves. The export carries that record as the file has it.
+            col.label(text="no record claims this bone -- these fields reach no file",
+                      icon="ERROR")
+        rm = pb.get("vtmb_spring_removed")
+        if rm is None:
+            col.operator(VTMB_OT_remove_spring_bone.bl_idname, icon="X")
+        else:
+            col.prop(pb, '["vtmb_spring_removed"]', text="Remove on export")
+            if rm:
+                col.label(text="dropped on export, and every later chain renumbers, so "
+                               "the ordinals here move with it", icon="ERROR")
         if pb.get("vtmb_spring_end") is None:
             # Absent is a third state and prop_search cannot draw a key that is not there:
             # the export carries the file's own end bone rather than repointing the chain,
@@ -1619,6 +1754,9 @@ class VTMB_PT_bone(bpy.types.Panel):
         for key, name, _desc in SPRING_FIELDS:
             if pb.get(key) is not None:
                 col.prop(pb, '["%s"]' % key, text=name)
+        line = spring_unk08_line(pb)
+        if line is not None:
+            col.label(text=line)
 
         col = lay.column(align=True)
         col.label(text="bc_override 1 retunes these live, without a re-export", icon="INFO")
@@ -2019,6 +2157,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_set_skin_family, VTMB_PT_skin_families,
            VTMB_PT_cloth,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
+           VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,

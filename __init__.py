@@ -303,6 +303,40 @@ def _restamp_sequences(obj, written, src, added, dropped_seqs, seqlist=None):
     if not moved or not blender_export.same_file(written, src):
         return 0
     obj["vtmb_sequences"] = blender_import.sequence_stash(mdl.Mdl(written))
+    if "vtmb_seqs_removed" in obj:
+        del obj["vtmb_seqs_removed"]
+    return moved
+
+
+def _restamp_springbones(obj, written, src, scene):
+    """Write each surviving chain's `vtmb_spring_index` again when the export moved how
+    many spring bone chains the file has.
+
+    A removal renumbers every later chain and an addition gives the new one an ordinal it
+    never had, so a second export off the stamps this one read would retune -- or drop --
+    the wrong record. The tombstone and the authored-chain marker go with them: both have
+    been answered and a second export must not answer them twice.
+
+    Only when the file just written is the one the scene reads, for the reason
+    `_restamp_sequences` states: the stamps belong to the armature's own model and an export
+    to another path leaves that model alone. Returns how many chains moved, 0 when nothing
+    was written.
+    """
+    moved = len(scene.get("spring_added") or ()) + len(scene.get("spring_removed") or ())
+    if not moved or not blender_export.same_file(written, src):
+        return 0
+    for name, k in (scene.get("spring_stamps") or {}).items():
+        pb = obj.pose.bones.get(name)
+        if pb is None:
+            continue
+        pb["vtmb_spring_index"] = k
+        if "vtmb_spring_new" in pb:
+            del pb["vtmb_spring_new"]
+    for name in scene.get("spring_gone") or ():
+        pb = obj.pose.bones.get(name)
+        for key in (blender_panel.SPRING_ALL if pb is not None else ()):
+            if key in pb:
+                del pb[key]
     return moved
 
 
@@ -1592,6 +1626,32 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            "them" if len(un) > 1 else "it",
                            "their" if len(un) > 1 else "its",
                            "them" if len(un) > 1 else "it"))
+        spring_added = scene.get("spring_added") or []
+        spring_removed = scene.get("spring_removed") or []
+        if spring_added or spring_removed:
+            what = ", ".join(["appended chain %d on %r" % (k, n) for k, n in spring_added]
+                             + ["dropped chain %d, which started at %r" % (k, n)
+                                for k, n in spring_removed])
+            self.report({"INFO"}, "spring bone chains: %s" % what)
+            if not _restamp_springbones(obj, self.filepath, src, scene):
+                # The stamps describe the armature's own model, which this export left
+                # alone, so the ordinals here still name that file's records.
+                self.report({"WARNING"},
+                            "the chain ordinals on this armature describe %s, which is "
+                            "what the export read, not the %s it wrote. Import the written "
+                            "file to edit the chains it holds"
+                            % (os.path.basename(src), os.path.basename(self.filepath)))
+        if scene.get("spring_over_mask"):
+            # SetModel ORs 1 << ordinal into a 32-bit mask with a shl %cl, which masks the
+            # count to 5 bits, so chain 32 shares chain 0's bit.
+            self.report({"WARNING"},
+                        "%d spring bone chain%s sit%s at ordinal %d or past it, where the "
+                        "game's 32-bit disable mask has no bit of its own -- the chain "
+                        "works, and nothing can switch it off"
+                        % (scene["spring_over_mask"],
+                           "" if scene["spring_over_mask"] == 1 else "s",
+                           "s" if scene["spring_over_mask"] == 1 else "",
+                           mdl_build.SPRING_MASK_BITS))
         sb = scene.get("blends_out_of_range") or []
         if sb:
             self.report({"WARNING"},
@@ -1655,11 +1715,12 @@ SCRATCH_DROPS = (
     "collision and ragdoll -- both live in the sibling .phy, not written",
     "flex descs, controllers, rules and every vertanim",
     "eyeballs, mouths and pose parameters",
-    "spring bones, procedural bones, IK chains and bone controllers",
+    ("procedural bones, IK chains and bone controllers -- a spring bone chain "
+     "authored on a bone IS written"),
     "sequence events and autolayers",
     "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
-    "hitbox sets and boxes placed in the scene -- Fit hitboxes refits one set off the "
-    "skin, and with it off none is written at all",
+    ("which hitbox set the engine selects at runtime -- the boxes and the sets "
+     "themselves ARE written, whatever Fit hitboxes says"),
 )
 
 
@@ -1801,7 +1862,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
     fit_hitboxes: bpy.props.BoolProperty(
         name="Fit hitboxes to the skin", default=True,
         description="Give every bone that owns geometry a hitbox enclosing it, so the "
-                    "model can be shot. Off writes no hitbox set at all and the engine "
+                    "model can be shot. Ignored where the scene carries box empties of "
+                    "its own, which are written either way. Off writes no hitbox set "
+                    "at all and the engine "
                     "falls back to the movement hull, which is one box for the whole "
                     "body. The hit group each box reports is a guess off the bone name "
                     "unless the pose bone carries a vtmb_hitgroup")
@@ -1855,8 +1918,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                                   "" if len(meshes) == 1 else "s"),
                   icon="NONE" if meshes else "ERROR")
             if not meshes:
-                box.label(text="a skeleton with no mesh is written and draws nothing",
-                          icon="INFO")
+                box.label(text="an export is refused: a model with no bodypart is "
+                               "one the engine draws nothing of",
+                          icon="ERROR")
             no_uv = [o.name for o in meshes
                      if blender_export.uv_layer_of(o)[0] is None]
             if no_uv:
@@ -1966,17 +2030,20 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         for name, npin, nvert in r.get("cloths") or ():
             self.report({"INFO"}, "%s: cloth over %d particles, %d of them pinned"
                         % (name, nvert, npin))
-        nbox, nset = r.get("unwritten_hitboxes") or (0, 0)
-        if nbox or nset:
-            self.report({"WARNING"},
-                        "%d hitbox%s in %d set%s placed in the scene %s not written: "
-                        "%s. Nothing on this path reads a box empty -- add_attachments "
-                        "takes only the attachments out of accessory_objects"
+        nbox, nset = r.get("scene_hitboxes") or (0, 0)
+        nfit = r.get("refit_hitboxes") or 0
+        if nset:
+            self.report({"INFO"},
+                        "%d hitbox%s in %d set%s written from the scene's own box empties, "
+                        "so Fit hitboxes did not run%s"
                         % (nbox, "" if nbox == 1 else "es", nset,
-                           "" if nset == 1 else "s", "was" if nbox == 1 else "were",
-                           "Fit hitboxes refit its own single set off the skin instead"
-                           if self.fit_hitboxes else
-                           "and Fit hitboxes is off, so the file carries none"))
+                           "" if nset == 1 else "s",
+                           " -- untick it or delete the boxes to refit off the skin"
+                           if self.fit_hitboxes else ""))
+        elif nfit:
+            self.report({"INFO"},
+                        "%d hitbox%s refitted off the skin, the scene carrying none"
+                        % (nfit, "" if nfit == 1 else "es"))
         if r["dropped"]:
             self.report({"WARNING"}, "dropped %s"
                         % ", ".join("%s x%d" % (k, v)

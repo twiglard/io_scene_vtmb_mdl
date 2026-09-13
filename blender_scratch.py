@@ -588,6 +588,20 @@ def add_cloth(d, obj, verts, faces, npin, flip=False, origins=None):
     return c, blob
 
 
+def refuse_empty(d):
+    """A model with no bodypart is refused rather than written.
+
+    Named so a check can restore the pre-fix form, which reached `vtx_write.to_bytes` and
+    died on `at["bodyparts"]` -- `_layout` assigns no offset to a zero-sized array, and
+    that one read has no default where `at.get("matrepl", 0)` beside it does. 0 of the
+    4445 shipped models carry `numbodyparts` 0.
+    """
+    if not d.bodyparts:
+        raise Refused("the scene has no mesh, so there is no bodypart to write and the "
+                      "engine would draw nothing of the model. Parent a mesh to the "
+                      "armature, or give one an armature modifier naming it")
+
+
 def add_meshes(d, mesh_objs, bone_index, scale=1.0):
     """One bodypart per object, holding one model whose meshes are its material slots.
 
@@ -716,18 +730,34 @@ def fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale=1.0, floor=0.05,
     return len(boxes)
 
 
-def unwritten_hitboxes(arm_obj):
-    """(boxes, sets) the no-donor path does not write, so the operator can say so.
+def scene_hitboxes(d, arm_obj, bone_index, scale=1.0):
+    """Every hitbox set and box the scene carries, verbatim. Returns (boxes, sets).
 
-    `fit_hitboxes` refits one set off the skin and `add_attachments` reads only the
-    attachments out of `accessory_objects`, so a box or a set empty the user placed reaches
-    the writer on neither arm of the option -- replaced when it is on, absent when it is
-    off. Not `Desc.drop`: `mdl_build.emit` refuses a description whose `dropped` is
-    non-empty unless the caller passes `drop`, and `write` does not, so recording it there
-    would refuse the export rather than warn about it.
+    The scene's boxes are the model's, so nothing here refits and nothing merges with a
+    refit: `build` runs `fit_hitboxes` only where this returns no set at all.  A set empty
+    with no box under it is still a set -- 358 of the 4445 shipped models carry exactly
+    that -- so the ordinals come from `set(boxes) | set(names)` and not from the boxes.
+    Set names are the scene's, `default` being what 4444 of 4445 shipped models call theirs
+    and `mingxiao.mdl` the one with seven.
+
+    An unresolvable bone is refused by name, the rule `add_attachments` already follows,
+    because silently dropping a box the user placed is the narrowing this replaces.
     """
     _attach, boxes, names = export_mod.accessory_objects(arm_obj)
-    return sum(len(v) for v in boxes.values()), len(set(list(boxes) + list(names)))
+    ords = sorted(set(boxes) | set(names))
+    nbox = 0
+    for k in ords:
+        recs = []
+        for obj in boxes.get(k, ()):
+            want = obj.parent_bone if obj.parent_type == "BONE" else ""
+            if want not in bone_index:
+                raise Refused("hitbox %r is on bone %r, which is not being written"
+                              % (obj.name, want or "<none>"))
+            lo, hi = export_mod.hitbox_extent(obj, scale)
+            recs.append((bone_index[want], int(obj.get("vtmb_hitbox_group") or 0), lo, hi))
+        build_mod.add_hitbox(d, recs, names.get(k, "default"))
+        nbox += len(recs)
+    return nbox, len(ords)
 
 
 def add_attachments(d, arm_obj, bone_index, scale=1.0):
@@ -747,6 +777,40 @@ def add_attachments(d, arm_obj, bone_index, scale=1.0):
         build_mod.add_attachment(d, str(obj.get("vtmb_attachment") or obj.name),
                                  bone_index[want], rows,
                                  int(obj.get("vtmb_attachment_type") or 0))
+        n += 1
+    return n
+
+
+def add_springbones(d, arm_obj, bone_index):
+    """Every spring bone chain the scene authors, on the bone it starts at. Returns the count.
+
+    The donor path matches a chain to a record by the ordinal the import stamped; there is
+    no file to match against here, so the chains an import stamped keep their order and the
+    ones this scene authored follow in bone order. A tombstoned chain is one the scene has
+    taken away and no record is written for it.
+
+    An unresolvable start or end bone is refused rather than skipped, the way an attachment
+    on a bone that is not being written is: a chain silently dropped is a garment that goes
+    stiff with nothing said.
+    """
+    claimed, add, _drop = export_mod.spring_chains(arm_obj)
+    n = 0
+    for pb in [x for _k, x in sorted(claimed.items())] + list(add):
+        if pb.name not in bone_index:
+            raise Refused("spring bone chain %r starts at a bone that is not being written"
+                          % pb.name)
+        end = pb.get("vtmb_spring_end")
+        if end:
+            if end not in bone_index:
+                raise Refused("spring bone chain %r ends at %r, which is not being written"
+                              % (pb.name, end))
+            endbone = bone_index[end]
+        else:
+            endbone = -1
+        fields = dict((field, float(pb[key]))
+                      for _at, key, field in export_mod.SPRING_KEYS if key in pb)
+        build_mod.add_springbone(d, bone_index[pb.name], endbone,
+                                 bool(pb.get("vtmb_spring_disabled")), **fields)
         n += 1
     return n
 
@@ -861,13 +925,18 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
         raise Refused("the armature has no bones")
     faces, unskinned, kept, crowded, cloths, stray = add_meshes(
         d, mesh_objs, bone_index, scale)
-    if hitboxes:
-        fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale)
+    refuse_empty(d)
+    # The scene is the authority: a box or a set the user placed is written whatever the
+    # option says, and the refit fills in only a scene that carries neither.
+    nbox, nset = scene_hitboxes(d, arm_obj, bone_index, scale)
+    nfit = fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale) if (
+        hitboxes and not nset) else 0
     add_attachments(d, arm_obj, bone_index, scale)
+    add_springbones(d, arm_obj, bone_index)
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
     return (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-            stray, unwritten_hitboxes(arm_obj))
+            stray, (nbox, nset, nfit))
 
 
 def _set_hull(d, lo, hi):
@@ -933,8 +1002,8 @@ def write(d, faces, path, checksum):
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
     (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-     stray, unwritten) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
-                               **kw)
+     stray, hbox) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
+                          **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "with_root_motion": moved, "unfitted": unfitted,
@@ -942,6 +1011,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),
             "anims": len(d.anims), "seqs": len(d.seqs),
             "includes": len(d.includes),
+            "springs": len(d.springbones),
             "hitboxes": sum(len(r.kids) for r in d.hitboxsets),
             "faces": st["tris_out"], "verts": st["verts_out"],
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16
@@ -949,4 +1019,5 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "kept": kept, "crowded": crowded,
             "unskinned": unskinned, "dropped": dict(d.dropped),
             "cloths": cloths, "stray_groups": stray,
-            "unwritten_hitboxes": unwritten, "lods": st["lods"]}
+            "scene_hitboxes": hbox[0:2], "refit_hitboxes": hbox[2],
+            "lods": st["lods"]}

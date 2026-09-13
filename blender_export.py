@@ -1442,7 +1442,6 @@ def renamed_anims(anim_names, source, arm_obj=None):
     return out, unstamped
 
 
-
 def split_unwritten(unwritten, adding):
     """(rows an append would take, rows nothing takes).
 
@@ -1611,13 +1610,23 @@ def new_materials(m, source):
     return out
 
 
-# CBaseAnimating::SetModel (vampire.dll 0x10095166) ORs `1 << ordinal` into
-# m_nPhysicsChainDisableMask at entity+0x72c for every record whose bone is negative, and the
-# shift is a `shl %cl`, which masks its count to 5 bits in hardware -- there is no explicit AND
-# on either side of it. So ordinal 32 writes chain 0's bit. Nothing in any of the four modules
-# bounds numspringbones; the largest shipped count is 25 (manbat), so no shipped file can reach
-# this and a writer emitting the negative form inherits the limit.
-SPRING_MASK_BITS = 32
+# The 32-chain limit and why it is hardware rather than a declared bound are on
+# mdl_build.SPRING_MASK_BITS, which is the one definition of it.
+SPRING_MASK_BITS = build_mod.SPRING_MASK_BITS
+
+# (record offset, the pose bone key, what mdl_build.SPRING_DEFAULTS calls it). The retune
+# loop and the panel's Add button both read this, so the five live in one place.
+SPRING_KEYS = ((0x08, "vtmb_spring_unk08", "unk08"),
+               (0x0c, "vtmb_spring_gravity", "gravity"),
+               (0x10, "vtmb_spring_damping", "damping"),
+               (0x14, "vtmb_spring_exp", "springexp"),
+               (0x18, "vtmb_spring_maxangle", "maxangledeg"))
+
+
+def spring_defaults():
+    """{the pose bone key: the value a new chain starts at}, the corpus's own per field."""
+    was = dict(build_mod.SPRING_DEFAULTS)
+    return dict((key, was[field]) for _at, key, field in SPRING_KEYS)
 
 
 def spring_start(k, have, off):
@@ -1677,46 +1686,114 @@ def spring_endbone(k, start, end, m):
     return j
 
 
+def spring_chains(arm_obj):
+    """(claimed {ordinal: pose bone}, [pose bones to append], {ordinal: pose bone to drop}).
+
+    A pose bone carrying `vtmb_spring_index` claims that record; `vtmb_spring_new`, which
+    the Add operator writes and the restamp clears, is a chain the scene authored and is
+    appended.
+
+    Both markers are positive and neither is the absence of the other, because absence is
+    already spoken for twice over. A deleted stamp is exactly what a record no pose bone can
+    claim looks like -- 4 of the 4445 shipped files carry one, two records on one start bone,
+    which the import keys its lookup by -- and that record is carried verbatim, so a bone
+    left holding the fields without a stamp is not an addition. A removal is a tombstone,
+    `vtmb_spring_removed`, for the same reason.
+    """
+    claimed, add, drop = {}, [], {}
+    for pb in arm_obj.pose.bones:
+        k = pb.get("vtmb_spring_index")
+        if k is None:
+            if pb.get("vtmb_spring_new"):
+                add.append(pb)
+            continue
+        k = int(k)
+        if k in claimed or k in drop:
+            continue
+        if pb.get("vtmb_spring_removed"):
+            drop[k] = pb
+        else:
+            claimed[k] = pb
+    return claimed, add, drop
+
+
 def apply_springbones(d, m, arm_obj):
-    """(fields retuned, named end bones, chains switched, records nothing claims).
+    """What the scene does to the spring bone chains, as a dict.
 
     Matched on the record ordinal the import stamped rather than on the bone, because a
     chain is identified by its ordinal everywhere the engine touches it -- the disable
     mask is `1 << recordIndex` -- and two records may name one start bone.
 
-    A record whose ordinal no pose bone claims is carried verbatim and named in the
-    fourth element as `(ordinal, start bone name)`. The route a shipped file takes is
-    exactly that shared start bone: the import keys its lookup by the bone, so the first
-    record on one is stamped and any further record on it is not. 4 of the 4445 files
-    carry it -- ghost.mdl chains 2 and 9, the three tremere_female_armor_* chains 2 and 4,
-    every one on a bone called Bone05 -- and the two records differ in all five floats.
+    A record whose ordinal no pose bone claims is carried verbatim and named in
+    `unclaimed` as `(ordinal, start bone name)`. The route a shipped file takes is exactly
+    that shared start bone: the import keys its lookup by the bone, so the first record on
+    one is stamped and any further record on it is not. 4 of the 4445 files carry it --
+    ghost.mdl chains 2 and 9, the three tremere_female_armor_* chains 2 and 4, every one on
+    a bone called Bone05 -- and the two records differ in all five floats.
+
+    Dropped first, appended second, retuned last, so every ordinal a mask limit or a report
+    names is the one this export is writing and not the one it read. `stamps` is what each
+    surviving chain's pose bone should carry afterwards, which the operator writes back when
+    the file it wrote is the one the scene reads: a removal shifts every later ordinal, so a
+    second export off the stamps this one read would drop the wrong record.
 
     Comparison is against the packed float32, not the Python float, so a value the user
     never touched cannot rewrite the bytes it came from.
     """
-    stamped = {}
-    for pb in arm_obj.pose.bones:
-        k = pb.get("vtmb_spring_index")
-        if k is not None:
-            stamped.setdefault(int(k), pb)
-    changed = named = switched = 0
-    unclaimed = []
+    claimed, add, drop = spring_chains(arm_obj)
+    out = {"changed": 0, "ends": 0, "switched": 0, "unclaimed": [],
+           "added": [], "removed": [], "stamps": {}, "gone": [], "over_mask": 0}
+
+    def name_of(i):
+        return m.bones[i].name if 0 <= i < len(m.bones) else "bone %d" % i
+
+    def start_of(r):
+        v = struct.unpack_from("<i", r.raw, 0x00)[0]
+        return v if v >= 0 else -1 - v
+
+    had = len(d.springbones)
+    for k in sorted(drop, reverse=True):
+        r = build_mod.remove_springbone(d, k)
+        out["removed"].append((k, name_of(start_of(r))))
+        out["gone"].append(drop[k].name)
+    out["removed"].reverse()
+    out["gone"].reverse()
+    # A claimed ordinal at or past the count the file had names a record this file has not
+    # got, which is a stale stamp, and it is dropped here exactly as it was ignored before.
+    renum = dict((k, k - sum(1 for g in drop if g < k))
+                 for k in range(had) if k not in drop)
+    claimed = dict((renum[k], pb) for k, pb in claimed.items() if k in renum)
+
+    for pb in add:
+        for b in m.bones:
+            if b.name == pb.name:
+                bi = b.index
+                break
+        else:
+            raise build_mod.Refused(
+                "a spring bone chain is authored on %r, which the file has no bone called"
+                % pb.name)
+        k = build_mod.add_springbone(d, bi,
+                                     disabled=bool(pb.get("vtmb_spring_disabled")))
+        out["added"].append((k, pb.name))
+        claimed[k] = pb
+        if k >= build_mod.SPRING_MASK_BITS:
+            out["over_mask"] += 1
+
     for k, r in enumerate(d.springbones):
-        pb = stamped.get(k)
+        pb = claimed.get(k)
         if pb is None:
-            start = struct.unpack_from("<i", r.raw, 0x00)[0]
-            start = start if start >= 0 else -1 - start
-            unclaimed.append((k, m.bones[start].name
-                              if 0 <= start < len(m.bones) else "bone %d" % start))
+            out["unclaimed"].append((k, name_of(start_of(r))))
             continue
+        out["stamps"][pb.name] = k
         have0 = struct.unpack_from("<i", r.raw, 0x00)[0]
         off = pb.get("vtmb_spring_disabled")
         # Absent is the scene never having said, the rule +0x04 and the five floats follow.
         want0 = have0 if off is None else spring_start(k, have0, off)
         if have0 != want0:
             struct.pack_into("<i", r.raw, 0x00, want0)
-            changed += 1
-            switched += 1
+            out["changed"] += 1
+            out["switched"] += 1
         have = struct.unpack_from("<i", r.raw, 0x04)[0]
         end = pb.get("vtmb_spring_end")
         if end is None:
@@ -1728,23 +1805,21 @@ def apply_springbones(d, m, arm_obj):
             # +0x00 carries the start bone as -1-bone when the chain starts disabled, and
             # want0 is the form this export is writing rather than the one it read.
             want = spring_endbone(k, want0 if want0 >= 0 else -1 - want0, end, m)
-            named += 1
+            out["ends"] += 1
         else:
             want = -1
         if have != want:
             struct.pack_into("<i", r.raw, 0x04, want)
-            changed += 1
-        for at, key in ((0x08, "vtmb_spring_unk08"), (0x0c, "vtmb_spring_gravity"),
-                        (0x10, "vtmb_spring_damping"), (0x14, "vtmb_spring_exp"),
-                        (0x18, "vtmb_spring_maxangle")):
+            out["changed"] += 1
+        for at, key, _field in SPRING_KEYS:
             v = pb.get(key)
             if v is None:
                 continue
             packed = struct.pack("<f", float(v))
             if bytes(r.raw[at:at + 4]) != packed:
                 r.raw[at:at + 4] = packed
-                changed += 1
-    return changed, named, switched, unclaimed
+                out["changed"] += 1
+    return out
 
 
 # An accessory matrix survives Blender as the object's loc/rot/scale, so reading one back
@@ -1839,13 +1914,33 @@ def read_attachments(m, arm_obj, scale):
     return out
 
 
-def read_hitboxsets(m, arm_obj, scale):
-    """[(set name, [(bone, group, bbmin+bbmax)])] out of the scene, in bone space.
+def hitbox_extent(obj, scale):
+    """(bbmin, bbmax) in bone space off one box empty's own matrix.
 
     A CUBE empty draws -size to +size, so the box is the empty's own scale and translation
     and comes back without a bounding-box walk.  0 of the 14151 shipped boxes has a zero
-    extent on any axis, so nothing here has to survive a degenerate one.
+    extent on any axis, so nothing here has to survive a degenerate one.  Shared by the
+    donor path and `blender_scratch.scene_hitboxes`, so what a box empty means has one
+    definition and the turn is refused on both.
     """
+    local = obj.matrix_basis
+    mid = [local[r][3] / scale for r in range(3)]
+    half = [local.col[c].to_3d().length / scale for c in range(3)]
+    # mstudiobbox_t is an AABB in bone space and carries no rotation, so a turned empty
+    # would be written as its unturned self. 1e-3 is three orders above the 1e-6 the
+    # identity round trip costs and far below any deliberate turn.
+    turn = max(abs(local.col[c].to_3d()[r] / (half[c] * scale or 1.0)
+                   - (1.0 if r == c else 0.0))
+               for c in range(3) for r in range(3))
+    if turn > 1e-3:
+        raise ValueError("hitbox %r is turned %.4f out of its bone's axes, and "
+                         "mstudiobbox_t carries no rotation" % (obj.name, turn))
+    return (tuple(a - b for a, b in zip(mid, half)),
+            tuple(a + b for a, b in zip(mid, half)))
+
+
+def read_hitboxsets(m, arm_obj, scale):
+    """[(set name, [(bone, group, bbmin+bbmax)])] out of the scene, in bone space."""
     bmap = bone_map(m, arm_obj)
     _attach, boxes, names = accessory_objects(arm_obj)
     out = []
@@ -1855,21 +1950,8 @@ def read_hitboxsets(m, arm_obj, scale):
         recs = []
         for obj in boxes.get(k, ()):
             bi = _accessory_bone(obj, m, arm_obj, bmap, "hitbox")
-            local = obj.matrix_basis
-            mid = [local[r][3] / scale for r in range(3)]
-            half = [local.col[c].to_3d().length / scale for c in range(3)]
-            # mstudiobbox_t is an AABB in bone space and carries no rotation, so a turned
-            # empty would be written as its unturned self. 1e-3 is three orders above the
-            # 1e-6 the identity round trip costs and far below any deliberate turn.
-            turn = max(abs(local.col[c].to_3d()[r] / (half[c] * scale or 1.0)
-                           - (1.0 if r == c else 0.0))
-                       for c in range(3) for r in range(3))
-            if turn > 1e-3:
-                raise ValueError("hitbox %r is turned %.4f out of its bone's axes, and "
-                                 "mstudiobbox_t carries no rotation" % (obj.name, turn))
-            recs.append((bi, int(obj.get("vtmb_hitbox_group") or 0),
-                         tuple(a - b for a, b in zip(mid, half))
-                         + tuple(a + b for a, b in zip(mid, half))))
+            lo, hi = hitbox_extent(obj, scale)
+            recs.append((bi, int(obj.get("vtmb_hitbox_group") or 0), lo + hi))
         out.append((names.get(k, "default"), recs))
     return out
 
