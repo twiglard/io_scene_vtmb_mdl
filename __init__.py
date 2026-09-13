@@ -1541,6 +1541,9 @@ SCRATCH_DROPS = (
     "eyeballs, mouths and pose parameters",
     "spring bones, procedural bones, IK chains and bone controllers",
     "sequence events and autolayers",
+    "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
+    "hitbox sets and boxes placed in the scene -- Fit hitboxes refits one set off the "
+    "skin, and with it off none is written at all",
 )
 
 
@@ -1847,6 +1850,17 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         for name, npin, nvert in r.get("cloths") or ():
             self.report({"INFO"}, "%s: cloth over %d particles, %d of them pinned"
                         % (name, nvert, npin))
+        nbox, nset = r.get("unwritten_hitboxes") or (0, 0)
+        if nbox or nset:
+            self.report({"WARNING"},
+                        "%d hitbox%s in %d set%s placed in the scene %s not written: "
+                        "%s. Nothing on this path reads a box empty -- add_attachments "
+                        "takes only the attachments out of accessory_objects"
+                        % (nbox, "" if nbox == 1 else "es", nset,
+                           "" if nset == 1 else "s", "was" if nbox == 1 else "were",
+                           "Fit hitboxes refit its own single set off the skin instead"
+                           if self.fit_hitboxes else
+                           "and Fit hitboxes is off, so the file carries none"))
         if r["dropped"]:
             self.report({"WARNING"}, "dropped %s"
                         % ", ".join("%s x%d" % (k, v)

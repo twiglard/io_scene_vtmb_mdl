@@ -716,6 +716,20 @@ def fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale=1.0, floor=0.05,
     return len(boxes)
 
 
+def unwritten_hitboxes(arm_obj):
+    """(boxes, sets) the no-donor path does not write, so the operator can say so.
+
+    `fit_hitboxes` refits one set off the skin and `add_attachments` reads only the
+    attachments out of `accessory_objects`, so a box or a set empty the user placed reaches
+    the writer on neither arm of the option -- replaced when it is on, absent when it is
+    off. Not `Desc.drop`: `mdl_build.emit` refuses a description whose `dropped` is
+    non-empty unless the caller passes `drop`, and `write` does not, so recording it there
+    would refuse the export rather than warn about it.
+    """
+    _attach, boxes, names = export_mod.accessory_objects(arm_obj)
+    return sum(len(v) for v in boxes.values()), len(set(list(boxes) + list(names)))
+
+
 def add_attachments(d, arm_obj, bone_index, scale=1.0):
     """Every attachment empty in the scene, on the bone it is parented to. Returns the count.
 
@@ -853,7 +867,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
     return (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-            stray)
+            stray, unwritten_hitboxes(arm_obj))
 
 
 def _set_hull(d, lo, hi):
@@ -906,6 +920,9 @@ def write(d, faces, path, checksum):
     data = build_mod.emit(d, checksum)
     m = mdl_mod.Mdl("<scene>", data=data)
     vtx, st = vtxr_mod.scratch(m, faces, checksum)
+    # Read rather than restated: vtx_rebuild.seed writes numLODs at 0x14 and the dialog
+    # claims the file is single-LOD, so the claim is graded against the bytes.
+    st["lods"] = struct.unpack_from("<i", vtx, 0x14)[0]
     stem = path[:-4] if path.lower().endswith(".mdl") else path
     with open(stem + ".mdl", "wb") as f:
         f.write(data)
@@ -916,8 +933,8 @@ def write(d, faces, path, checksum):
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
     (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-     stray) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
-                    **kw)
+     stray, unwritten) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
+                               **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "with_root_motion": moved, "unfitted": unfitted,
@@ -931,4 +948,5 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
                                for bp in d.bodyparts for x in bp.kids),
             "kept": kept, "crowded": crowded,
             "unskinned": unskinned, "dropped": dict(d.dropped),
-            "cloths": cloths, "stray_groups": stray}
+            "cloths": cloths, "stray_groups": stray,
+            "unwritten_hitboxes": unwritten, "lods": st["lods"]}
