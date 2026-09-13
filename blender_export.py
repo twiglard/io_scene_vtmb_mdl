@@ -1411,6 +1411,38 @@ def match_actions(m, source, arm_obj=None):
     return match_indices([a.name for a in m.anims], source, arm_obj)
 
 
+def renamed_anims(anim_names, source, arm_obj=None):
+    """({index: the name Blender now gives it}, the candidates no stamp can confirm).
+
+    The index comes off `match_indices`, which is already what decides which action writes
+    which animation, so this adds no second rule -- it reads that map and reports the slots
+    whose action is no longer called after the record.  An action that took its slot by
+    name renames nothing by construction.
+
+    `vtmb_anim_name` is what makes a rename sayable, and the file's own name at the slot is
+    not enough: Blender deduplicates, so the two animations called `walk` that 3 of the
+    4445 shipped models carry import as `walk` and `walk.001`, and the second differs from
+    the record's name on a plain re-export that renamed nothing.  The stamp also has to
+    still agree with the file, or it describes an animation some earlier export already
+    renamed and the scene is not the authority any more.
+
+    An action from an import older than the stamp reaches the second return instead, so a
+    scene that cannot express a rename says so rather than taking one silently either way.
+    """
+    found = match_indices(anim_names, source, arm_obj)[0]
+    out, unstamped = {}, []
+    for i, act in sorted(found.items()):
+        if act.name == anim_names[i]:
+            continue
+        was = act.get("vtmb_anim_name")
+        if was is None:
+            unstamped.append((anim_names[i], act.name))
+        elif str(was) == anim_names[i]:
+            out[i] = act.name
+    return out, unstamped
+
+
+
 def split_unwritten(unwritten, adding):
     """(rows an append would take, rows nothing takes).
 
@@ -2969,6 +3001,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
              "slots_moved": 0, "slots_gone": [],
+             "renamed_anims": [], "unstamped_renames": [],
              "dup_models": dup_models, "dup_bones": dup_bones,
              "blind_bones": []}
     poses = read_bones(m, arm_obj, scale, scene["blind_bones"])
@@ -3014,6 +3047,12 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     anim_names = [r.name for r in d.anims]
+    # Collected here and applied at the end: `apply_sequences` resolves every blend cell of
+    # the stash by animation NAME, so renaming first makes it refuse the file it is about
+    # to write. The records are held by object rather than by index because a drop below
+    # renumbers the list.
+    renames, scene["unstamped_renames"] = renamed_anims(anim_names, source, arm_obj)
+    pending_renames = [(d.anims[i], anim_names[i], n) for i, n in sorted(renames.items())]
     scene["sequences"], scene["blends_out_of_range"] = apply_sequences(
         d, m, arm_obj, anim_names,
         sequence_actions(anim_names, source, arm_obj, actions))
@@ -3035,6 +3074,16 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                              % (os.path.basename(source), drop))
         seqs, _left = build_mod.remove_animation(d, names.index(drop))
         dropped = {"anim": drop, "seqs": seqs}
+
+    # Last, so `drop` resolves against the name the file still carried and every blend cell
+    # has already been written as an index. A renamed animation the same export dropped is
+    # simply gone.
+    live = {id(r) for r in d.anims}
+    for rec, was, now in pending_renames:
+        if id(rec) not in live:
+            continue
+        build_mod.rename_animation(d, d.anims.index(rec), now)
+        scene["renamed_anims"].append((was, now))
 
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],

@@ -296,6 +296,48 @@ def _restamp_sequences(obj, written, src, added, dropped_seqs):
     return moved
 
 
+def _restamp_renamed_anims(obj, written, src, renames):
+    """Bring `vtmb_anim_name` and the sequence stash's blend cells onto the names just
+    written, and answer how many moved.
+
+    Both name an animation of the armature's own model, so leaving them behind costs the
+    next export twice over: `renamed_anims` compares the stamp against the file and stops
+    seeing a second rename once the two disagree, and `apply_sequences` resolves every
+    blend cell by name and refuses a file that no longer carries the one the stash holds.
+
+    Only when the file just written is the one the scene reads, for the reason
+    `_restamp_sequences` states -- an export to another path leaves the model the stamps
+    describe alone, where the old names are still the current ones, so the next export
+    derives the same rename off the same donor and lands in the same place.
+    """
+    if not renames or not blender_export.same_file(written, src):
+        return 0
+    fwd = dict(renames)
+    n = 0
+    for act in bpy.data.actions:
+        was = act.get("vtmb_anim_name")
+        if was is None or str(was) not in fwd:
+            continue
+        if not blender_export.same_file(act.get("vtmb_source"), src):
+            continue
+        act["vtmb_anim_name"] = fwd[str(was)]
+        n += 1
+    stash = [dict(x) for x in obj.get("vtmb_sequences") or ()]
+    cells = 0
+    for seq in stash:
+        blends = [list(col) for col in seq.get("blends") or ()]
+        moved = False
+        for col in blends:
+            for y, name in enumerate(col):
+                if name in fwd:
+                    col[y], moved, cells = fwd[name], True, cells + 1
+        if moved:
+            seq["blends"] = blends
+    if cells:
+        obj["vtmb_sequences"] = stash
+    return n + cells
+
+
 def _base_anims(path):
     if not path or not os.path.exists(path):
         return []
@@ -1423,6 +1465,29 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            " and the %d sequence%s that played only it"
                            % (len(gone["seqs"]),
                               "" if len(gone["seqs"]) == 1 else "s")))
+        ren = r["scene"].get("renamed_anims") or []
+        if ren:
+            what = ", ".join("%s -> %s" % (a, b) for a, b in ren[:4])
+            if len(ren) > 4:
+                what += " and %d more" % (len(ren) - 4)
+            self.report({"INFO"}, "renamed %d animation%s: %s"
+                        % (len(ren), "" if len(ren) == 1 else "s", what))
+            _restamp_renamed_anims(obj, self.filepath, src, ren)
+        uns = r["scene"].get("unstamped_renames") or []
+        if uns:
+            # Reported rather than guessed at: Blender deduplicates an action name, so the
+            # second of two animations called the same thing imports as `walk.001` and
+            # differs from the record on an export that renamed nothing.
+            self.report({"WARNING"},
+                        "%d action%s named differently from the animation it writes and "
+                        "carr%s no vtmb_anim_name, so the file keeps the name it has: %s. "
+                        "That stamp is what tells a rename from Blender's own duplicate "
+                        "suffix -- import the file again to get it"
+                        % (len(uns), "" if len(uns) == 1 else "s",
+                           "ies" if len(uns) == 1 else "y",
+                           ", ".join("%s is called %s" % (a, b) for a, b in uns[:4])
+                           + ("" if len(uns) <= 4 else
+                              " and %d more" % (len(uns) - 4))))
         # The stamp is what makes the next export replace this animation rather than
         # append it a second time. `vtmb_source` is left alone when the action already
         # has one: the name match comes first anyway, and repointing it would move the
@@ -1432,6 +1497,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             if act is None:
                 continue
             act["vtmb_anim_index"] = i
+            # Without this the action's own name is the only thing saying what the record
+            # is called, and `renamed_anims` cannot tell a later rename from Blender's
+            # duplicate suffix.
+            act["vtmb_anim_name"] = name
             if not act.get("vtmb_source"):
                 act["vtmb_source"] = self.filepath
         what = ", ".join("%s from %r (%d frames)" % (n, a, f)

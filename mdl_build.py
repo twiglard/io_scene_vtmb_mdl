@@ -2579,3 +2579,34 @@ def remove_animation(d, i):
                                      for x in al if x not in gone]
     del d.anims[i]
     return doomed, len(d.anims)
+
+
+def rename_animation(d, i, name):
+    """Give animation `i` a new label, and answer what it was called.
+
+    `mstudioanimdesc_t.sznameindex` is a struct-relative string offset, so the length is
+    free and `emit` rebuilds the table.  Nothing in the game reads the field: `animmap`
+    reaches animdesc +0x04, +0x08, +0x0c, +0x10, +0x14 and +0x30 across engine, client and
+    vampire and nothing else, and StudioRender carries no animdesc at all.  So the name is
+    for hlmv, for this addon's round trip, and for a blend grid, which is the only table in
+    the file that names an animation -- and it names it by index, so a rename costs nothing
+    there either.
+
+    A name another animation already carries is refused.  The file would still be legal --
+    3 of the 4445 shipped models ship one, 9 surplus records between them -- but every
+    route back into a scene resolves an animation by name, and Blender deduplicates an
+    action name, so authoring a second `walk` produces a scene that cannot say which record
+    it means.
+    """
+    if not 0 <= i < len(d.anims):
+        raise Refused("no animation %d to rename: the file has %d" % (i, len(d.anims)))
+    name = str(name)
+    if not name:
+        raise Refused("animation %d cannot be renamed to the empty string: 0 of the 14315 "
+                      "shipped animations carry one" % i)
+    for k, r in enumerate(d.anims):
+        if k != i and r.name == name:
+            raise Refused("animation %d is already called %r, and a scene cannot name two"
+                          % (k, name))
+    was, d.anims[i].name = d.anims[i].name, name
+    return was

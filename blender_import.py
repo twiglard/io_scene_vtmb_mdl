@@ -1165,6 +1165,11 @@ def build_actions(m, arm_obj, wanted, scale, root_motion=True):
         action["vtmb_numframes"] = a.numframes
         action["vtmb_source"] = src.path
         action["vtmb_anim_index"] = a.index
+        # The record's own name, which Blender cannot be asked for afterwards: it
+        # deduplicates, so `walk.001` is what two animations called `walk` look like in a
+        # scene and is indistinguishable from a rename without this. 3 of the 4445 shipped
+        # models carry one, 9 surplus records between them.
+        action["vtmb_anim_name"] = a.name
         # An exporter has to take the root motion back out of the keys, so record whether
         # it was ever put in -- a.movements alone does not say.
         action["vtmb_root_motion"] = in_keys
