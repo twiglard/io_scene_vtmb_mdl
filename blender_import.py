@@ -166,8 +166,15 @@ def build_armature(context, m, name, scale, root_motion=True):
     bpy.ops.object.mode_set(mode="OBJECT")
 
     dbs = arm_obj.data.bones
-    # Keyed on the record ordinal, not on the bone: two records may name one start bone,
-    # and the disable mask is `1 << recordIndex`, so the ordinal is what identifies a chain.
+    # What is stamped is the record ordinal, since the disable mask is `1 << recordIndex`
+    # and that is what identifies a chain everywhere the engine touches it. The lookup is
+    # keyed by the start bone because a pose bone is what carries the stamp, and a pose
+    # bone can carry one chain's worth of keys -- so where two records name one start bone
+    # the first is stamped and the second is reachable from no bone in the scene. 4 of the
+    # 4445 files carry that: ghost.mdl chains 2 and 9 and the three tremere_female_armor_*
+    # chains 2 and 4, every one on a bone called Bone05, and the two records differ in all
+    # five floats. The export names each such record rather than passing it over in
+    # silence; it is still written exactly as the file had it.
     springs = {}
     for s in m.springbones:
         springs.setdefault(s.bone, s)

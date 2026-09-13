@@ -1463,6 +1463,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "back on. 0 of the 600 shipped records are written that way"
                         % (scene["spring_switched"],
                            "" if scene["spring_switched"] == 1 else "s"))
+        un = scene.get("spring_unclaimed") or []
+        if un:
+            self.report({"WARNING"},
+                        "Spring bone %s: carried exactly as the file has %s, since no "
+                        "bone in this scene claims %s ordinal and nothing here can "
+                        "retune %s. The shipped cause is two records on one start bone, "
+                        "which 4 of the 4445 models carry: the import stamps the first "
+                        "and the second is reachable from no bone"
+                        % (", ".join("chain %d, which starts at %r" % (k, n)
+                                     for k, n in un),
+                           "them" if len(un) > 1 else "it",
+                           "their" if len(un) > 1 else "its",
+                           "them" if len(un) > 1 else "it"))
         sb = scene.get("blends_out_of_range") or []
         if sb:
             self.report({"WARNING"},

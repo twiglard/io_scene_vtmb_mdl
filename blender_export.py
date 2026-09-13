@@ -1646,12 +1646,18 @@ def spring_endbone(k, start, end, m):
 
 
 def apply_springbones(d, m, arm_obj):
-    """(fields retuned, chains given a named end bone, chains switched off or on).
+    """(fields retuned, named end bones, chains switched, records nothing claims).
 
     Matched on the record ordinal the import stamped rather than on the bone, because a
     chain is identified by its ordinal everywhere the engine touches it -- the disable
-    mask is `1 << recordIndex` -- and two records may name one start bone. A record whose
-    ordinal no pose bone claims is carried verbatim.
+    mask is `1 << recordIndex` -- and two records may name one start bone.
+
+    A record whose ordinal no pose bone claims is carried verbatim and named in the
+    fourth element as `(ordinal, start bone name)`. The route a shipped file takes is
+    exactly that shared start bone: the import keys its lookup by the bone, so the first
+    record on one is stamped and any further record on it is not. 4 of the 4445 files
+    carry it -- ghost.mdl chains 2 and 9, the three tremere_female_armor_* chains 2 and 4,
+    every one on a bone called Bone05 -- and the two records differ in all five floats.
 
     Comparison is against the packed float32, not the Python float, so a value the user
     never touched cannot rewrite the bytes it came from.
@@ -1662,9 +1668,14 @@ def apply_springbones(d, m, arm_obj):
         if k is not None:
             stamped.setdefault(int(k), pb)
     changed = named = switched = 0
+    unclaimed = []
     for k, r in enumerate(d.springbones):
         pb = stamped.get(k)
         if pb is None:
+            start = struct.unpack_from("<i", r.raw, 0x00)[0]
+            start = start if start >= 0 else -1 - start
+            unclaimed.append((k, m.bones[start].name
+                              if 0 <= start < len(m.bones) else "bone %d" % start))
             continue
         have0 = struct.unpack_from("<i", r.raw, 0x00)[0]
         off = pb.get("vtmb_spring_disabled")
@@ -1701,7 +1712,7 @@ def apply_springbones(d, m, arm_obj):
             if bytes(r.raw[at:at + 4]) != packed:
                 r.raw[at:at + 4] = packed
                 changed += 1
-    return changed, named, switched
+    return changed, named, switched, unclaimed
 
 
 # An accessory matrix survives Blender as the object's loc/rot/scale, so reading one back
@@ -2952,7 +2963,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     d = build_mod.apply_anims(d, edits, source)
 
     scene = {"bones": 0, "materials": 0, "sequences": 0, "springs": 0,
-             "spring_ends": 0, "spring_switched": 0, "stale": 0,
+             "spring_ends": 0, "spring_switched": 0, "spring_unclaimed": [],
+             "stale": 0,
              "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [], "surplus": surplus_bones(m, arm_obj),
@@ -2992,8 +3004,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.add_material(d, name, None)
         have.add(name)
         scene["added_materials"].append(name)
-    (scene["springs"], scene["spring_ends"],
-     scene["spring_switched"]) = apply_springbones(d, m, arm_obj)
+    (scene["springs"], scene["spring_ends"], scene["spring_switched"],
+     scene["spring_unclaimed"]) = apply_springbones(d, m, arm_obj)
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)
