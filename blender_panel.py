@@ -10,6 +10,7 @@ material.
 """
 
 import os
+import re
 
 import bpy
 import mathutils
@@ -801,30 +802,290 @@ class VTMB_PT_eyeball(bpy.types.Panel):
         draw_eyeball(self.layout, context.object)
 
 
+FLEX_KEYS = {"CONTROLLER": "vtmb_flexcontrollers", "RULE": "vtmb_flexrules"}
+FLEX_KIND_ITEMS = [
+    ("CONTROLLER", "Flex controller", "`<type> [range <min> <max>] <name>`"),
+    ("RULE", "Flex rule", "`<flexdesc> = <expression>`"),
+]
+
+
+def _flex_lines(arm_obj, kind):
+    return [str(x) for x in (arm_obj.get(FLEX_KEYS[kind]) or ())]
+
+
+def _write_flex(arm_obj, kind, lines):
+    """Reassign the whole list, which is the only write a string ID property takes.
+
+    Reading one back hands over a plain Python copy, so `arm[key][0] = x` writes into the
+    copy and is discarded -- Blender's own Custom Properties list cannot edit one either.
+    """
+    arm_obj[FLEX_KEYS[kind]] = list(lines)
+
+
+def _flex_type_search(self, context, edit_text):
+    return blender_export.FLEX_TYPES
+
+
+def _flex_compose(kind, ctype, name, expr, rng=(0.0, 1.0)):
+    """The line these fields spell, or ValueError saying what is wrong with them."""
+    if kind == "CONTROLLER":
+        line = blender_export.flex_controller_line(ctype.strip(), rng[0], rng[1],
+                                                   name.strip())
+        blender_export.flex_controller_fields(line)
+        return line
+    if not name.strip():
+        raise ValueError("a flex rule names the flex it drives, and this one names none")
+    if "=" in name:
+        raise ValueError("a flex name cannot carry `=`")
+    if not expr.strip():
+        raise ValueError("flex rule %r has no expression" % name.strip())
+    return "%s = %s" % (name.strip(), expr.strip())
+
+
+def _flex_cited(arm_obj, name):
+    """The first flex rule naming this controller, or None."""
+    pat = re.compile(r"\b%s\b" % re.escape(name))
+    return next((r for r in _flex_lines(arm_obj, "RULE") if pat.search(r)), None)
+
+
+def _flex_refuse(arm_obj, index, line):
+    """Why this controller line cannot stand at `index`, or None.
+
+    A rule resolves a controller by NAME and by nothing else -- the engine patches `link`
+    at load from a process-global name table -- so a duplicate drives the first silently
+    and a rename leaves every rule that cited the old name driving nothing.
+    """
+    lines = _flex_lines(arm_obj, "CONTROLLER")
+    try:
+        name = blender_export.flex_controller_fields(line)[3]
+    except ValueError as e:
+        return str(e)
+    for k, other in enumerate(lines):
+        if k == index:
+            continue
+        try:
+            if blender_export.flex_controller_fields(other)[3] == name:
+                return ("another flex controller is already named %r, and a rule names a "
+                        "controller by its name alone" % name)
+        except ValueError:
+            pass
+    if 0 <= index < len(lines):
+        was = blender_export.flex_controller_fields(lines[index])[3]
+        cited = _flex_cited(arm_obj, was) if was != name else None
+        if cited is not None:
+            return ("flex rule %r names %r, so renaming it to %r would leave that rule "
+                    "driving nothing" % (cited, was, name))
+    return None
+
+
+def _flex_armature(context):
+    obj = getattr(context, "object", None)
+    return obj if obj is not None and obj.type == "ARMATURE" else None
+
+
+class VTMB_OT_edit_flex_line(bpy.types.Operator):
+    bl_idname = "vtmb.edit_flex_line"
+    bl_label = "Edit flex line"
+    bl_description = ("Rewrite one flex controller or flex rule. A controller keeps the "
+                      "range it had: it is 0..1 on all 8649 shipped controllers")
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: bpy.props.EnumProperty(name="Array", items=FLEX_KIND_ITEMS,
+                                 default="CONTROLLER")
+    index: bpy.props.IntProperty(name="Line", default=0, min=0)
+    ctype: bpy.props.StringProperty(
+        name="Type", default="mouth", search=_flex_type_search,
+        search_options={"SORT", "SUGGESTION"},
+        description="One of the seven words the corpus carries, or any other -- the "
+                    "field is a string in the file and not an enum")
+    name: bpy.props.StringProperty(
+        name="Name", default="",
+        description="A controller's name, or the flex a rule drives. That name is the "
+                    "only identity either has")
+    expr: bpy.props.StringProperty(name="Expression", default="")
+
+    @classmethod
+    def poll(cls, context):
+        return _flex_armature(context) is not None
+
+    def invoke(self, context, event):
+        lines = _flex_lines(_flex_armature(context), self.kind)
+        if 0 <= self.index < len(lines):
+            line = lines[self.index]
+            if self.kind == "CONTROLLER":
+                try:
+                    fields = blender_export.flex_controller_fields(line)
+                    self.ctype, self.name = fields[0], fields[3]
+                except ValueError:
+                    self.name = line
+            elif "=" in line:
+                self.name, self.expr = (x.strip() for x in line.split("=", 1))
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        col = self.layout.column()
+        if self.kind == "CONTROLLER":
+            col.prop(self, "ctype")
+            col.prop(self, "name")
+        else:
+            col.prop(self, "name", text="Flex")
+            col.prop(self, "expr")
+
+    def execute(self, context):
+        arm_obj = _flex_armature(context)
+        lines = _flex_lines(arm_obj, self.kind)
+        if not 0 <= self.index < len(lines):
+            self.report({"ERROR"}, "there is no %s line %d"
+                        % (self.kind.lower(), self.index))
+            return {"CANCELLED"}
+        rng = (0.0, 1.0)
+        if self.kind == "CONTROLLER":
+            try:
+                fields = blender_export.flex_controller_fields(lines[self.index])
+                rng = (fields[1], fields[2])
+            except ValueError:
+                pass
+        try:
+            line = _flex_compose(self.kind, self.ctype, self.name, self.expr, rng)
+        except ValueError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        if self.kind == "CONTROLLER":
+            why = _flex_refuse(arm_obj, self.index, line)
+            if why:
+                self.report({"ERROR"}, why)
+                return {"CANCELLED"}
+        lines[self.index] = line
+        _write_flex(arm_obj, self.kind, lines)
+        self.report({"INFO"}, "line %d is now %r" % (self.index, line))
+        return {"FINISHED"}
+
+
+class VTMB_OT_add_flex_line(bpy.types.Operator):
+    bl_idname = "vtmb.add_flex_line"
+    bl_label = "Add flex line"
+    bl_description = "Append a flex controller or a flex rule"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: bpy.props.EnumProperty(name="Array", items=FLEX_KIND_ITEMS,
+                                 default="CONTROLLER")
+    ctype: bpy.props.StringProperty(
+        name="Type", default="mouth", search=_flex_type_search,
+        search_options={"SORT", "SUGGESTION"})
+    name: bpy.props.StringProperty(name="Name", default="")
+    expr: bpy.props.StringProperty(name="Expression", default="")
+
+    @classmethod
+    def poll(cls, context):
+        return _flex_armature(context) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        col = self.layout.column()
+        if self.kind == "CONTROLLER":
+            col.prop(self, "ctype")
+            col.prop(self, "name")
+        else:
+            col.prop(self, "name", text="Flex")
+            col.prop(self, "expr")
+
+    def execute(self, context):
+        arm_obj = _flex_armature(context)
+        lines = _flex_lines(arm_obj, self.kind)
+        try:
+            line = _flex_compose(self.kind, self.ctype, self.name, self.expr)
+        except ValueError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        if self.kind == "CONTROLLER":
+            why = _flex_refuse(arm_obj, len(lines), line)
+            if why:
+                self.report({"ERROR"}, why)
+                return {"CANCELLED"}
+        _write_flex(arm_obj, self.kind, lines + [line])
+        self.report({"INFO"}, "appended %r" % line)
+        return {"FINISHED"}
+
+
+class VTMB_OT_remove_flex_line(bpy.types.Operator):
+    bl_idname = "vtmb.remove_flex_line"
+    bl_label = "Remove flex line"
+    bl_description = "Drop one flex controller or flex rule"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: bpy.props.EnumProperty(name="Array", items=FLEX_KIND_ITEMS,
+                                 default="CONTROLLER")
+    index: bpy.props.IntProperty(name="Line", default=0, min=0)
+
+    @classmethod
+    def poll(cls, context):
+        return _flex_armature(context) is not None
+
+    def execute(self, context):
+        arm_obj = _flex_armature(context)
+        lines = _flex_lines(arm_obj, self.kind)
+        if not 0 <= self.index < len(lines):
+            self.report({"ERROR"}, "there is no %s line %d"
+                        % (self.kind.lower(), self.index))
+            return {"CANCELLED"}
+        if self.kind == "CONTROLLER":
+            try:
+                was = blender_export.flex_controller_fields(lines[self.index])[3]
+            except ValueError:
+                was = None
+            cited = _flex_cited(arm_obj, was) if was else None
+            if cited is not None:
+                self.report({"ERROR"}, "flex rule %r names %r, so dropping that controller "
+                                       "would leave the rule driving nothing" % (cited, was))
+                return {"CANCELLED"}
+        gone = lines.pop(self.index)
+        _write_flex(arm_obj, self.kind, lines)
+        self.report({"INFO"}, "dropped %r" % gone)
+        return {"FINISHED"}
+
+
 def draw_flex(lay, arm_obj):
     """The flex controllers and the flex rules, as the QC lines they are.
 
     Both are stored as text because studiomdl's own syntax is the only syntax either has
-    -- Option_Flexcontroller and Option_Flexrule, studiomdl.cpp:2875 and :2914 -- and an
-    ID-property string is editable in place where a parsed structure would not be.
+    -- Option_Flexcontroller and Option_Flexrule, studiomdl.cpp:2875 and :2914. A string
+    list in an ID property cannot be edited in place, so every write here reassigns the
+    whole list through `_write_flex` and the three operators are what reach it.
     """
-    ctls = [str(x) for x in (arm_obj.get("vtmb_flexcontrollers") or ())]
-    rules = [str(x) for x in (arm_obj.get("vtmb_flexrules") or ())]
-    if not ctls and not rules:
-        lay.label(text="no flex controllers", icon="INFO")
-        return
+    ctls = _flex_lines(arm_obj, "CONTROLLER")
+    rules = _flex_lines(arm_obj, "RULE")
     box = lay.box()
     box.label(text="%d flex controller(s)" % len(ctls), icon="DRIVER")
     by_type = {}
     for line in ctls:
         by_type.setdefault(line.split(None, 1)[0] if line else "?", []).append(line)
-    for t in sorted(by_type):
-        box.label(text="%s: %s" % (t, ", ".join(x.rsplit(None, 1)[-1]
-                                                for x in by_type[t])))
+    if by_type:
+        box.label(text=", ".join("%s %d" % (t, len(by_type[t])) for t in sorted(by_type)))
+    for k, line in enumerate(ctls):
+        row = box.row(align=True)
+        row.label(text=line)
+        op = row.operator("vtmb.edit_flex_line", text="", icon="GREASEPENCIL")
+        op.kind, op.index = "CONTROLLER", k
+        op = row.operator("vtmb.remove_flex_line", text="", icon="X")
+        op.kind, op.index = "CONTROLLER", k
+    box.operator("vtmb.add_flex_line", text="Add controller",
+                 icon="ADD").kind = "CONTROLLER"
+    # 0.0..1.0 on all 8649 shipped controllers, so the range is stated and not offered.
+    box.label(text="every shipped controller ranges 0..1, and an edit keeps the range "
+                   "the line already has", icon="INFO")
+
     box = lay.box()
     box.label(text="%d flex rule(s)" % len(rules), icon="SHAPEKEY_DATA")
-    for line in rules:
-        box.label(text=line)
+    for k, line in enumerate(rules):
+        row = box.row(align=True)
+        row.label(text=line)
+        op = row.operator("vtmb.edit_flex_line", text="", icon="GREASEPENCIL")
+        op.kind, op.index = "RULE", k
+        op = row.operator("vtmb.remove_flex_line", text="", icon="X")
+        op.kind, op.index = "RULE", k
+    box.operator("vtmb.add_flex_line", text="Add rule", icon="ADD").kind = "RULE"
 
 
 class VTMB_PT_flex(bpy.types.Panel):
@@ -2248,6 +2509,8 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_PT_cloth,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
+           VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
+           VTMB_OT_remove_flex_line,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,

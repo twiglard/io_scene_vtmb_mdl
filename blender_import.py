@@ -13,6 +13,7 @@ import zlib
 import bpy
 import mathutils
 
+from . import blender_export as export_mod
 from . import cloth as cloth_mod
 from . import mdl as mdl_mod
 from . import paths as paths_mod
@@ -249,8 +250,7 @@ def build_armature(context, m, name, scale, root_motion=True):
 
 def _flexctrl_line(c):
     """`$flexcontroller` without the command word: `<type> [range <min> <max>] <name>`."""
-    rng = "" if (c.min, c.max) == (0.0, 1.0) else "range %g %g " % (c.min, c.max)
-    return "%s %s%s" % (c.type, rng, c.name)
+    return export_mod.flex_controller_line(c.type, c.min, c.max, c.name)
 
 
 def sequence_stash(m):

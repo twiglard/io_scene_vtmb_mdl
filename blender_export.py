@@ -2028,6 +2028,35 @@ def eyeball_radius(obj, scale):
 _FLEXCTRL_RE = re.compile(
     r"^\s*(\S+)\s+(?:range\s+(\S+)\s+(\S+)\s+)?(\S+)\s*$")
 
+# Commonest first over 8649 controllers on 198 models: 2940, 2159, 1568, 1176, 784, 20, 2.
+# The field is a string and not an enum, so the panel offers these and takes an eighth.
+FLEX_TYPES = ("phoneme", "mouth", "eyelid", "brow", "nose", "morph", "wholeface")
+
+
+def flex_controller_fields(line):
+    """(type, min, max, name) off a `$flexcontroller` line, or ValueError naming it.
+
+    The one grammar: the panel stores through it and `apply_flex` reads through it, so a
+    line the panel wrote is one the export can parse.
+    """
+    mo = _FLEXCTRL_RE.match(line)
+    if not mo:
+        raise ValueError("flex controller %r is not `<type> [range <min> <max>] <name>`"
+                         % line)
+    t, lo, hi, name = mo.groups()
+    try:
+        lo = 0.0 if lo is None else float(lo)
+        hi = 1.0 if hi is None else float(hi)
+    except ValueError:
+        raise ValueError("flex controller %r has a range that is not two numbers" % line)
+    return t, lo, hi, name
+
+
+def flex_controller_line(ctype, lo, hi, name):
+    """The inverse of `flex_controller_fields`, in the import's own spelling."""
+    rng = "" if (lo, hi) == (0.0, 1.0) else "range %g %g " % (lo, hi)
+    return "%s %s%s" % (ctype, rng, name)
+
 
 # Springs store `w0 = 2*sigma*k0` and `w1 = -2*sigma*(1-k0)` and group 1 stores
 # `rest2 = slack * d2`, so one authored number moving is visible in every spring. Under
@@ -2266,21 +2295,21 @@ def apply_flex(d, m, arm_obj):
 
     ctls = []
     for line in lines:
-        mo = _FLEXCTRL_RE.match(line)
-        if not mo:
-            raise build_mod.Refused("flex controller %r is not `<type> [range <min> <max>] <name>`"
-                          % line)
-        t, lo, hi, name = mo.groups()
         try:
-            lo = 0.0 if lo is None else float(lo)
-            hi = 1.0 if hi is None else float(hi)
-        except ValueError:
-            raise build_mod.Refused("flex controller %r has a range that is not two numbers" % line)
+            t, lo, hi, name = flex_controller_fields(line)
+        except ValueError as e:
+            raise build_mod.Refused(str(e))
         raw = bytearray(20)
         struct.pack_into("<iff", raw, 8, -1, lo, hi)
         ctls.append(build_mod.Rec(raw, name, None, {"type": t}))
 
     names = [c.name for c in ctls]
+    # A rule resolves a controller by name, so a duplicate makes every rule naming it drive
+    # the first silently. 0 of the 198 shipped models carry one.
+    dup = next((n for k, n in enumerate(names) if n in names[:k]), None)
+    if dup is not None:
+        raise build_mod.Refused("two flex controllers are named %r, and a rule names a "
+                                "controller by its name alone" % dup)
     added = 0
     recs = []
     # A rule the scene did not touch keeps the donor's own op bytes, so an unedited export
