@@ -491,6 +491,14 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
     filename_ext = ".mdl"
     filter_glob: bpy.props.StringProperty(default="*.mdl", options={"HIDDEN"})
 
+    use_packs: bpy.props.BoolProperty(
+        name="Read game VPKs", default=True,
+        description="Search the pack0NN.vpk archives under Game root as well as the loose "
+                    "trees. Off restricts every lookup -- materials, textures and the "
+                    "include-model chain -- to loose files, which on a stock install finds "
+                    "almost nothing: a shipped model then imports untextured and a "
+                    "character's animations do not resolve. Only useful against an "
+                    "unpacked tree, or to prove a loose file is the one being read")
     with_mesh: bpy.props.BoolProperty(
         name="Mesh", default=True,
         description="Read the geometry: vertices, UVs, vertex groups and materials. "
@@ -532,6 +540,7 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         lay = self.layout
         lay.use_property_split = True
         lay.use_property_decorate = False
+        lay.prop(self, "use_packs")
         lay.prop(self, "with_mesh")
         sub = lay.column()
         sub.enabled = self.with_mesh
@@ -554,7 +563,7 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
                 with_mesh=self.with_mesh, with_flexes=self.with_flexes,
                 with_anims=self.with_anims, with_chained=self.with_chained,
                 game_root=game_root, mods=mods, extra_roots=extract,
-                root_motion=self.root_motion)
+                use_packs=self.use_packs, root_motion=self.root_motion)
         except Exception as exc:
             traceback.print_exc()
             self.report({"ERROR"}, "%s: %s -- traceback on the console"
