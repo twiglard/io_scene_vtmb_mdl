@@ -477,38 +477,34 @@ class VtxFile:
 # ---- building new geometry ------------------------------------------------------
 
 def cut_lods(data):
-    """Every LOD past 0 turned off in one `.vtx`, in place: (bytes, was, switch points).
+    """Every LOD past 0 dropped from one `.vtx`: (bytes, was, switch points).
 
-    Two dwords per model plus the file header's own, written over the finished bytes and
-    nothing else -- the LOD 1..n payload stays on disk with nothing pointing at it, which
-    is what the Unofficial Patch's own four cut models do. Re-laying the file instead
-    shrinks the material replacement list, whose length is `numLODs * 8`, and
-    `Mod_LoadStudioModelVertexData` sizes its allocation off the FILE header
-    (`operator_new(numLODs * 0x18)`, StudioRender 0x2c00537f), so a cut that reaches one
-    header and not the other is an out-of-bounds walk.
+    The file is re-laid with one LOD, so the LOD 1..n strip groups, vertex records,
+    indices and strips leave it rather than staying on disk with nothing pointing at them.
+    The Unofficial Patch's own four cut models keep that payload -- `animalism_beastform`
+    differs from Troika's in two bytes at the same length -- and this does not: the file a
+    writer emits carries what its headers reach and nothing else.
 
-    `was` is the file header's count, and the third value is the switch distance of each
-    LOD that stops being reachable.
+    Both counts come out of one field, which is what a patch over finished bytes had to
+    hold by hand: `Mod_LoadStudioModelVertexData` sizes its allocation with
+    `operator_new(numLODs * 0x18)` off the FILE header (StudioRender 0x2c00537f) and walks
+    the model headers, so a cut reaching one and not the other is an out-of-bounds walk.
+    The material replacement list is `numLODs * 8` long and shrinks with them.
+
+    `was` is the file header's count, and the third value is the switch value of each LOD
+    that goes. A file already at one LOD re-lays byte-identically -- `vtx-rewrite` is 8887
+    of 8887 over the corpus -- so cutting one writes nothing.
     """
-    d = bytearray(data)
-    version, = _u(d, 0, "i")
-    if version != VTX_VERSION:
-        raise ValueError(".vtx version %d, not %d" % (version, VTX_VERSION))
-    was, = _u(d, 0x14, "i")
-    numbodyparts, bodypartoffset = _u(d, 0x1c, "2i")
+    v = VtxFile(data=data)
+    was = v.numlods
     dropped = []
-    for i in range(numbodyparts):
-        bo = bodypartoffset + i * BODYPART_STRIDE
-        nmodels, modeloffset = _u(d, bo, "2i")
-        for j in range(nmodels):
-            mo = bo + modeloffset + j * MODEL_STRIDE
-            nlods, lodoffset = _u(d, mo, "2i")
-            for l in range(1, nlods):
-                dropped.append(_u(d, mo + lodoffset + l * LOD_STRIDE + 8, "f")[0])
-            if nlods > 1:
-                struct.pack_into("<i", d, mo, 1)
-    struct.pack_into("<i", d, 0x14, 1)
-    return bytes(d), was, dropped
+    for bp in v.bodyparts:
+        for model in bp.models:
+            dropped.extend(lod.switch_point for lod in model.lods[1:])
+            del model.lods[1:]
+    v.numlods = 1
+    del v.matrepl[1:]
+    return v.to_bytes(), was, dropped
 
 
 SHADOW_LOD_SWITCH = -1.0

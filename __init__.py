@@ -1393,17 +1393,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     self.report({"INFO"}, "%s was already at one LOD" % row["file"])
             elif forced:
                 self.report({"WARNING"},
-                            "%s cut from %d LODs to 1: the file's own vertex numbering "
-                            "was rebuilt, so every lower LOD named vertices that are no "
-                            "longer there. A lower LOD is an authored decimation and "
-                            "cannot be rebuilt from LOD 0. It used to swap at %s"
-                            % (row["file"], row["was"],
+                            "%s cut from %d LODs to 1, %d byte%s dropped: the file's own "
+                            "vertex numbering was rebuilt, so every lower LOD named "
+                            "vertices that are no longer there. A lower LOD is an authored "
+                            "decimation and is not carried over from the donor. It used to "
+                            "swap at %s"
+                            % (row["file"], row["was"], row["bytes"],
+                               "" if row["bytes"] == 1 else "s",
                                ", ".join("%g" % x for x in row["dropped"])))
             else:
                 self.report({"INFO"},
-                            "%s cut from %d LODs to 1, %d byte%s changed. It used to swap "
-                            "at %s, and that geometry is still in the file with nothing "
-                            "pointing at it"
+                            "%s cut from %d LODs to 1, %d byte%s dropped. It used to swap "
+                            "at %s, and that geometry is no longer in the file"
                             % (row["file"], row["was"], row["bytes"],
                                "" if row["bytes"] == 1 else "s",
                                ", ".join("%g" % x for x in row["dropped"])))

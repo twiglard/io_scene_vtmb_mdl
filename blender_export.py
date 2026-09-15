@@ -2983,6 +2983,9 @@ def stale_flavours(dest, written=("dx80",)):
 def cut_vtx_lods(source, dest, written=(), flavours=None):
     """Every `.vtx` beside the written model turned down to one LOD. One row per file.
 
+    The LOD 1..n payload leaves the file with them -- `vtx_write.cut_lods` re-lays the
+    bytes rather than patching the two counts -- so `bytes` is what the file lost.
+
     Every flavour that exists is edited, not only the one the geometry pass rewrote: the
     engine picks by `-dxlevel` and a flavour left at seven LODs still swaps to a coarse
     mesh. A flavour the geometry pass did not write is copied across from the donor first,
@@ -3011,7 +3014,7 @@ def cut_vtx_lods(source, dest, written=(), flavours=None):
                 f.write(cut)
         out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": was,
                     "dropped": dropped, "why": None,
-                    "bytes": sum(1 for a, b in zip(data, cut) if a != b)})
+                    "bytes": len(data) - len(cut)})
     return out
 
 
@@ -3538,16 +3541,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     touched = (revise_vtx(source, dest, data, revised, vtx_flavours)
                if (revised or removed or added_bones) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
-    # After the geometry pass, which writes whole .vtx files: the cut is two dwords over
-    # the finished bytes and would otherwise be laid back over.
+    # After the geometry pass, which writes whole .vtx files: the cut re-lays what that
+    # pass wrote and would otherwise be laid back over.
     # `revise` rewrites LOD 0 and leaves the lower ones the donor's own triangles, which
     # index by original vertex id -- valid while the numbering holds and meaningless once a
-    # rebuild renumbers or a delete shifts every survivor after the hole. A lower LOD's ids
-    # name the vertices a delete took, so they cannot be remapped either. The decimation is
-    # authored and cannot be rebuilt from LOD 0, so the LODs go. The cut is the whole
-    # file's and not the one model's: `numLODs` agrees between the file header and every
-    # model header on all 8887 shipped files, and the Unofficial Patch's own cut models set
-    # both.
+    # rebuild renumbers or a delete shifts every survivor after the hole. A lower LOD is an
+    # authored decimation and the file the export writes is not the donor, so the LODs go
+    # rather than being carried across from it. The cut is the whole file's and not the one
+    # model's: `numLODs` agrees between the file header and every model header on all 8887
+    # shipped files, and the Unofficial Patch's own cut models set both.
     forced = bool(mesh["renumbered"] or mesh["rebuilt_deleted"]) and not cut_lods
     # A switch-value ladder and a cut to one LOD are contradictory asks, and a cut forced
     # by a renumbering rebuild is the same ask made by the file rather than by the dialog.
