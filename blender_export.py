@@ -1205,12 +1205,12 @@ def stale_stash(m, source):
     return out
 
 
-# Four stamps landed after 0.2.49 was tagged and `bl_info` has not moved since, so
-# `vtmb_addon_version` cannot tell a `.blend` written before one from a scene imported today:
-# both stamp 0.2.49. What a stamp's ABSENCE does say is that the import predates it, which is
-# the test here, and it needs no version. The cloth pin group is the one of the four absence
-# cannot reach -- `vtmb_pinned` existed before its meaning changed on 2026-09-12 -- and
-# separating those two needs the version bump.
+# Four stamps landed while `bl_info` still read 0.2.49, so `vtmb_addon_version` cannot tell a
+# `.blend` written before one from a scene imported in that window: both stamp 0.2.49. What a
+# stamp's ABSENCE does say is that the import predates it, which is the test here, and it needs
+# no version. The cloth pin group is the one of the four absence cannot reach -- `vtmb_pinned`
+# existed before its meaning changed on 2026-09-12 -- and 0.3.0 is what separates it from here
+# on, at or past it the group being pv[:numfixed]. No entry below does that yet.
 STALE_STAMPS = (
     ("vtmb_slot_mats", "object",
      "which material sat in each slot, so a slot reordered or deleted since the import is "

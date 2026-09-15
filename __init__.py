@@ -17,7 +17,7 @@ bl_info = {
                    "and optionally vertex positions, normals, UVs and weights. A "
                    "second exporter authors a .mdl and .dx80.vtx from the scene with "
                    "no donor file at all",
-    "version": (0, 2, 49),
+    "version": (0, 3, 0),
     "category": "Import-Export",
 }
 
