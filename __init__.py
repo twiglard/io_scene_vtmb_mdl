@@ -875,7 +875,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         name="Positions", default=False,
         description="Write each vertex's location. Adding and removing vertices is "
                     "allowed: a mesh whose count moved is rebuilt whole and its "
-                    ".dx80.vtx rewritten beside it")
+                    ".dx80.vtx rewritten beside it. None of these four decides whether a "
+                    "changed set of triangles is written -- that always is, and rebuilds "
+                    "the model from the scene")
     write_normals: bpy.props.BoolProperty(
         name="Normals", default=False,
         description="Write each vertex's normal, which is what the file shades with. "
@@ -1080,7 +1082,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 if no:
                     _pair(box, "cannot store", ", ".join(no), icon="INFO")
             else:
-                _pair(box, "meshes", "left alone", icon="INFO")
+                _pair(box, "meshes", "per-vertex fields left alone; a changed triangle "
+                      "set still rebuilds the model", icon="INFO")
 
         lay.label(text="Rebuilt from scratch: every offset recomputed, unreferenced "
                        "spans dropped.", icon="FILE_REFRESH")

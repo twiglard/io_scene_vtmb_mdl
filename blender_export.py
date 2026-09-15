@@ -3200,6 +3200,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     The skeleton, the material names and the sequence table come from the scene too, and
     unconditionally: each is compared against what the file already says and written only
     where it differs, so an unedited model still comes back byte for byte.
+
+    `mesh_fields` says which per-vertex fields a model that still has the file's own
+    triangles takes from the scene. It does not decide whether the geometry is read: a
+    changed triangle set rebuilds the model from the scene whatever it says, triangles
+    living in the .vtx alone and no field naming one. A rebuild writes the scene's
+    positions and skinning as well, an original keeping what was imported only for the
+    fields `mesh_fields` leaves out.
     """
     m = mdl_mod.Mdl(source)
     if verify:
@@ -3465,50 +3472,56 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source)}
     revised = {}
-    if mesh_fields:
-        cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
-            mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
-            mesh["unskinned"], mesh["stray_groups"] = read_meshes(
-                m, source, mesh_fields)
-        if not cells and not rebuild and not mesh["missing"]:
-            raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
-        for (bi, mi), verts in sorted(cells.items()):
-            rec = d.bodyparts[bi].kids[mi]
-            mo = m.bodyparts[bi].models[mi]
-            was_vb = rec.extra["verts"]
-            rec.extra["verts"], n = mesh_mod.pack_model(mo, verts, mesh_fields, was_vb)
-            # _must_rebuild sends every changed triangle set to the rebuild, so on this
-            # path the donor's triangles are still the written vertices' own.
-            tri = donor_faces.get((bi, mi))
-            rec.extra["tangents"], t = build_mod.retangent_block(
-                mo.filetype, was_vb, rec.extra["verts"], rec.extra.get("tangents") or b"",
-                tri.elements() if tri else (), mo.quant_offset, mo.quant_scale)
-            mesh["verts"] += n
-            mesh["tangents"] += t
-        mesh["models"] = len(cells)
-        bone_index = {b.name: b.index for b in m.bones}
-        for (bi, mi), obj in sorted(rebuild.items()):
-            was = m.bodyparts[bi].models[mi].numvertices
-            tri = donor_faces.get((bi, mi))
-            faces, unskinned, kept, edits = rebuild_cell(
-                d, obj, bi, mi, bone_index, mesh_fields,
-                list(tri.elements()) if tri else None)
-            for k, tris in enumerate(faces):
-                revised[(bi, mi, k)] = tris
-            now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
-                      for x in d.bodyparts[bi].kids[mi].kids)
-            mesh["rebuilt"].append((obj.name, was, now))
-            mesh["unskinned"] += unskinned
-            mesh["renumbered"] += 0 if kept else 1
-            # Same meaning as the in-place path's, so they share the report line.
-            mesh["normals"] += edits["normals"]
-            mesh["blind_normals"] += edits["blind"]
-            mesh["rebuilt_uvs"] += edits["uvs"]
-            mesh["rebuilt_added"] += edits["added"]
-            mesh["rebuilt_deleted"] += edits["deleted"]
-            mesh["flex_dropped"] += edits.get("flex_dropped", 0)
-            mesh["flex_emptied"] += edits.get("flex_emptied", 0)
-            mesh["tangents"] += edits["tangents"]
+    # Whatever the four checkboxes say. Triangles live in the .vtx alone, so a face
+    # added, deleted or re-wound moves no .mdl byte and no checkbox names one -- and a
+    # mesh the scene changed is rebuilt from the scene rather than from the file, which
+    # is what leaves the written model independent of the donor's own geometry.
+    cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
+        mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
+        mesh["unskinned"], mesh["stray_groups"] = read_meshes(
+            m, source, mesh_fields)
+    if mesh_fields and not cells and not rebuild and not mesh["missing"]:
+        # Only where a field was asked for: with none, an untouched scene reaches neither
+        # list and that is the whole of a default export rather than a scene that belongs
+        # to another file.
+        raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
+    for (bi, mi), verts in sorted(cells.items()):
+        rec = d.bodyparts[bi].kids[mi]
+        mo = m.bodyparts[bi].models[mi]
+        was_vb = rec.extra["verts"]
+        rec.extra["verts"], n = mesh_mod.pack_model(mo, verts, mesh_fields, was_vb)
+        # _must_rebuild sends every changed triangle set to the rebuild, so on this
+        # path the donor's triangles are still the written vertices' own.
+        tri = donor_faces.get((bi, mi))
+        rec.extra["tangents"], t = build_mod.retangent_block(
+            mo.filetype, was_vb, rec.extra["verts"], rec.extra.get("tangents") or b"",
+            tri.elements() if tri else (), mo.quant_offset, mo.quant_scale)
+        mesh["verts"] += n
+        mesh["tangents"] += t
+    mesh["models"] = len(cells)
+    bone_index = {b.name: b.index for b in m.bones}
+    for (bi, mi), obj in sorted(rebuild.items()):
+        was = m.bodyparts[bi].models[mi].numvertices
+        tri = donor_faces.get((bi, mi))
+        faces, unskinned, kept, edits = rebuild_cell(
+            d, obj, bi, mi, bone_index, mesh_fields,
+            list(tri.elements()) if tri else None)
+        for k, tris in enumerate(faces):
+            revised[(bi, mi, k)] = tris
+        now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
+                  for x in d.bodyparts[bi].kids[mi].kids)
+        mesh["rebuilt"].append((obj.name, was, now))
+        mesh["unskinned"] += unskinned
+        mesh["renumbered"] += 0 if kept else 1
+        # Same meaning as the in-place path's, so they share the report line.
+        mesh["normals"] += edits["normals"]
+        mesh["blind_normals"] += edits["blind"]
+        mesh["rebuilt_uvs"] += edits["uvs"]
+        mesh["rebuilt_added"] += edits["added"]
+        mesh["rebuilt_deleted"] += edits["deleted"]
+        mesh["flex_dropped"] += edits.get("flex_dropped", 0)
+        mesh["flex_emptied"] += edits.get("flex_emptied", 0)
+        mesh["tangents"] += edits["tangents"]
 
     if write_flexes:
         # After the geometry, because add_flex bounds every key against the mesh's
