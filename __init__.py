@@ -1532,6 +1532,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         % (", ".join(wide[:4])
                            + ("" if len(wide) <= 4 else " and %d more" % (len(wide) - 4)),
                            "it" if len(wide) == 1 else "them"))
+        # The same consequence off a different cause: `requantised` above is the bind
+        # having moved, this is a pose the export authored falling outside the scales the
+        # file was encoded with. Both can fire, over different animations.
+        carried = r.get("requant_carried") or 0
+        if carried:
+            qb = r.get("requant_bones") or []
+            self.report({"WARNING"}, "a pose you exported needed a wider scale on %s, "
+                                     "which re-encoded %d animation%s already in the file"
+                        % (", ".join(qb[:4])
+                           + ("" if len(qb) <= 4 else " and %d more" % (len(qb) - 4)),
+                           carried, "" if carried == 1 else "s"))
         root = r["scene"].get("root_turned") or []
         if root:
             # A movement block is an offset on the entity transform, above the skeleton, so

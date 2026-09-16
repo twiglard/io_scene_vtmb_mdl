@@ -189,6 +189,11 @@ class Desc(object):
         # default so a file read out of bytes keeps the boxes it shipped.
         self.refit_boxes = False
         self.refit_count = 0
+        # What `quantise` had to do, stamped the way `refit_count` is: the bones whose
+        # scales it widened, by file name, and the animations already in the file that it
+        # re-encoded because of them.
+        self.requant_bones = []
+        self.requant_carried = 0
         self.anims = []
         self.seqs = []
         self.seqgroups = []
@@ -2316,6 +2321,7 @@ def quantise(d):
     One scale per bone serves every animation in the file, so a per-animation fit would
     silently requantise the others -- which is why the poses are held until here.
     """
+    d.requant_bones, d.requant_carried = [], 0
     pending = [r for r in d.anims if r.extra.get("poses")]
     if not pending:
         return 0
@@ -2347,6 +2353,7 @@ def quantise(d):
     # One scale set serves the whole file, so widening it for a new pose leaves every
     # animation already in it decoding against scales it was not encoded for.
     if old != scales:
+        d.requant_bones = [b.name for k, b in enumerate(m.bones) if old[k] != scales[k]]
         fresh = set(id(r) for r in pending)
         for r in d.anims:
             if id(r) in fresh or not r.extra.get("block"):
@@ -2355,6 +2362,7 @@ def quantise(d):
             W.rescale(t, old, scales)
             r.extra["block"] = W._anim_block(m, t)
             r.extra["block_bones"] = len(d.bones)
+            d.requant_carried += 1
     return len(pending)
 
 

@@ -438,9 +438,11 @@ def read_bones(m, arm_obj, scale, blind=None):
 def surplus_bones(m, arm_obj):
     """Bones the armature has that the file does not, in armature order.
 
-    `add_surplus_bones` writes these, so on the export path this comes back empty and a
-    name left in it is a bone that could not be placed. The export dialog calls it before
-    anything is written, where it is the list of bones the export is about to add.
+    The export dialog's prediction, called before anything is written, where it is the list
+    of bones the export is about to add. The export path itself has no use for it:
+    `add_surplus_bones` places every one of them or raises naming the ones it could not, so
+    asked afterwards this answers [] whatever happened. What the export reports is
+    `add_surplus_bones`' own list of what it placed.
     """
     have = set(bone_map(m, arm_obj).values())
     return [b.name for b in arm_obj.data.bones if b.name not in have]
@@ -3364,7 +3366,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
              "stale": 0,
              "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
-             "added_materials": [], "surplus": surplus_bones(m, arm_obj),
+             "added_materials": [],
              "slots_moved": 0, "slots_gone": [],
              "renamed_anims": [], "unstamped_renames": [],
              "seqlist": {},
@@ -3591,6 +3593,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "renamed": renamed,
             "model_name": model_name, "hull": hull, "cdtexture": cdtex,
             "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
+            # One scale set serves every animation in the file and `fit_scales` never
+            # narrows, so a pose this export authored can widen a bone for every animation
+            # already in it. `emit` is what runs the fit, so this is read after it.
+            "requant_bones": d.requant_bones, "requant_carried": d.requant_carried,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
