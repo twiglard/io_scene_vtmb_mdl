@@ -584,7 +584,7 @@ def unpack_object(data, at):
     return out
 
 
-def rebuild(obj, keep, pv_new, pos, bound):
+def rebuild(obj, keep, pv_new, pos, bound, npin=None):
     """A shipped cloth object regenerated for a survivor set -- (Cloth, bind, counts).
 
     `keep` is the surviving donor particles in the file's own order, which is what keeps the
@@ -609,10 +609,16 @@ def rebuild(obj, keep, pv_new, pos, bound):
     the regeneration renumbers the edge list, so a record survives only where both its edges
     are still an edge of the new face list; a bound vertex whose record did not survive takes
     its own particle's normal, which the counts report.
+
+    `npin` overrides the count the donor's own prefix gives, which is what a pin edit passes:
+    the pinned set is spelled by the order alone, so a caller changing it hands `keep` already
+    ordered pinned-first and says how many.  Left None the donor's own pins are kept, which is
+    what a delete wants.
     """
     npart, nfix = obj[0x04], obj[0x08]
     pmap = dict((p, i) for i, p in enumerate(keep))
-    npin = sum(1 for p in keep if p < nfix)
+    if npin is None:
+        npin = sum(1 for p in keep if p < nfix)
     faces = [tuple(pmap[p] for p in f[2:5]) for f in obj["faces"]
              if all(p in pmap for p in f[2:5])]
     if not faces:

@@ -1454,6 +1454,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                              % e["sigma_edges"])
             if e["moved"]:
                 moved.append("%d of the cloth's particles moved" % e["moved"])
+            if e["flips"]:
+                moved.append("%d vertex normal flip(s)" % len(e["flips"]))
+            if e["repin"]:
+                moved.append("the pin set, which regenerates the springs and the mass "
+                             "split around it")
+            if e["pins_why"] is not None:
+                self.report({"WARNING"},
+                            "%s: the pin group names a different set of particles than "
+                            "the file pins, and %s -- the file's own pins stay"
+                            % (e["object"] or e["model"], e["pins_why"]))
+            if e["pins"] is not None and e["pins"][1]:
+                self.report({"WARNING"},
+                            "%s: %d vertex(es) of the pin group anchor no cloth particle "
+                            "and are ignored -- %s"
+                            % (e["object"] or e["model"], len(e["pins"][1]),
+                               ", ".join(str(v) for v in e["pins"][1][:8])))
             if e["why"] is not None:
                 self.report({"WARNING"},
                             "%s: %s, so %s"
@@ -1473,6 +1489,16 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             else:
                 self.report({"INFO"}, "%s: cloth refitted -- %s, over %d springs"
                             % (e["object"], " and ".join(moved), e["springs"]))
+        if (cl or {}).get("repinned"):
+            self.report({"WARNING"},
+                        "%d cloth object(s) were regenerated around the pin set the scene "
+                        "names, %d particles pinned in all -- every spring, every ring "
+                        "distance and the collision triangles are functions of the pins, "
+                        "so none of it could be written in place. Spawn it before "
+                        "believing it" % (cl["repinned"], cl["pinned"]))
+        if (cl or {}).get("flips"):
+            self.report({"INFO"},
+                        "%d cloth vertex normal flip(s) written" % cl["flips"])
         for name in (cl or {}).get("flattened") or []:
             self.report({"WARNING"},
                         "%s: this cloth object's stiffness varied spring by spring and the "

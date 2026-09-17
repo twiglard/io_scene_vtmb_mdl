@@ -1038,7 +1038,7 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
     from . import blender_scratch as scratch_mod
     carry = []
-    runs, unskinned, kept, why, edits, _origins = scratch_mod.split_mesh(
+    runs, unskinned, kept, why, edits, origins = scratch_mod.split_mesh(
         obj, bone_index, 1.0, fields, carry)
     mr = d.bodyparts[bi].kids[mi]
     if not kept:
@@ -1053,7 +1053,10 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
     faces, edits["tangents"], flex, edits["cloth"] = build_mod.replace_model(
         d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris,
-        carry=carry if kept else None)
+        carry=carry if kept else None,
+        # `origins` is one list per run and the written model-local numbering is the runs
+        # concatenated in that order, which is the order `replace_model` is handed.
+        flips=cloth_flip_bits(obj, [vi for run in origins for vi in run]))
     edits["flex_dropped"], edits["flex_emptied"] = flex
     return faces, unskinned, kept, edits
 
@@ -2106,6 +2109,107 @@ def cloth_sigma_edges(obj, pv, springs, ns0, donor):
     return {q: buf[at[k]] for q, k in keys.items()}
 
 
+# The addon version at or past which `vtmb_pinned` holds pv[:numfixed]. Before 2026-09-12 the
+# import built that group from the mesh binding, which pins fewer -- 44 against 55 on
+# `panel_cloth` -- so a pin set read off an older scene regenerates the object around the wrong
+# pins, and the group existing before its meaning changed is what absence cannot separate.
+CLOTH_PIN_VERSION = (0, 2, 51)
+
+# A regeneration emits one row and a row is a LOD. The geometry rebuild already cuts the
+# written .vtx to one, so it loses nothing there; an in-place export writes no .vtx at all, so
+# a shipped object of several rows would be left with LODs whose cloth row is gone. 28 of the
+# 60 shipped carriers are single-row -- 4 carry 2, 7 carry 6 and 21 carry 7.
+CLOTH_PIN_ROWS = 1
+
+
+def cloth_flip_bits(obj, origins):
+    """The scene's cloth normal flip per output vertex, or None where the scene never said.
+
+    Bit 15 of `mstudiomesh_t +0x34` negates that vertex's normal, and 63 of the 84 shipped
+    meshes set it on some vertices and not others, so the import stamps it per vertex. A scene
+    carrying neither the attribute nor the object key has said nothing and the file's own bit
+    stands: `blender_scratch.flip_flags` answers False there, which is right for a sheet
+    authored from nothing and would clear every flip in the file on a donor.
+    """
+    from . import blender_scratch as scratch_mod
+    if (obj.data.attributes.get("vtmb_cloth_flip") is None
+            and obj.get("vtmb_cloth_flip") is None):
+        return None
+    return scratch_mod.flip_flags(obj, origins)
+
+
+def cloth_flip_moves(cl, mo, flips):
+    """[(mesh, mesh-local vertex, the bit the scene wants)] where it differs from the file.
+
+    The binding's own entry is one ushort per mesh vertex -- low 15 bits the particle, bit 15
+    the flip -- so an owner byte of 0xff is a vertex this object draws rigidly and has no bit
+    to move. Model vertex index is Blender vertex index, so the scene's per-vertex answer is
+    read at the mesh's own `vertexoffset`.
+    """
+    if flips is None:
+        return []
+    data, out = cl["data"], []
+    for k in sorted(cl["meshes"]):
+        (own_at, p34_at, _p38_at), n = cl["meshes"][k]
+        off = mo.meshes[k].vertexoffset if k < len(mo.meshes) else 0
+        for j in range(n):
+            if data[own_at + j] == 0xff:
+                continue
+            raw = struct.unpack_from("<H", data, p34_at + j * 2)[0]
+            want = flips if isinstance(flips, bool) else bool(flips[off + j])
+            if want != bool(raw & 0x8000):
+                out.append((k, j, want))
+    return out
+
+
+def cloth_pin_set(obj, pv, npart):
+    """(the particles the scene pins, the group members naming no particle), or None.
+
+    The pin set is spelled by the particle ORDER -- [0, numfixed) is pinned and nothing else
+    marks a pin -- so a scene changes it by naming a different set of anchor vertices, and
+    `pv[p]` is a Blender vertex index because a Blender object is one mstudiomodel_t carrying
+    every mesh of it with `vertexoffset` applied. None where the object names no such group,
+    which is a scene that has never said and keeps the file's own pins.
+    """
+    from . import blender_scratch as scratch_mod
+    name = str(obj.get("vtmb_cloth_pin_group") or scratch_mod.PIN_GROUP)
+    vg = obj.vertex_groups.get(name)
+    if vg is None:
+        return None
+    anchors = {}
+    for q in range(min(npart, len(pv))):
+        anchors.setdefault(pv[q], q)
+    members = set(v.index for v in obj.data.vertices
+                  if any(g.group == vg.index for g in v.groups))
+    return (set(anchors[v] for v in members if v in anchors),
+            sorted(members - set(anchors)))
+
+
+def cloth_pin_why(obj, cl, pinned, npart):
+    """Why this object's pin edit cannot be written, or None where it can."""
+    got = obj.get("vtmb_addon_version")
+    got = tuple(int(x) for x in got) if got is not None else None
+    if got is None or got < CLOTH_PIN_VERSION:
+        return ("this scene was imported by addon %s, which built the pin group from the mesh "
+                "binding rather than from pv[:numfixed] -- it pins fewer particles than the "
+                "file does, so writing it would regenerate the cloth around the wrong pins. "
+                "Re-import the file to edit its pins"
+                % (".".join(str(x) for x in got) if got else "0.2.49 or older"))
+    if cl["cols"] != 1:
+        return ("this model's cloth table is %d columns wide and a regeneration emits one"
+                % cl["cols"])
+    if cl["rows"] != CLOTH_PIN_ROWS:
+        return ("this model's cloth table has %d rows, a row is a LOD, and a regeneration "
+                "emits one -- an in-place export writes no .vtx, so the other LODs would be "
+                "left naming a cloth row that is gone. Delete a vertex to take the geometry "
+                "rebuild, which cuts the .vtx to one LOD as well" % cl["rows"])
+    if not pinned:
+        return "the pin group holds no particle's anchor vertex, so every particle would be free"
+    if len(pinned) >= npart:
+        return "the pin group pins every one of the %d particles, so nothing would move" % npart
+    return None
+
+
 def cloth_edits(m, source, d):
     """What each cloth-bound model's scene says that its donor bytes do not.
 
@@ -2125,7 +2229,8 @@ def cloth_edits(m, source, d):
         obj = found.get((bi, mi))
         e = {"key": (bi, mi), "model": mo.name, "object": obj.name if obj else None,
              "why": None, "scale": None, "sigma": None, "slack": None, "moved": 0,
-             "springs": 0, "flattens": False, "sigma_edges": 0}
+             "springs": 0, "flattens": False, "sigma_edges": 0,
+             "flips": [], "pins": None, "pins_why": None, "repin": False}
         out.append(e)
         if obj is None:
             e["why"] = "no mesh object in the scene belongs to this model"
@@ -2139,7 +2244,7 @@ def cloth_edits(m, source, d):
                         "removing one is not a write this exporter has")
             continue
         _k, at = slot
-        scale_f, _npart, _nfixed, ns0, _spoff, pv, springs = _cloth_header(cl["data"], at)
+        scale_f, npart, nfix, ns0, _spoff, pv, springs = _cloth_header(cl["data"], at)
         if not springs or not pv:
             e["why"] = "the file's cloth object carries no springs or no particle map"
             continue
@@ -2191,14 +2296,39 @@ def cloth_edits(m, source, d):
                          if v < len(me.vertices)
                          and _d2(tuple(me.vertices[v].co), w) > CLOTH_MIN_D2)
         e["springs"] = len(springs)
+        # The scene's flip and the scene's pin set, which are what the panel draws and what
+        # the donor path read nowhere until now. Blender vertex index is model-local vertex
+        # index here -- one Blender vertex per model vertex, `vertexoffset` applied -- which
+        # is what the vertex-count comparison above has already established.
+        e["flips"] = cloth_flip_moves(cl, mo, cloth_flip_bits(obj, range(len(me.vertices))))
+        e["pins"] = cloth_pin_set(obj, pv, npart)
+        if e["pins"] is not None and e["pins"][0] != set(range(nfix)):
+            e["pins_why"] = cloth_pin_why(obj, cl, e["pins"][0], npart)
+            e["repin"] = e["pins_why"] is None
     return out
+
+
+def cloth_refit(moved, a, b, d2_was, d2_now):
+    """Whether a spring's `rest2` is refitted: one of its particles moved, and it has a
+    direction to carry.
+
+    It keys off the particle set `cloth_edits` counts `moved` with and never off the
+    spring's own separation. A squared displacement is quadratic in a position error where
+    a difference of two squared separations is linear in it, so one absolute tolerance over
+    both is two different sensitivities: on a filetype-1 donor, whose packed positions
+    decode to a different float32 than the ones the file was authored from, the per-vertex
+    test reads about 1e-12 and the per-spring one about 4e-6, and any cloth edit at all then
+    refit 2340 of bilttablea's 2657 rest lengths against positions nothing wrote (BUGS 153).
+    """
+    return (a in moved or b in moved) and d2_was > CLOTH_MIN_D2
 
 
 def apply_cloth(d, m, source, edits=None):
     """Each model's row-0 cloth object rewritten in place from the scene.
 
     `scale` at +0x00, each spring's `w0`/`w1` from the panel's sigma with the file's own
-    mass split kept, and `rest2` refitted to where the particle's vertex now sits. Nothing
+    mass split kept, and `rest2` refitted on the springs whose own particles the scene
+    moved -- and on no others, whatever the arithmetic says the separation is. Nothing
     outside the object's own bytes moves, so the region keeps its length and the second
     indirection stays as it was -- the table stores no count and every payload offset is
     object-relative (anomalies section B10).
@@ -2212,12 +2342,12 @@ def apply_cloth(d, m, source, edits=None):
         edits = cloth_edits(m, source, d)
     found = mesh_objects(m, source)
     out = {"models": 0, "springs": 0, "scale": 0, "sigma": 0, "slack": 0, "refitted": 0,
-           "sigma_edges": 0, "flattened": []}
+           "sigma_edges": 0, "flattened": [], "flips": 0, "repinned": 0, "pinned": 0}
     for e in edits:
         if e["why"] is not None:
             continue
         if not (e["scale"] or e["sigma"] or e["slack"] or e["moved"]
-                or e["sigma_edges"]):
+                or e["sigma_edges"] or e["flips"] or e["repin"]):
             continue
         bi, mi = e["key"]
         cl = d.bodyparts[bi].kids[mi].extra["cloth"]
@@ -2229,6 +2359,8 @@ def apply_cloth(d, m, source, edits=None):
         now = [tuple(me.vertices[v].co) if v < len(me.vertices) else (0.0, 0.0, 0.0)
                for v in pv]
         was = [donor[v].pos if v < len(donor) else (0.0, 0.0, 0.0) for v in pv]
+        moved = {p for p, (nw, wz) in enumerate(zip(now, was))
+                 if _d2(nw, wz) > CLOTH_MIN_D2}
         if e["scale"]:
             struct.pack_into("<f", data, at, e["scale"][1])
             out["scale"] += 1
@@ -2253,18 +2385,85 @@ def apply_cloth(d, m, source, edits=None):
                 d2_was, d2_now = _d2(was[a], was[b]), _d2(now[a], now[b])
                 if q >= ns0 and slack is not None:
                     rest2 = slack * d2_now
-                elif d2_was > CLOTH_MIN_D2 and abs(d2_now - d2_was) > CLOTH_MIN_D2:
+                elif cloth_refit(moved, a, b, d2_was, d2_now):
                     rest2 = (rest2 / d2_was) * d2_now if CLOTH_KEEP_RATIO else d2_now
                     out["refitted"] += 1
             struct.pack_into("<2H3f", data, at + spoff + q * 16, a, b, w0, w1, rest2)
             out["springs"] += 1
+        for k, j, want in e["flips"]:
+            (_own_at, p34_at, _p38_at), _n = cl["meshes"][k]
+            raw = struct.unpack_from("<H", data, p34_at + j * 2)[0]
+            struct.pack_into("<H", data, p34_at + j * 2,
+                             (raw & 0x7fff) | (0x8000 if want else 0))
+            out["flips"] += 1
         cl["data"] = bytes(data)
+        if e["repin"]:
+            # After the edits above, so the regeneration carries the sigma and the scale
+            # this export just wrote rather than the ones the file came with.
+            npin = cloth_repin(d, m, found[(bi, mi)], e)
+            out["repinned"] += 1
+            out["pinned"] += npin
         out["models"] += 1
         out["sigma"] += 1 if sigma is not None else 0
         out["slack"] += 1 if slack is not None else 0
         if e["flattens"]:
             out["flattened"].append(e["object"])
     return out
+
+
+def cloth_repin(d, m, obj, e):
+    """The model's row-0 cloth object regenerated around the pin set the scene names.
+
+    The pinned set is spelled by the particle ORDER alone -- [0, numfixed) is pinned -- and
+    `k0 = r0^2 / (r0^2 + r1^2)` for `r` the ring index from it, so every spring endpoint,
+    every ring distance and the collision-triangle block are functions of the pin set and
+    none of them can be written in place. `mdl_build._rebuild_cloth` is the same
+    regeneration for a geometry edit; here nothing was deleted, so every particle survives
+    and its model-local vertex is the one the file gave it.
+
+    Returns how many particles the written object pins.
+    """
+    bi, mi = e["key"]
+    cl = d.bodyparts[bi].kids[mi].extra["cloth"]
+    _k, at = _cloth_slot(cl)
+    data = cl["data"]
+    co = cloth_mod.unpack_object(data, at)
+    npart = co[0x04]
+    pinned = e["pins"][0]
+    keep = ([q for q in range(npart) if q in pinned]
+            + [q for q in range(npart) if q not in pinned])
+    me = obj.data
+    pv_new = [co["pv"][q] for q in keep]
+    pos = [tuple(me.vertices[v].co) if v < len(me.vertices) else (0.0, 0.0, 0.0)
+           for v in pv_new]
+    mo = m.bodyparts[bi].models[mi]
+    flips = cloth_flip_bits(obj, range(len(me.vertices)))
+    bound = []
+    for k in sorted(cl["meshes"]):
+        (own_at, p34_at, p38_at), n = cl["meshes"][k]
+        off = mo.meshes[k].vertexoffset if k < len(mo.meshes) else 0
+        for j in range(n):
+            if data[own_at + j] == 0xff:
+                continue
+            raw = struct.unpack_from("<H", data, p34_at + j * 2)[0]
+            if flips is None:
+                flip = bool(raw & 0x8000)
+            elif isinstance(flips, bool):
+                flip = flips
+            else:
+                flip = bool(flips[off + j])
+            bound.append((k, j, raw & 0x7fff, flip,
+                          struct.unpack_from("<H", data, p38_at + j * 2)[0]))
+    c, bind, _counts = cloth_mod.rebuild(co, keep, pv_new, pos, bound, npin=len(pinned))
+    full = {}
+    for k in sorted(cl["meshes"]):
+        ent = [None] * cl["meshes"][k][1]
+        for v, rec in bind.get(k, {}).items():
+            ent[v] = rec
+        full[k] = ent
+    d.bodyparts[bi].kids[mi].extra["cloth"] = cloth_mod.region(
+        cloth_mod.pack(c), c.numparticles, full)
+    return len(pinned)
 
 
 def apply_flex(d, m, arm_obj):

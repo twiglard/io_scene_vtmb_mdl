@@ -330,7 +330,7 @@ def _regrow_cloth(mr, k, new_n):
     return True
 
 
-def _rebuild_cloth(mr, was, carry, meshes):
+def _rebuild_cloth(mr, was, carry, meshes, flips=None):
     """The model's row-0 cloth object regenerated for the survivors of a geometry edit.
 
     Returns None where nothing was deleted, having only regrown the per-vertex arrays for
@@ -342,6 +342,11 @@ def _rebuild_cloth(mr, was, carry, meshes):
     18.2%, are row-0 particles.  A row is a LOD and a rebuild already cuts the written .vtx
     to one, so one row is emitted -- which loses an upper seam on the 20 of 61 row-0 objects
     that carry one, 0 carrying a lower one.
+
+    `flips` is the scene's normal flip per WRITTEN model-local vertex, a bool covering every
+    one of them, or None to keep the bit the file carries.  Bit 15 of +0x34 is a per-vertex
+    authored fact the scene holds as an attribute, so a rebuild reading the donor's would
+    discard an edit made in the same session as the geometry one.
     """
     cl = mr.extra.get("cloth")
     if not cl:
@@ -364,10 +369,11 @@ def _rebuild_cloth(mr, was, carry, meshes):
     data = cl["data"]
     obj = cloth_mod.unpack_object(data, at)
     npart = obj[0x04]
-    newof, pos_all, new_off = {}, [], 0
+    newof, pos_all, new_off, newoff_of = {}, [], 0, {}
     for k, (_material, verts, _tris) in enumerate(meshes):
         cmap = None if carry is None else carry[k]
         old_off = was[k][1]
+        newoff_of[k] = new_off
         for j in range(len(verts)):
             o = j if cmap is None else cmap[j]
             if o is not None:
@@ -388,7 +394,13 @@ def _rebuild_cloth(mr, was, carry, meshes):
             raw = struct.unpack_from("<H", data, p34_at + o * 2)[0]
             if raw & 0x7fff not in alive:
                 continue
-            bound.append((k, j, raw & 0x7fff, bool(raw & 0x8000),
+            if flips is None:
+                flip = bool(raw & 0x8000)
+            elif isinstance(flips, bool):
+                flip = flips
+            else:
+                flip = bool(flips[newoff_of[k] + j])
+            bound.append((k, j, raw & 0x7fff, flip,
                           struct.unpack_from("<H", data, p38_at + o * 2)[0]))
     c, bind, counts = cloth_mod.rebuild(obj, keep, pv_new, pos, bound)
     full = {}
@@ -2215,7 +2227,8 @@ def set_model_name(d, bi, mi, name):
     r.raw[0:128] = b + b"\x00" * (128 - len(b))
 
 
-def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=None):
+def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
+                  carry=None, flips=None):
     """Rewrite one existing model's geometry, keeping everything else its records carry.
 
     `meshes` is `add_model`'s -- [(material, verts, faces), ...] -- one entry per mesh the
@@ -2232,6 +2245,9 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=No
     local index j is donor local index j, which an append satisfies and a delete does not.
     With it the donor's per-vertex fields, its tangents and its flex payloads all resolve
     through the map, so a delete keeps the file's own numbering for every survivor.
+
+    `flips` is the scene's cloth normal flip per written model-local vertex, passed through
+    to the cloth rebuild; None keeps the bit the file carries.
 
     Returns the per-mesh face lists, how many tangents were rewritten,
     (flex records dropped, flexes left holding none), and what a cloth rebuild dropped or
@@ -2277,7 +2293,7 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=No
             flexempty += b
         offset += len(verts)
         faces.append(list(tris))
-    cloth = _rebuild_cloth(mr, was, carry, meshes)
+    cloth = _rebuild_cloth(mr, was, carry, meshes, flips)
     mr.extra["verts"] = bytes(vb)
     mr.extra["tangents"] = bytes(tb)
     # 44-byte records are filetype 0 whatever the donor was: 1 and 2 carry no weight or

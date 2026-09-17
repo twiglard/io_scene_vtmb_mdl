@@ -451,6 +451,7 @@ def draw_cloth(lay, obj):
                   icon="ERROR")
     else:
         lay.label(text="%d pinned, %d free" % (pins[0], pins[1] - pins[0]))
+        lay.label(text="a changed pin set regenerates the springs and the mass split")
 
 
 class VTMB_PT_cloth(bpy.types.Panel):
