@@ -1027,9 +1027,9 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     A delete is not that case. The survivors keep the file's own order, so `split_mesh`
     reports the donor vertex each written one came from and the flex payloads are
     renumbered through it -- a record naming the deleted vertex is dropped and the rest
-    keep the vertex they named. A cloth binding still refuses: `mstudiocloth_t.vertindex`
-    names a model vertex that has to exist, so a particle whose anchor has gone has no
-    entry to emit.
+    keep the vertex they named. A cloth binding is regenerated for the particles whose
+    anchor vertex survived, `mstudiocloth_t.vertindex` being one ushort per particle naming
+    a model vertex that has to exist; what that drops comes back in `edits["cloth"]`.
 
     `fields` is what the checkboxes asked for. Without it a face added or a winding
     reversed changes Blender's corner normal on every vertex it touches, and the split
@@ -1051,20 +1051,7 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
             raise ValueError(
                 "%s: the file's own vertex numbering could not be recovered -- %s -- and "
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
-    cl = mr.extra.get("cloth") if edits["deleted"] else None
-    bound = [] if not cl else [
-        k for k, cmap in enumerate(carry)
-        if k in cl["meshes"] and cmap is not None
-        and len(cmap) - sum(1 for o in cmap if o is None)
-        < struct.unpack_from("<i", mr.kids[k].raw, 0x08)[0]]
-    if bound:
-        raise ValueError(
-            "%s: mesh %s lost a vertex and binds this model's cloth. "
-            "mstudiocloth_t.vertindex names a model vertex that has to exist, so a "
-            "particle whose anchor has gone has no entry to emit, and dropping the "
-            "particle renumbers the spring array"
-            % (obj.name, ", ".join(str(k) for k in bound)))
-    faces, edits["tangents"], flex = build_mod.replace_model(
+    faces, edits["tangents"], flex, edits["cloth"] = build_mod.replace_model(
         d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris,
         carry=carry if kept else None)
     edits["flex_dropped"], edits["flex_emptied"] = flex
@@ -2158,9 +2145,10 @@ def cloth_edits(m, source, d):
             continue
         me = obj.data
         if len(me.vertices) != mo.numvertices:
-            e["why"] = ("the scene holds %d vertices where the file's model has %d, so a "
-                        "particle's rest position cannot be read"
-                        % (len(me.vertices), mo.numvertices))
+            e["why"] = ("the scene holds %d vertices where the file's model has %d, so "
+                        "neither `pv` nor a particle's rest position reads against the "
+                        "donor -- the geometry rebuild has already regenerated this "
+                        "object from the scene" % (len(me.vertices), mo.numvertices))
             continue
         donor = m.vertices(mo)
         was = [donor[v].pos if v < len(donor) else (0.0, 0.0, 0.0) for v in pv]
@@ -3470,6 +3458,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
             "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
             "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
+            "cloth_rebuilt": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source)}
@@ -3524,6 +3513,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["flex_dropped"] += edits.get("flex_dropped", 0)
         mesh["flex_emptied"] += edits.get("flex_emptied", 0)
         mesh["tangents"] += edits["tangents"]
+        if edits.get("cloth"):
+            mesh["cloth_rebuilt"].append((obj.name, edits["cloth"]))
 
     if write_flexes:
         # After the geometry, because add_flex bounds every key against the mesh's

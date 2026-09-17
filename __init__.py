@@ -1256,6 +1256,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "and were dropped. Every survivor keeps the file's own order and "
                         "the flex payloads follow the new numbering"
                         % mesh["rebuilt_deleted"])
+        for name, c in mesh["cloth_rebuilt"]:
+            # Rows and seams are in the list because a rebuild emits one row --
+            # mdl_build._rebuild_cloth says why.
+            lost = ", ".join(
+                "%d %s" % (c[k], w) for k, w in
+                (("particles", "particles"), ("springs", "springs"), ("faces", "faces"),
+                 ("blends", "blend normals"), ("rows", "further cloth rows"),
+                 ("seams", "upper seams")) if c[k])
+            self.report({"WARNING"},
+                        "%s: this model's cloth was regenerated for the vertices the edit "
+                        "left, which dropped %s. Spawn it before believing it"
+                        % (name, lost or "nothing"))
         if mesh["flex_dropped"] or mesh["flex_emptied"]:
             self.report({"WARNING"},
                         "%d morph-target delta%s named a deleted vertex and went with "

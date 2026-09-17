@@ -487,43 +487,184 @@ def pack(c):
 
 
 
-def region(blob, nvert, npart, flip):
+def one_to_one(nvert, npart, flip):
+    """`region`'s binding for a sheet the generator made: vertex v is particle v.
+
+    Bit 15 of the +0x34 entry negates that vertex's normal, and 63 of the 84 shipped meshes
+    set it on some vertices and not others, so a shipped object needs one flag per vertex.
+    A bool is the whole mesh, which is what an authored sheet has.
+
+    The normal index is the particle's own.  A generated object carries no blends, so the
+    normal array is `numparticles` long and a particle index is the only thing in range --
+    which is NOT the shipped form: on 59 of the 60 shipped row-0 objects `numblends` equals
+    the bound vertex count and +0x38 runs `numparticles + i` over the bound vertices in
+    mesh-then-vertex order, 31 008 of 31 008 entries at or past `numparticles`.
+    """
+    if nvert > npart:
+        raise Refused("a cloth region wants at least one particle per vertex, and this "
+                      "one has %d vertices against %d particles" % (nvert, npart))
+    if isinstance(flip, (bool, int)):
+        bits = [bool(flip)] * nvert
+    else:
+        bits = [bool(f) for f in flip]
+        if len(bits) != nvert:
+            raise Refused("%d flip flags against %d vertices; +0x34 is one entry per "
+                          "vertex" % (len(bits), nvert))
+    return {0: [(v, bits[v], v) for v in range(nvert)]}
+
+
+def region(blob, npart, bind):
     """`mstudiomodel_t`'s cloth as mdl_build's dict: table, object, three per-mesh arrays.
+
+    `bind` is one entry per vertex per mesh -- `{mesh index: [(particle, flip, normal) or
+    None, ...]}` -- None being a vertex the cloth does not drive, which takes owner 0xff.
+    `one_to_one` builds the generator's own.
 
     `data` is laid out as one blob and every offset in the dict is relative to its start;
     `mdl_build.emit` places it and patches the table slots and the three `mstudiomesh_t`
     fields.  The nine payload offsets inside the object are object-relative and `pack`
     already wrote them, so nothing here touches the object's bytes.
     """
-    if nvert > npart:
-        raise Refused("a cloth region wants at least one particle per vertex, and this "
-                      "one has %d vertices against %d particles" % (nvert, npart))
-    table = struct.pack("<i", 4)                     # one slot, the object right after it
-    # Bit 15 negates that vertex's normal, and 63 of the 84 shipped meshes set it on some
-    # vertices and not others, so a shipped object needs one flag per vertex. A bool is
-    # the whole mesh, which is what an authored sheet has.
-    if isinstance(flip, (bool, int)):
-        bits = [0x8000 if flip else 0] * nvert
-    else:
-        bits = [0x8000 if f else 0 for f in flip]
-        if len(bits) != nvert:
-            raise Refused("%d flip flags against %d vertices; +0x34 is one entry per "
-                          "vertex" % (len(bits), nvert))
     # All three arrays start 4-aligned on 84 of 84 shipped meshes, so an odd vertex count
     # needs the ushort ones padded too, not only the documented byte one.
     def pad(x):
         return x + bytes(-len(x) % 4)
-    own = pad(bytes(nvert))                          # column 0 for every vertex
-    p34 = pad(b"".join(struct.pack("<H", v | bits[v]) for v in range(nvert)))
-    p38 = pad(b"".join(struct.pack("<H", v) for v in range(nvert)))
-    at_own = 4 + len(blob)
-    at_p34 = at_own + len(own)
-    at_p38 = at_p34 + len(p34)
-    for name, off in (("object", 4), ("owner", at_own), ("particle", at_p34),
-                      ("normal", at_p38)):
-        if off % 4:
-            raise Refused("the cloth region's %s array lands at %d, which is not "
-                          "4-aligned; all three start 4-aligned on 84 of 84 shipped "
-                          "meshes" % (name, off))
-    return {"data": table + blob + own + p34 + p38, "cols": 1, "rows": 1, "table": 0,
-            "slots": [(0, 4)], "meshes": {0: ([at_own, at_p34, at_p38], nvert)}}
+    body, meshes, off = [], {}, 4 + len(blob)
+    for k in sorted(bind):
+        ent = bind[k]
+        for e in ent:
+            if e is not None and not 0 <= e[0] < npart:
+                raise Refused("mesh %d binds a vertex to particle %d of %d"
+                              % (k, e[0], npart))
+        own = pad(bytes(0xff if e is None else 0 for e in ent))
+        p34 = pad(b"".join(struct.pack("<H", 0 if e is None
+                                       else e[0] | (0x8000 if e[1] else 0))
+                           for e in ent))
+        p38 = pad(b"".join(struct.pack("<H", 0 if e is None else e[2]) for e in ent))
+        spans = []
+        for name, arr in (("owner", own), ("particle", p34), ("normal", p38)):
+            if off % 4:
+                raise Refused("the cloth region's %s array lands at %d, which is not "
+                              "4-aligned; all three start 4-aligned on 84 of 84 shipped "
+                              "meshes" % (name, off))
+            spans.append(off)
+            body.append(arr)
+            off += len(arr)
+        meshes[k] = (spans, len(ent))
+    table = struct.pack("<i", 4)                     # one slot, the object right after it
+    return {"data": table + blob + b"".join(body), "cols": 1, "rows": 1, "table": 0,
+            "slots": [(0, 4)], "meshes": meshes}
+
+
+def unpack_object(data, at):
+    """One shipped `mstudiocloth_t` read out of a carried region blob.
+
+    The header ints under their own offsets plus the five blocks a rebuild has to renumber.
+    The batch bytes and the two seam arrays are deliberately absent: `pack` recomputes the
+    first from the spring groups, and a seam binds a free particle onto a triangle of the
+    object one ROW away, which a one-row rebuild has none of.
+    """
+    def i32(o):
+        return struct.unpack_from("<i", data, at + o)[0]
+
+    h = dict((o, i32(o)) for o in range(0, 0x5c, 4))
+    npart, ns = h[0x04], h[0x18] + h[0x1c]
+    out = dict(h)
+    out["scale"] = struct.unpack_from("<f", data, at)[0]
+    out["pv"] = list(struct.unpack_from("<%dH" % npart, data, at + h[0x10])) \
+        if h[0x10] and npart else []
+    out["springs"] = [struct.unpack_from("<2H3f", data, at + h[0x20] + q * 16)
+                      for q in range(ns)] if h[0x20] else []
+    out["edges"] = [struct.unpack_from("<2H", data, at + h[0x40] + q * 4)
+                    for q in range(h[0x38])] if h[0x40] else []
+    out["faces"] = [struct.unpack_from("<5H", data, at + h[0x48] + q * 10)
+                    for q in range(h[0x44])] if h[0x48] else []
+    out["blends"] = [struct.unpack_from("<2H2f", data, at + h[0x50] + q * 12)
+                     for q in range(h[0x4c])] if h[0x50] else []
+    return out
+
+
+def rebuild(obj, keep, pv_new, pos, bound):
+    """A shipped cloth object regenerated for a survivor set -- (Cloth, bind, counts).
+
+    `keep` is the surviving donor particles in the file's own order, which is what keeps the
+    pinned prefix a prefix: particles [0, numfixed) are pinned and nothing else marks a pin,
+    so dropping from inside that range leaves the survivors pinned-first with no reordering.
+    `pv_new` and `pos` are the new model-local vertex and the rest position of each, and
+    `bound` is (mesh, new vertex, donor particle, flip, donor normal index) for every bound
+    vertex the edit left, in mesh-then-vertex order.
+
+    Springs, edges, faces, the collision triangles and the mass split are regenerated rather
+    than renumbered: `k0` is a function of the ring index from the pinned set, which is a
+    property of the surviving graph, so carrying a shipped `k0` through a delete would state
+    the old graph's distances.  Per-spring `sigma` IS carried, keyed by the new particle
+    pair, since it is authored and nothing derives it.
+
+    `slack` is the median of the donor's own group-1 `rest2 / d2` over the pairs that
+    survived, measured against the NEW positions, so a pure delete recovers the authored
+    number exactly and a delete that also moved a vertex recovers it as well as the
+    positions allow.
+
+    The blend normals are carried where they translate.  A blend names two EDGE indices and
+    the regeneration renumbers the edge list, so a record survives only where both its edges
+    are still an edge of the new face list; a bound vertex whose record did not survive takes
+    its own particle's normal, which the counts report.
+    """
+    npart, nfix = obj[0x04], obj[0x08]
+    pmap = dict((p, i) for i, p in enumerate(keep))
+    npin = sum(1 for p in keep if p < nfix)
+    faces = [tuple(pmap[p] for p in f[2:5]) for f in obj["faces"]
+             if all(p in pmap for p in f[2:5])]
+    if not faces:
+        raise Refused("every cloth face lost a corner: %d of the object's %d particles "
+                      "survived the edit and no triangle of the face list is whole"
+                      % (len(keep), npart))
+    ns0 = obj[0x18]
+    # `generate`'s scalar covers both groups, so it is group 1's; every group-0 edge gets an
+    # explicit entry, since a new edge falling back to that scalar would read 1.0.
+    carried = dict((pair(pmap[a], pmap[b]), (w0 - w1) / 2.0)
+                   for a, b, w0, w1, _r in obj["springs"][:ns0]
+                   if a in pmap and b in pmap)
+    hi0 = max([(w0 - w1) / 2.0 for _a, _b, w0, w1, _r in obj["springs"][:ns0]] or [1.0])
+    sig1 = max([(w0 - w1) / 2.0 for _a, _b, w0, w1, _r in obj["springs"][ns0:]] or [1.0])
+    sigma0 = dict((e, carried.get(e, hi0)) for e in tri_edges(faces))
+    slack = None
+    rat = []
+    for a, b, _w0, _w1, rest2 in obj["springs"][ns0:]:
+        if a in pmap and b in pmap:
+            d2 = sum((x - y) ** 2 for x, y in zip(pos[pmap[a]], pos[pmap[b]]))
+            if d2 > 1e-9:
+                rat.append(rest2 / d2)
+    if rat:
+        rat.sort()
+        n = len(rat)
+        slack = rat[n // 2] if n % 2 else (rat[n // 2 - 1] + rat[n // 2]) / 2.0
+    c = generate(pos, faces, npin, pv=pv_new, sigma=sig1, slack=slack,
+                 scale=obj["scale"], sigma0=sigma0)
+    eidx = dict((e, j) for j, e in enumerate(c.edges))
+    enew = {}
+    for j, (p0, p1) in enumerate(obj["edges"]):
+        if p0 in pmap and p1 in pmap:
+            q = eidx.get(pair(pmap[p0], pmap[p1]))
+            if q is not None:
+                enew[j] = q
+    bind, kept_blends = {}, 0
+    for k, v, p, flip, n38 in bound:
+        rec = None
+        if n38 >= npart and n38 - npart < len(obj["blends"]):
+            e0, e1, w0, w1 = obj["blends"][n38 - npart]
+            if e0 in enew and e1 in enew:
+                rec = (enew[e0], enew[e1], w0, w1)
+        if rec is None:
+            n = pmap[p]
+        else:
+            n = len(keep) + len(c.blends)
+            c.blends.append(rec)
+            kept_blends += 1
+        bind.setdefault(k, {})[v] = (pmap[p], flip, n)
+    counts = {"particles": npart - len(keep),
+              "springs": len(obj["springs"]) - len(c.springs),
+              "faces": len(obj["faces"]) - len(faces),
+              "blends": len(obj["blends"]) - kept_blends,
+              "seams": 1 if (obj[0x54] or obj[0x58]) else 0}
+    return c, bind, counts

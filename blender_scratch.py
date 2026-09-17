@@ -584,7 +584,9 @@ def add_cloth(d, obj, verts, faces, npin, flip=False, origins=None):
                            else sigma_edges(obj, origins, faces))
     blob = cloth_mod.pack(c)
     mr = d.bodyparts[-1].kids[-1]
-    mr.extra["cloth"] = cloth_mod.region(blob, len(verts), c.numparticles, flip)
+    mr.extra["cloth"] = cloth_mod.region(
+        blob, c.numparticles,
+        cloth_mod.one_to_one(len(verts), c.numparticles, flip))
     return c, blob
 
 

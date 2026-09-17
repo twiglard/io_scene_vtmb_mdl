@@ -16,9 +16,10 @@ whose real input is a Blender scene.
 Sections whose internal structure is unimplemented are *carried*, not dropped: cloth moves
 as one rigid region with its pointers recomputed (`_cloth_region`), and a cloth-bound mesh
 whose vertex count changed has its three per-vertex arrays rebuilt for that count
-(`_regrow_cloth`).  `_drop_stale_cloth` is the backstop for a count that moved without
-saying so.  `Desc.dropped` counts everything not carried, and `emit` refuses unless the
-caller passes `drop=True`; over `gamedata\\models` nothing populates it, all 3263
+(`_regrow_cloth`) -- or, where the edit deleted a vertex, the whole object regenerated for
+the surviving particles (`_rebuild_cloth`).  `_drop_stale_cloth` is the backstop for a count
+that moved without saying so.  `Desc.dropped` counts everything not carried, and `emit`
+refuses unless the caller passes `drop=True`; over `gamedata\\models` nothing populates it, all 3263
 procedural bones being proctype 1.
 
 `replace_model` is the third entry point, between the two: it rewrites one existing model's
@@ -33,6 +34,7 @@ import struct
 import sys
 
 try:
+    from . import cloth as cloth_mod
     from . import mdl as M
     from . import mdl_write as W
     from . import normal_table as NT
@@ -40,6 +42,7 @@ try:
     from . import sections as S
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import cloth as cloth_mod
     import mdl as M
     import mdl_write as W
     import normal_table as NT
@@ -292,7 +295,7 @@ def _drop_stale_cloth(d):
                 break
 
 
-def _regrow_cloth(mr, k, new_n, deleted=0):
+def _regrow_cloth(mr, k, new_n):
     """Mesh `k`'s three per-vertex cloth arrays, rebuilt for a new vertex count.
 
     Row-major -- row r's slice starts at `numvertices * r`, recon 29.3 -- so a count change
@@ -308,14 +311,6 @@ def _regrow_cloth(mr, k, new_n, deleted=0):
     cl = mr.extra.get("cloth")
     if not cl or k not in cl["meshes"]:
         return False
-    if deleted:
-        raise Refused(
-            "mesh %d carries a cloth binding and %d of its vertices were deleted. "
-            "mstudiocloth_t.vertindex is one ushort per particle naming a model vertex "
-            "that has to exist -- ProcessMesh1_Cloth_000H StudioRender 0x2c023590 reads "
-            "pv[p] every frame and skins it -- so a particle whose anchor has gone has no "
-            "entry to emit, and dropping the particle renumbers the spring array"
-            % (k, deleted))
     spans, old_n = cl["meshes"][k]
     if old_n == new_n:
         return False
@@ -333,6 +328,78 @@ def _regrow_cloth(mr, k, new_n, deleted=0):
     cl["data"] = bytes(data)
     cl["meshes"][k] = (out, new_n)
     return True
+
+
+def _rebuild_cloth(mr, was, carry, meshes):
+    """The model's row-0 cloth object regenerated for the survivors of a geometry edit.
+
+    Returns None where nothing was deleted, having only regrown the per-vertex arrays for
+    the new counts; otherwise a dict of what the rebuild dropped, for the caller to report.
+
+    Which vertices simulate is a per-vertex authored fact with no scene representation, so
+    the particle set comes from the file's own binding and never from the mesh: the 84
+    shipped binding blocks sit on meshes holding 170 190 vertices between them and 31 008,
+    18.2%, are row-0 particles.  A row is a LOD and a rebuild already cuts the written .vtx
+    to one, so one row is emitted -- which loses an upper seam on the 20 of 61 row-0 objects
+    that carry one, 0 carrying a lower one.
+    """
+    cl = mr.extra.get("cloth")
+    if not cl:
+        return None
+    lost = [k for k in range(len(meshes))
+            if carry is not None and carry[k] is not None
+            and was[k][0] > sum(1 for o in carry[k] if o is not None)]
+    if not lost:
+        for k, (_material, verts, _tris) in enumerate(meshes):
+            _regrow_cloth(mr, k, len(verts))
+        return None
+    if cl["cols"] != 1:
+        raise Refused(
+            "this model's cloth table is %d columns wide and a rebuild emits one. "
+            "1 of the 60 shipped carriers is wider" % cl["cols"])
+    at = dict(cl["slots"]).get(0)
+    if at is None:
+        raise Refused("this model's cloth table has no row-0 object, and row 0 is the row "
+                      "the scene holds")
+    data = cl["data"]
+    obj = cloth_mod.unpack_object(data, at)
+    npart = obj[0x04]
+    newof, pos_all, new_off = {}, [], 0
+    for k, (_material, verts, _tris) in enumerate(meshes):
+        cmap = None if carry is None else carry[k]
+        old_off = was[k][1]
+        for j in range(len(verts)):
+            o = j if cmap is None else cmap[j]
+            if o is not None:
+                newof[old_off + o] = new_off + j
+            pos_all.append(verts[j][0])
+        new_off += len(verts)
+    keep = [p for p in range(npart) if newof.get(obj["pv"][p]) is not None]
+    pv_new = [newof[obj["pv"][p]] for p in keep]
+    pos = [pos_all[v] for v in pv_new]
+    alive, bound = set(keep), []
+    for k in sorted(cl["meshes"]):
+        (own_at, p34_at, p38_at), old_n = cl["meshes"][k]
+        cmap = None if carry is None else carry[k]
+        for j in range(len(meshes[k][1])):
+            o = j if cmap is None else cmap[j]
+            if o is None or o >= old_n or data[own_at + o] == 0xff:
+                continue
+            raw = struct.unpack_from("<H", data, p34_at + o * 2)[0]
+            if raw & 0x7fff not in alive:
+                continue
+            bound.append((k, j, raw & 0x7fff, bool(raw & 0x8000),
+                          struct.unpack_from("<H", data, p38_at + o * 2)[0]))
+    c, bind, counts = cloth_mod.rebuild(obj, keep, pv_new, pos, bound)
+    full = {}
+    for k in sorted(cl["meshes"]):
+        ent = [None] * len(meshes[k][1])
+        for v, e in bind.get(k, {}).items():
+            ent[v] = e
+        full[k] = ent
+    mr.extra["cloth"] = cloth_mod.region(cloth_mod.pack(c), c.numparticles, full)
+    counts["rows"] = cl["rows"] - 1
+    return counts
 
 
 def _sized(b, base, cnt_off, idx_off, stride):
@@ -2166,8 +2233,9 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=No
     With it the donor's per-vertex fields, its tangents and its flex payloads all resolve
     through the map, so a delete keeps the file's own numbering for every survivor.
 
-    Returns the per-mesh face lists, how many tangents were rewritten, and
-    (flex records dropped, flexes left holding none).
+    Returns the per-mesh face lists, how many tangents were rewritten,
+    (flex records dropped, flexes left holding none), and what a cloth rebuild dropped or
+    None where the model carries no cloth or the edit deleted nothing.
     """
     mr = d.bodyparts[bi].kids[mi]
     if len(meshes) != len(mr.kids):
@@ -2185,7 +2253,6 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=No
     flexdrop = flexempty = 0
     for k, (material, verts, tris) in enumerate(meshes):
         cmap = None if carry is None else carry[k]
-        gone = 0 if cmap is None else was[k][0] - sum(1 for o in cmap if o is not None)
         pvb, ptb = _pack_verts(verts, tris)
         if old_ft == 0:
             _carry_vertex_fields(pvb, old_vb, was[k], len(verts), cmap)
@@ -2208,15 +2275,15 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None, carry=No
             a, b = _remap_flexes(mr.kids[k], cmap, len(verts))
             flexdrop += a
             flexempty += b
-        _regrow_cloth(mr, k, len(verts), gone)
         offset += len(verts)
         faces.append(list(tris))
+    cloth = _rebuild_cloth(mr, was, carry, meshes)
     mr.extra["verts"] = bytes(vb)
     mr.extra["tangents"] = bytes(tb)
     # 44-byte records are filetype 0 whatever the donor was: 1 and 2 carry no weight or
     # bone field at all, so a quantised donor gains skinning here rather than losing it.
     struct.pack_into("<i", mr.raw, 0x9c, 0)
-    return faces, retang, (flexdrop, flexempty)
+    return faces, retang, (flexdrop, flexempty), cloth
 
 
 def _unit(v):
