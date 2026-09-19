@@ -1470,6 +1470,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             "and are ignored -- %s"
                             % (e["object"] or e["model"], len(e["pins"][1]),
                                ", ".join(str(v) for v in e["pins"][1][:8])))
+            if e["flips_other"]:
+                self.report({"WARNING"},
+                            "%s: %d vertex(es) of this model are driven by another cloth "
+                            "object of row 0, which the scene does not hold -- the import "
+                            "puts the first object on the mesh -- so their normal flip "
+                            "bits stay as the file has them"
+                            % (e["object"] or e["model"],
+                               sum(n for _k, n in e["flips_other"])))
             if e["why"] is not None:
                 self.report({"WARNING"},
                             "%s: %s, so %s"

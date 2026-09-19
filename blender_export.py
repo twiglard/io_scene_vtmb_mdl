@@ -2138,28 +2138,43 @@ def cloth_flip_bits(obj, origins):
     return scratch_mod.flip_flags(obj, origins)
 
 
-def cloth_flip_moves(cl, mo, flips):
-    """[(mesh, mesh-local vertex, the bit the scene wants)] where it differs from the file.
+def cloth_flip_moves(cl, mo, flips, col):
+    """([(mesh, mesh-local vertex, the bit the scene wants)], [(mesh, vertices left alone)]).
 
-    The binding's own entry is one ushort per mesh vertex -- low 15 bits the particle, bit 15
-    the flip -- so an owner byte of 0xff is a vertex this object draws rigidly and has no bit
-    to move. Model vertex index is Blender vertex index, so the scene's per-vertex answer is
-    read at the mesh's own `vertexoffset`.
+    The binding's own entry is one owner byte and one ushort per mesh vertex -- low 15 bits
+    the particle, bit 15 the flip. The owner byte is the COLUMN of the row-0 cloth object
+    that drives the vertex, so 0xff is a vertex this model draws rigidly and any other
+    column is a vertex a sibling object owns. `blender_import._stamp_cloth` puts row 0's
+    FIRST object on the mesh and stamps the attribute only where the owner byte is that
+    object's column, so every other column reads False whatever the file holds and writing
+    it would clear the file's own bits -- 293 of them on `tremere_female_armor_3`, the one
+    shipped model of 60 carrying two objects in row 0 (BUGS 154). Those are counted and
+    left alone.
+
+    Model vertex index is Blender vertex index, so the scene's per-vertex answer is read at
+    the mesh's own `vertexoffset`.
     """
     if flips is None:
-        return []
-    data, out = cl["data"], []
+        return [], []
+    data, out, other = cl["data"], [], []
     for k in sorted(cl["meshes"]):
         (own_at, p34_at, _p38_at), n = cl["meshes"][k]
         off = mo.meshes[k].vertexoffset if k < len(mo.meshes) else 0
+        skipped = 0
         for j in range(n):
-            if data[own_at + j] == 0xff:
+            own = data[own_at + j]
+            if own == 0xff:
+                continue
+            if own != col:
+                skipped += 1
                 continue
             raw = struct.unpack_from("<H", data, p34_at + j * 2)[0]
             want = flips if isinstance(flips, bool) else bool(flips[off + j])
             if want != bool(raw & 0x8000):
                 out.append((k, j, want))
-    return out
+        if skipped:
+            other.append((k, skipped))
+    return out, other
 
 
 def cloth_pin_set(obj, pv, npart):
@@ -2230,7 +2245,8 @@ def cloth_edits(m, source, d):
         e = {"key": (bi, mi), "model": mo.name, "object": obj.name if obj else None,
              "why": None, "scale": None, "sigma": None, "slack": None, "moved": 0,
              "springs": 0, "flattens": False, "sigma_edges": 0,
-             "flips": [], "pins": None, "pins_why": None, "repin": False}
+             "flips": [], "flips_other": [], "pins": None, "pins_why": None,
+             "repin": False}
         out.append(e)
         if obj is None:
             e["why"] = "no mesh object in the scene belongs to this model"
@@ -2243,7 +2259,7 @@ def cloth_edits(m, source, d):
             e["why"] = ("the Cloth box is off and the file's cloth object stays -- "
                         "removing one is not a write this exporter has")
             continue
-        _k, at = slot
+        slot_k, at = slot
         scale_f, npart, nfix, ns0, _spoff, pv, springs = _cloth_header(cl["data"], at)
         if not springs or not pv:
             e["why"] = "the file's cloth object carries no springs or no particle map"
@@ -2300,7 +2316,8 @@ def cloth_edits(m, source, d):
         # the donor path read nowhere until now. Blender vertex index is model-local vertex
         # index here -- one Blender vertex per model vertex, `vertexoffset` applied -- which
         # is what the vertex-count comparison above has already established.
-        e["flips"] = cloth_flip_moves(cl, mo, cloth_flip_bits(obj, range(len(me.vertices))))
+        e["flips"], e["flips_other"] = cloth_flip_moves(
+            cl, mo, cloth_flip_bits(obj, range(len(me.vertices))), slot_k % cl["cols"])
         e["pins"] = cloth_pin_set(obj, pv, npart)
         if e["pins"] is not None and e["pins"][0] != set(range(nfix)):
             e["pins_why"] = cloth_pin_why(obj, cl, e["pins"][0], npart)
