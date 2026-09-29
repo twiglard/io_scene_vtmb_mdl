@@ -8,9 +8,9 @@ parsed. That makes it the corpus comparison; it is not what an exporter calls.
 
 `revise` is, and does the opposite: it keeps every strip group the edit did not touch, byte
 for byte as the compiler emitted it, and re-emits only the cells named. LOD 0 only. A named
-mesh split over several strip groups is dealt out again by `vtx_write.assign_groups`, which
-is studiomdl's own rule; a mesh whose groups would change in number or kind, and any mesh
-carrying a cloth group, is refused instead.
+mesh is dealt out again by the rule the shipped files follow -- a triangle with a corner in
+the mesh's cloth binding to the cloth group, the rest by `vtx_write.assign_groups`,
+studiomdl's four passes -- and its groups follow, growing or shrinking in number.
 
 `seed` and `scratch` write a .vtx for a model that never had one.
 """
@@ -114,50 +114,77 @@ def _same_faces(a, b):
     return sorted(_canon(t) for t in a) == sorted(_canon(t) for t in b)
 
 
-def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, i, j, k):
-    """New triangles dealt out over a split mesh's existing strip groups.
+def _kind(g):
+    return (bool(g.flags & W.SG_IS_HW_SKINNED), bool(g.flags & W.SG_IS_FLEXED),
+            bool(g.flags & W.SG_IS_CLOTH))
 
-    studiomdl's rule is in `vtx_write.assign_groups`; `plans/vtx-partition-check.py`
-    holds it to the shipped corpus. The donor's own groups say which passes the mesh has,
-    and a re-partition that would add or drop one is refused rather than guessed at: the
-    group array would have to change length, which no writer path does.
+
+def _format_bits(v, mesh, lod):
+    """The vertex-format bit a new group of this mesh takes, and the file's `+0x07` byte.
+
+    The format bit is one value per mesh in every shipped file, and `+0x07` is padding
+    constant within a file, so any group supplies it.
     """
-    if any(g.flags & W.SG_IS_CLOTH for g in mesh.groups):
-        raise ValueError(
-            "bodypart %d model %d mesh %d has a strip group flagged %#04x, which the "
-            "shipped files set only on cloth, and what puts a triangle in it is unread"
-            % (i, j, k, W.SG_IS_CLOTH))
+    fmt = W.SG_VERTS_ARE_BONED | W.SG_VERTS_ARE_PLAIN
+    near = list(mesh.groups) + [g for e in lod.meshes for g in e.groups]
+    every = [g for bp in v.bodyparts for mo in bp.models for lo in mo.lods
+             for e in lo.meshes for g in e.groups]
+    for g in near + every:
+        if g.flags & fmt:
+            return g.flags & fmt, every[0].unk07
+    return None, 0
+
+
+def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, force_no_flex,
+                 i, j, k):
+    """New triangles dealt out over one mesh's strip groups, as [(group, triangles)].
+
+    A triangle with a corner in the LOD-0 cloth binding goes to the cloth group, placed
+    ahead of the software unflexed pass or last; the rest go through `assign_groups`.
+    A pass the donor lacks gets a new group, and a donor group no pass needs is dropped.
+    """
+    row = src_mesh.clothbind[0] if src_mesh.clothbind else {}
+    drape = [t for t in new if any(x in row for x in t)]
+    rest = [t for t in new if not any(x in row for x in t)]
     flexed = set()
     for f in src_mesh.flexes:
         for va in f.verts:
             flexed.add(va.index)
     vb, vw = {}, {}
-    for t in new:
+    for t in rest:
         for x in t:
             if x in vb:
                 continue
             vert = verts[src_mesh.vertexoffset + x]
             vb[x] = list(vert.bones[:min(4, vert.numbones)])
             vw[x] = list(vert.weights)
-    # forceNoFlex is a per-LOD .qc setting the donor states by having no flexed group.
-    force_no_flex = not any(g.flags & W.SG_IS_FLEXED
-                            for e in lod.meshes for g in e.groups)
-    passes = W.assign_groups(new, flexed, vb, vw, v.maxbones_tri, v.maxbones_vert,
-                             fixed_function, force_no_flex)
-    want = [(bool(g.flags & W.SG_IS_HW_SKINNED), bool(g.flags & W.SG_IS_FLEXED))
-            for g in mesh.groups]
-    got = [(hw, fx) for hw, fx, _t in passes]
-    if want != got:
-        raise ValueError(
-            "bodypart %d model %d mesh %d is split over %d strip groups and the new "
-            "triangles need %d: the donor has %s and the edit wants %s"
-            % (i, j, k, len(want), len(got),
-               " ".join("hw%d/flex%d" % (a, b) for a, b in want),
-               " ".join("hw%d/flex%d" % (a, b) for a, b in got)))
-    return [t for _hw, _fx, t in passes]
+    passes = [(hw, fx, False, t) for hw, fx, t in
+              W.assign_groups(rest, flexed, vb, vw, v.maxbones_tri, v.maxbones_vert,
+                              fixed_function, force_no_flex)]
+    if drape:
+        at = next((q for q, p in enumerate(passes) if not p[0] and not p[1]),
+                  len(passes))
+        passes.insert(at, (False, False, True, drape))
+    spare = list(mesh.groups)
+    out = []
+    for hw, fx, cloth, tris in passes:
+        g = next((g for g in spare if _kind(g) == (hw, fx, cloth)), None)
+        if g is not None:
+            spare.remove(g)
+        else:
+            fmt, pad = _format_bits(v, mesh, lod)
+            if fmt is None:
+                raise ValueError("bodypart %d model %d mesh %d needs a new strip group "
+                                 "and no group in the file says which vertex format it "
+                                 "takes" % (i, j, k))
+            g = W.Group(fmt | (W.SG_IS_HW_SKINNED if hw else 0)
+                        | (W.SG_IS_FLEXED if fx else 0)
+                        | (W.SG_IS_CLOTH if cloth else 0), pad)
+        out.append((g, tris))
+    return out
 
 
-def revise(mdl, vtx_path, faces, fixed_function=None):
+def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
     """One .vtx re-emitted with new triangles for the cells named and the rest untouched.
 
     `mdl` is the model as it will be written, since a changed mesh's bone bindings come out
@@ -166,11 +193,14 @@ def revise(mdl, vtx_path, faces, fixed_function=None):
     byte for byte, so editing one mesh leaves every other alone.
 
     Only LOD 0 is revised; the lower LODs keep their own triangles, which stay valid
-    because an addition never moves an original vertex id.
+    because an addition never moves an original vertex id. `lod0_only` is for an export
+    that cuts the file to one LOD next, which a renumbering rebuild forces: there the lower
+    LODs name vertices by the donor's numbering, so they are left as read and not rebuilt
+    against the written model, whose vertex at the same index is another one.
 
-    A mesh split over several strip groups is partitioned again by
-    `vtx_write.assign_groups`, studiomdl's own four-pass rule, unless the donor's groups
-    would have to change in number or kind, or one of them is flagged as cloth.
+    A named mesh whose triangles differ from the donor's is dealt out by `_repartition`,
+    and its strip groups become the passes that rule asks for, so their number and kind
+    can change.
 
     The .mdl's checksum is written through unchanged: the pair only has to agree with each
     other, and both files are written together.
@@ -186,6 +216,13 @@ def revise(mdl, vtx_path, faces, fixed_function=None):
             src_model = mdl.bodyparts[i].models[j]
             verts = mdl.vertices(src_model)
             for li, lod in enumerate(model.lods):
+                if li and lod0_only:
+                    ri += sum(len(e.groups) for e in lod.meshes)
+                    continue
+                # Read off the donor before any mesh of this LOD is re-dealt: a mesh gaining
+                # a flexed group would otherwise change it for the meshes after.
+                force_no_flex = not any(g.flags & W.SG_IS_FLEXED
+                                        for e in lod.meshes for g in e.groups)
                 for k, mesh in enumerate(lod.meshes):
                     src_mesh = src_model.meshes[k]
                     # LOD 0 only. A lower LOD draws a subset of the same mesh vertices by
@@ -196,32 +233,33 @@ def revise(mdl, vtx_path, faces, fixed_function=None):
                     for n, grp in enumerate(mesh.groups):
                         sg = reader.groups[ri + n]
                         ids = grp.orig_vert_ids() if grp.numverts else []
-                        donor.append((sg, ids,
+                        donor.append((grp, ids,
                                       [tuple(t) for t in reader.triangles(sg)]
                                       if grp.numverts else []))
-                    split = None
-                    if new is not None and len(mesh.groups) != 1:
+                    ri += len(mesh.groups)
+                    if new is not None:
                         # The comparison is in mesh-local indices, which is what the caller
                         # speaks; `rebuild_group` wants the group-local ones kept above.
-                        flat = [tuple(ids[x] for x in t)
-                                for _s, ids, ts in donor for t in ts]
+                        flat = [tuple(ids[x] for x in t) for _g, ids, ts in donor for t in ts]
                         if _same_faces(flat, new):
                             new = None
-                        else:
-                            split = _repartition(mesh, src_mesh, new, verts, v,
-                                                 lod, fixed_function, i, j, k)
-                    for n, grp in enumerate(mesh.groups):
-                        ri += 1
-                        if new is None:
-                            if not grp.numverts:
-                                continue
-                            orig, tris = donor[n][1], donor[n][2]
-                        else:
+                    if new is None:
+                        cells = [(g, ids, tris) for g, ids, tris in donor if g.numverts]
+                    else:
+                        dealt = _repartition(mesh, src_mesh, new, verts, v, lod,
+                                             fixed_function, force_no_flex, i, j, k)
+                        if not dealt and mesh.groups:
+                            # Every triangle deleted leaves one empty group.
+                            dealt = [(mesh.groups[0], [])]
+                        mesh.groups[:] = [g for g, _t in dealt]
+                        cells = []
+                        for g, mine in dealt:
                             st["revised"] += 1
-                            mine = new if split is None else split[n]
                             orig = sorted(set(x for t in mine for x in t))
                             local = dict((o, m) for m, o in enumerate(orig))
-                            tris = [tuple(local[x] for x in t) for t in mine]
+                            cells.append((g, orig, [tuple(local[x] for x in t)
+                                                    for t in mine]))
+                    for grp, orig, tris in cells:
                         vb = (vertex_bones(src_mesh, orig, verts)
                               if grp.flags & W.SG_VERTS_ARE_BONED else None)
                         W.rebuild_group(grp, orig, tris, vb,

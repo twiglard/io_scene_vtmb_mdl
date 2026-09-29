@@ -3400,7 +3400,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved):
             "removed": gone, "renamed": moved, "geometry": geometry_moved}
 
 
-def revise_vtx(source, dest, data, revised, flavours=("dx80",)):
+def revise_vtx(source, dest, data, revised, flavours=("dx80",), lod0_only=False):
     """Rewrite the .vtx for a model whose geometry moved, and return what each cost.
 
     The donor's own file supplies every strip group the edit did not touch, so a change to
@@ -3422,7 +3422,7 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",)):
                     "needs one rewritten -- the engine draws nothing when the pair "
                     "disagrees" % os.path.basename(source))
             continue
-        blob, st = vtxr_mod.revise(written, src, revised)
+        blob, st = vtxr_mod.revise(written, src, revised, lod0_only=lod0_only)
         path = vtx_path(dest, flavour)
         with open(path, "wb") as f:
             f.write(blob)
@@ -3818,16 +3818,6 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
-    # A bone removal or an append moves no vertex and no triangle, so `revised` is empty --
-    # and the .vtx still has to be rewritten, because every strip group's bone data is bound
-    # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
-    # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
-    # was named, so an empty face map is the whole of what either needs.
-    touched = (revise_vtx(source, dest, data, revised, vtx_flavours)
-               if (revised or removed or added_bones) else [])
-    vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
-    # After the geometry pass, which writes whole .vtx files: the cut re-lays what that
-    # pass wrote and would otherwise be laid back over.
     # `revise` rewrites LOD 0 and leaves the lower ones the donor's own triangles, which
     # index by original vertex id -- valid while the numbering holds and meaningless once a
     # rebuild renumbers or a delete shifts every survivor after the hole. A lower LOD is an
@@ -3838,12 +3828,25 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     forced = bool(mesh["renumbered"] or mesh["rebuilt_deleted"]) and not cut_lods
     # A switch-value ladder and a cut to one LOD are contradictory asks, and a cut forced
     # by a renumbering rebuild is the same ask made by the file rather than by the dialog.
-    # Refused before either writer runs, so a stop leaves no half-edited `.vtx` behind.
+    # Refused before any .vtx writer runs, so a stop leaves no half-edited `.vtx` behind.
     switch_vals = parse_lod_switch(lod_switch)
     if switch_vals and (cut_lods or forced):
         raise build_mod.Refused(
             "LOD switch values were given and the LODs are being cut to one LOD%s"
             % ("" if cut_lods else " because a rebuild renumbered the vertices"))
+    # A bone removal or an append moves no vertex and no triangle, so `revised` is empty --
+    # and the .vtx still has to be rewritten, because every strip group's bone data is bound
+    # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
+    # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
+    # was named, so an empty face map is the whole of what either needs.
+    # Under a cut the lower LODs are not rebound: after a renumbering they name the donor's
+    # vertices, and the cut drops them anyway.
+    touched = (revise_vtx(source, dest, data, revised, vtx_flavours,
+                          lod0_only=bool(cut_lods or forced))
+               if (revised or removed or added_bones) else [])
+    vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
+    # After the geometry pass, which writes whole .vtx files: the cut re-lays what that
+    # pass wrote and would otherwise be laid back over.
     lods = (cut_vtx_lods(source, dest, [x["flavour"] for x in touched],
                          None if cut_lods else [x["flavour"] for x in touched])
             if (cut_lods or forced) else [])
