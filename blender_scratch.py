@@ -604,7 +604,7 @@ def refuse_empty(d):
                       "armature, or give one an armature modifier naming it")
 
 
-def add_meshes(d, mesh_objs, bone_index, scale=1.0):
+def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None):
     """One bodypart per object, holding one model whose meshes are its material slots.
 
     A bodypart is a variant selector -- the engine draws one of its models, chosen by
@@ -644,9 +644,11 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0):
             cflip = flip_flags(obj, corig)
             meshes = [(slot, cverts, cfaces)]
         if meshes:
-            build_mod.add_model(d, meshes,
-                                bodypart=obj.get("vtmb_bodypart") or obj.name,
-                                model=obj.get("vtmb_model") or obj.name + ".smd")
+            bi = build_mod.add_model(d, meshes,
+                                     bodypart=obj.get("vtmb_bodypart") or obj.name,
+                                     model=obj.get("vtmb_model") or obj.name + ".smd")
+            if owners is not None:
+                owners.append((bi, obj))
             if cloth is not None:
                 add_cloth(d, obj, cverts, cfaces, npin, cflip, corig)
                 cloths.append((obj.name, npin, len(cverts)))
@@ -760,6 +762,56 @@ def scene_hitboxes(d, arm_obj, bone_index, scale=1.0):
         build_mod.add_hitbox(d, recs, names.get(k, "default"))
         nbox += len(recs)
     return nbox, len(ords)
+
+
+def add_cloth_volumes(d, arm_obj, owners, bone_index, scale=1.0):
+    """Every cloth capsule and sphere empty, on the model its object came from. Returns
+    (records, records put on the first model because no imported object carries theirs).
+
+    Where one lands decides nothing the engine does: the gather at 0x2c014a00 collects the
+    selected submodel of every bodypart into one list, and each bodypart here has one.
+    """
+    caps, sphs = export_mod.cloth_volume_objects(arm_obj)
+    at = {}
+    for bi, obj in owners:
+        if obj.get("vtmb_index") is not None:
+            at.setdefault(int(obj["vtmb_index"]), bi)
+
+    def bone(obj):
+        want = obj.parent_bone if obj.parent_type == "BONE" else ""
+        if want not in bone_index:
+            raise Refused("cloth volume %r is on bone %r, which is not being written"
+                          % (obj.name, want or "<none>"))
+        return bone_index[want]
+
+    blobs, n, moved = {}, 0, 0
+    for key in sorted(caps):
+        ends = caps[key]
+        if set(ends) != {0, 1}:
+            (end, obj), = ends.items()
+            raise Refused("%r is end %d of cloth capsule %d and the other end is gone; "
+                          "delete it too, or add a capsule with Add Cloth Capsule"
+                          % (obj.name, end, key[1]))
+        ends = (ends[0], ends[1])
+        rec = struct.pack("<2i7f", bone(ends[0]), bone(ends[1]),
+                          export_mod._capsule_radius(ends, key[0], key[1], scale),
+                          *(export_mod.cloth_volume_centre(ends[0], arm_obj, scale)
+                            + export_mod.cloth_volume_centre(ends[1], arm_obj, scale)))
+        bi = at.get(key[0], 0)
+        moved += bool(at) and key[0] not in at
+        blobs.setdefault((bi, "clothcollide"), []).append(rec)
+        n += 1
+    for key in sorted(sphs):
+        obj = sphs[key]
+        rec = struct.pack("<if3f", bone(obj), export_mod.cloth_volume_radius(obj, scale),
+                          *export_mod.cloth_volume_centre(obj, arm_obj, scale))
+        bi = at.get(key[0], 0)
+        moved += bool(at) and key[0] not in at
+        blobs.setdefault((bi, "clothsphere"), []).append(rec)
+        n += 1
+    for (bi, k), recs in blobs.items():
+        d.bodyparts[bi].kids[0].extra[k] = b"".join(recs)
+    return n, moved
 
 
 def add_attachments(d, arm_obj, bone_index, scale=1.0):
@@ -925,8 +977,9 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
+    owners = []
     faces, unskinned, kept, crowded, cloths, stray = add_meshes(
-        d, mesh_objs, bone_index, scale)
+        d, mesh_objs, bone_index, scale, owners)
     refuse_empty(d)
     # The scene is the authority: a box or a set the user placed is written whatever the
     # option says, and the refit fills in only a scene that carries neither.
@@ -934,6 +987,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     nfit = fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale) if (
         hitboxes and not nset) else 0
     add_attachments(d, arm_obj, bone_index, scale)
+    d.cloth_volumes = add_cloth_volumes(d, arm_obj, owners, bone_index, scale)
     add_springbones(d, arm_obj, bone_index)
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
@@ -1018,7 +1072,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "material_names": [r.name for r in d.textures],
             "anims": len(d.anims), "seqs": len(d.seqs),
             "includes": len(d.includes),
-            "springs": len(d.springbones),
+            "springs": len(d.springbones), "cloth_volumes": d.cloth_volumes,
             "hitboxes": sum(len(r.kids) for r in d.hitboxsets),
             "faces": st["tris_out"], "verts": st["verts_out"],
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16

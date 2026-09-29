@@ -288,9 +288,9 @@ def _drop_stale_cloth(d):
                 if k < len(mr.kids) and \
                         struct.unpack_from("<i", mr.kids[k].raw, 8)[0] == was:
                     continue
+                # The collision volumes stay: they name bones and no vertex, and the gather
+                # at 0x2c014a00 collides them with every cloth object of the model.
                 mr.extra["cloth"] = None
-                mr.extra["clothcollide"] = b""
-                mr.extra["clothsphere"] = b""
                 d.drop("cloth on a mesh whose vertex count changed")
                 break
 

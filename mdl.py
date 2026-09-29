@@ -247,6 +247,8 @@ BODYPART_STRIDE = 16
 MODEL_STRIDE = 224
 MESH_STRIDE = 60
 EYEBALL_STRIDE = 140
+CLOTHCAPSULE_STRIDE = 36
+CLOTHSPHERE_STRIDE = 20
 MOUTH_STRIDE = 20
 MESH_NUMFLEXES = 0x10
 
@@ -558,7 +560,18 @@ class VertAnim:
 class Model:
     __slots__ = ("index", "name", "nummeshes", "numvertices", "vertexbase",
                  "tangentbase", "filetype", "quant_offset", "quant_scale", "meshes",
-                 "cloths", "clothrows", "clothcols", "eyeballs")
+                 "cloths", "clothrows", "clothcols", "eyeballs", "clothcapsules",
+                 "clothspheres")
+
+
+class ClothCapsule:
+    """One mstudioclothcollide_t, in bone space: p0 rides bone0 and p1 rides bone1."""
+    __slots__ = ("index", "bone0", "bone1", "radius", "p0", "p1")
+
+
+class ClothSphere:
+    """One mstudioclothsphere_t, its centre in `bone`'s space."""
+    __slots__ = ("index", "bone", "radius", "centre")
 
 
 class Eyeball:
@@ -924,7 +937,32 @@ class Mdl:
             m.meshes.append(e)
         self._read_cloths(off, m, meshindex)
         self._read_eyeballs(off, m)
+        self._read_clothvolumes(off, m)
         return m
+
+    def _read_clothvolumes(self, off, m):
+        """The model's cloth collision capsules (+0xd0/+0xd4) and spheres (+0xd8/+0xdc).
+
+        StudioRender's gather reads them off each bodypart's selected submodel only and
+        collides every cloth object of the model with all of them.
+        """
+        d = self.d
+        m.clothcapsules, m.clothspheres = [], []
+        n, idx = struct.unpack_from("<2i", d, off + 0xd0)
+        for k in range(n):
+            c = ClothCapsule()
+            c.index = k
+            f = struct.unpack_from("<2i7f", d, off + idx + k * CLOTHCAPSULE_STRIDE)
+            c.bone0, c.bone1, c.radius = f[0], f[1], f[2]
+            c.p0, c.p1 = f[3:6], f[6:9]
+            m.clothcapsules.append(c)
+        n, idx = struct.unpack_from("<2i", d, off + 0xd8)
+        for k in range(n):
+            c = ClothSphere()
+            c.index = k
+            f = struct.unpack_from("<if3f", d, off + idx + k * CLOTHSPHERE_STRIDE)
+            c.bone, c.radius, c.centre = f[0], f[1], f[2:5]
+            m.clothspheres.append(c)
 
     def _read_eyeballs(self, off, m):
         """Every mstudioeyeball_t of one model, materials and lid flexes resolved by name."""

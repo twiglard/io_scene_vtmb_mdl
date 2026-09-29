@@ -1555,6 +1555,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            "" if r["scene"]["hitboxsets"]
                            else "; every box empty is gone, so the file now holds "
                                 "numhitboxsets 0"))
+        vol = r["scene"].get("cloth_volumes")
+        if vol:
+            self.report({"INFO"}, "%d cloth collision capsule or sphere record%s written "
+                                  "from the scene's empties" % (vol, "" if vol == 1 else "s"))
+        vol = r["scene"].get("cloth_volumes_unread")
+        if vol:
+            self.report({"WARNING"},
+                        "%d cloth volume empt%s not read: this armature was imported before "
+                        "cloth volumes were drawn, or one names a bone it has not got, so the "
+                        "file keeps its own volumes. Import the file again to edit them"
+                        % (vol, "y" if vol == 1 else "ies"))
         if r.get("includes"):
             self.report({"INFO"},
                         "this model chains its animations to %s"
@@ -2222,6 +2233,14 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         for name, npin, nvert in r.get("cloths") or ():
             self.report({"INFO"}, "%s: cloth over %d particles, %d of them pinned"
                         % (name, nvert, npin))
+        nvol, vmoved = r.get("cloth_volumes") or (0, 0)
+        if nvol:
+            self.report({"INFO"}, "%d cloth collision capsule or sphere record%s written from "
+                                  "the scene's empties%s"
+                        % (nvol, "" if nvol == 1 else "s",
+                           "" if not vmoved else
+                           "; %d named a model no object here carries and went on the first"
+                           % vmoved))
         nbox, nset = r.get("scene_hitboxes") or (0, 0)
         nfit = r.get("refit_hitboxes") or 0
         if nset:

@@ -562,6 +562,116 @@ class VTMB_OT_add_hitbox(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _volume_target(context, op):
+    """(armature, bone, scale) the two cloth-volume operators act on, or None, reported.
+
+    A donor armature without `vtmb_cloth_volumes` has its file's volumes carried, so an
+    empty added there would be read by no export.
+    """
+    arm_obj = context.object
+    if arm_obj.get("vtmb_source") and not arm_obj.get("vtmb_cloth_volumes"):
+        op.report({"ERROR"}, "this armature was imported before cloth volumes were drawn, "
+                             "or one names a bone it has not got, so the export carries the "
+                             "file's own volumes and would not read a new one. Import the "
+                             "file again")
+        return None
+    bone = arm_obj.data.bones.get(context.active_bone.name)
+    if bone is None:
+        op.report({"ERROR"}, "bone %r is not in the armature yet; leave Edit mode first"
+                  % context.active_bone.name)
+        return None
+    return arm_obj, bone, float(arm_obj.get("vtmb_scale", 1.0) or 1.0)
+
+
+def _next_volume(arm_obj, model, key):
+    """One past the highest `key` ordinal on that model, so a new volume never shares a slot."""
+    used = [int(o[key]) for o in arm_obj.children_recursive
+            if o.get(key) is not None and o.get("vtmb_cloth_volume_model") == model]
+    return max(used, default=-1) + 1
+
+
+def _volume_empty(arm_obj, bone, label, radius, scale, model, at):
+    obj = bpy.data.objects.new(label, None)
+    obj.empty_display_type = "SPHERE"
+    obj.empty_display_size = radius * scale
+    _link_beside(arm_obj, obj)
+    obj.parent = arm_obj
+    obj.parent_type = "BONE"
+    obj.parent_bone = bone.name
+    obj.matrix_parent_inverse = mathutils.Matrix.Translation((0.0, -bone.length, 0.0))
+    obj.matrix_basis = mathutils.Matrix.Translation(at)
+    obj["vtmb_cloth_volume_model"] = model
+    obj["vtmb_cloth_radius"] = radius
+    return obj
+
+
+_VOLUME_MODEL = ("The flat model index, which is the vtmb_index of that model's object. A "
+                 "volume collides with every cloth object of the whole file, whichever "
+                 "model carries it")
+
+
+class VTMB_OT_add_cloth_capsule(bpy.types.Operator):
+    bl_idname = "vtmb.add_cloth_capsule"
+    bl_label = "Add cloth capsule"
+    bl_description = ("Cloth collision capsule along the active bone, as two sphere "
+                      "empties, one per end. Every shipped capsule has both ends on one bone")
+    bl_options = {"REGISTER", "UNDO"}
+
+    model: bpy.props.IntProperty(name="Model", default=0, min=0, description=_VOLUME_MODEL)
+    radius: bpy.props.FloatProperty(
+        name="Radius", default=3.43, min=1e-3,
+        description="In model units. The median over the 227 shipped capsules is 3.43")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and context.active_bone is not None)
+
+    def execute(self, context):
+        got = _volume_target(context, self)
+        if got is None:
+            return {"CANCELLED"}
+        arm_obj, bone, scale = got
+        k = _next_volume(arm_obj, self.model, "vtmb_cloth_capsule")
+        for end, y in enumerate((0.0, bone.length)):
+            obj = _volume_empty(arm_obj, bone, "%s.m%d.capsule%d.%d"
+                                % (arm_obj.name, self.model, k, end),
+                                self.radius, scale, self.model, (0.0, y, 0.0))
+            obj["vtmb_cloth_capsule"] = k
+            obj["vtmb_cloth_capsule_end"] = end
+        return {"FINISHED"}
+
+
+class VTMB_OT_add_cloth_sphere(bpy.types.Operator):
+    bl_idname = "vtmb.add_cloth_sphere"
+    bl_label = "Add cloth sphere"
+    bl_description = "Cloth collision sphere at the active bone's head"
+    bl_options = {"REGISTER", "UNDO"}
+
+    model: bpy.props.IntProperty(name="Model", default=0, min=0, description=_VOLUME_MODEL)
+    radius: bpy.props.FloatProperty(
+        name="Radius", default=4.40, min=1e-3,
+        description="In model units. The median over the 30 shipped spheres is 4.40")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and context.active_bone is not None)
+
+    def execute(self, context):
+        got = _volume_target(context, self)
+        if got is None:
+            return {"CANCELLED"}
+        arm_obj, bone, scale = got
+        k = _next_volume(arm_obj, self.model, "vtmb_cloth_sphere")
+        obj = _volume_empty(arm_obj, bone, "%s.m%d.sphere%d" % (arm_obj.name, self.model, k),
+                            self.radius, scale, self.model, (0.0, 0.0, 0.0))
+        obj["vtmb_cloth_sphere"] = k
+        return {"FINISHED"}
+
+
 def _link_beside(arm_obj, obj):
     for c in bpy.data.collections:
         if arm_obj.name in c.objects:
@@ -570,11 +680,30 @@ def _link_beside(arm_obj, obj):
     bpy.context.scene.collection.objects.link(obj)
 
 
+def cloth_volume_line(arm_obj):
+    """What the panel says about the cloth collision volumes: the counts, or why none is read.
+
+    Removing one is deleting its empties -- both ends, for a capsule.
+    """
+    try:
+        caps, sphs = blender_export.cloth_volume_objects(arm_obj)
+    except ValueError as exc:
+        return str(exc)
+    if arm_obj.get("vtmb_source") and not arm_obj.get("vtmb_cloth_volumes"):
+        return "cloth volumes: the file's own are carried -- import it again to edit them"
+    return "cloth volumes: %d capsule%s, %d sphere%s; delete the empties to remove one" % (
+        len(caps), "" if len(caps) == 1 else "s", len(sphs), "" if len(sphs) == 1 else "s")
+
+
 def draw_accessories(lay, context, arm_obj):
     attach, boxes, names = accessories_of(arm_obj)
     row = lay.row(align=True)
     row.operator("vtmb.add_attachment", icon="EMPTY_ARROWS")
     row.operator("vtmb.add_hitbox", icon="MESH_CUBE")
+    row = lay.row(align=True)
+    row.operator("vtmb.add_cloth_capsule", icon="SPHERE")
+    row.operator("vtmb.add_cloth_sphere", icon="MESH_UVSPHERE")
+    lay.label(text=cloth_volume_line(arm_obj), icon="INFO")
     if not attach and not boxes:
         lay.label(text="no attachment and no hitbox", icon="INFO")
         return
@@ -2549,7 +2678,8 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_UL_actions,
            VTMB_OT_set_skin_family, VTMB_PT_skin_families,
            VTMB_PT_cloth,
-           VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_PT_accessories,
+           VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_OT_add_cloth_capsule,
+           VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line,

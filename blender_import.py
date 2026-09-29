@@ -633,7 +633,11 @@ def build_accessories(context, m, arm_obj, name, scale):
     dbs = arm_obj.data.bones
     made = []
     eyes = any(mo.eyeballs for bp in m.bodyparts for mo in bp.models)
-    if not m.attachments and not m.hitboxsets and not eyes:
+    vols = any(mo.clothcapsules or mo.clothspheres for bp in m.bodyparts for mo in bp.models)
+    # An export reads the volume empties only where this is set, so a scene imported
+    # before they were drawn, or one missing a volume's bone, carries the file's own.
+    arm_obj["vtmb_cloth_volumes"] = 1
+    if not m.attachments and not m.hitboxsets and not eyes and not vols:
         return made
     coll = _accessory_collection(context, arm_obj, name)
     for a in m.attachments:
@@ -660,6 +664,34 @@ def build_accessories(context, m, arm_obj, name, scale):
                     coll.objects.link(obj)
                     _bone_child(obj, arm_obj, dbs[m.bones[e.bone].name])
                     made.append(obj)
+    models = [mo for bp in m.bodyparts for mo in bp.models]
+    for gi, model in enumerate(models):
+        for c in model.clothcapsules:
+            for end, (bi, p) in enumerate(((c.bone0, c.p0), (c.bone1, c.p1))):
+                obj = _cloth_volume_empty(m, dbs, "%s.m%d.capsule%d.%d" % (
+                    name, gi, c.index, end), bi, p, c.radius, scale)
+                if obj is None:
+                    arm_obj.pop("vtmb_cloth_volumes", None)
+                    continue
+                obj["vtmb_cloth_capsule"] = c.index
+                obj["vtmb_cloth_capsule_end"] = end
+                obj["vtmb_cloth_volume_model"] = gi
+                coll.objects.link(obj)
+                _bone_child(obj, arm_obj, dbs[m.bones[bi].name])
+                obj.matrix_basis = mathutils.Matrix.Translation([x * scale for x in p])
+                made.append(obj)
+        for c in model.clothspheres:
+            obj = _cloth_volume_empty(m, dbs, "%s.m%d.sphere%d" % (name, gi, c.index),
+                                      c.bone, c.centre, c.radius, scale)
+            if obj is None:
+                arm_obj.pop("vtmb_cloth_volumes", None)
+                continue
+            obj["vtmb_cloth_sphere"] = c.index
+            obj["vtmb_cloth_volume_model"] = gi
+            coll.objects.link(obj)
+            _bone_child(obj, arm_obj, dbs[m.bones[c.bone].name])
+            obj.matrix_basis = mathutils.Matrix.Translation([x * scale for x in c.centre])
+            made.append(obj)
     for hs in m.hitboxsets:
         root = bpy.data.objects.new("%s.%s" % (name, hs.name or "default"), None)
         root.empty_display_type = "PLAIN_AXES"
@@ -692,6 +724,22 @@ def build_accessories(context, m, arm_obj, name, scale):
             obj["vtmb_hitbox_index"] = x.index
             made.append(obj)
     return made
+
+
+def _cloth_volume_empty(m, dbs, label, bi, p, radius, scale):
+    """One end of a cloth collision capsule, or one sphere, as a SPHERE empty.
+
+    The display size is the radius: 0.5325..14.6895 over the 257 shipped volumes, so the
+    1e-4 clamp is reached by none. A bone the armature has not got draws nothing and the
+    export carries that record as the file had it.
+    """
+    if not 0 <= bi < len(m.bones) or dbs.get(m.bones[bi].name) is None:
+        return None
+    obj = bpy.data.objects.new(label, None)
+    obj.empty_display_type = "SPHERE"
+    obj.empty_display_size = max(radius * scale, 1e-4)
+    obj["vtmb_cloth_radius"] = radius
+    return obj
 
 
 def _eyeball_empty(m, e, model, arm_obj, name, scale, dbs):
