@@ -143,6 +143,12 @@ def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, force_no_fl
     ahead of the software unflexed pass or last; the rest go through `assign_groups`.
     A pass the donor lacks gets a new group, and a donor group no pass needs is dropped.
     """
+    n = src_mesh.numvertices
+    for t in new:
+        for x in t:
+            if not 0 <= x < n:
+                raise ValueError("origMeshVertID %d is outside bodypart %d model %d mesh "
+                                 "%d, which has %d vertices" % (x, i, j, k, n))
     row = src_mesh.clothbind[0] if src_mesh.clothbind else {}
     drape = [t for t in new if any(x in row for x in t)]
     rest = [t for t in new if not any(x in row for x in t)]
