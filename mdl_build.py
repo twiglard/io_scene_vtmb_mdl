@@ -301,8 +301,9 @@ def _regrow_cloth(mr, k, new_n):
     Row-major -- row r's slice starts at `numvertices * r`, recon 29.3 -- so a count change
     moves every row and the arrays cannot be carried as they stand. Each row keeps its own
     entries and a vertex the edit added takes the format's own "none": 0xff on +0x30, 0 on
-    +0x34 and +0x38. Nothing inside needs remapping, because +0x34 holds a particle index
-    and +0x38 a cloth-normal index, neither of them a vertex.
+    +0x34 and +0x38. Nothing in these three needs remapping, because +0x34 holds a particle
+    index and +0x38 a cloth-normal index, neither of them a vertex -- but the object's own
+    `vertindex` does, and `_renumber_cloth_pv` is what moves it.
 
     Grown arrays are appended and the three mesh fields re-aimed. Nothing inside the region
     moves: the table stores no count and every object payload offset is object-relative, so
@@ -330,11 +331,73 @@ def _regrow_cloth(mr, k, new_n):
     return True
 
 
+def _cloth_vertex_map(was, carry, meshes):
+    """({donor model-local vertex: written model-local vertex}, every written position,
+    {mesh: its written vertexoffset}).
+
+    `carry[k]` is mesh k's donor-local index per written vertex, None where the edit added
+    one, or None for the whole mesh where the partition was positional.
+    """
+    newof, pos_all, new_off, newoff_of = {}, [], 0, {}
+    for k, (_material, verts, _tris) in enumerate(meshes):
+        cmap = None if carry is None else carry[k]
+        old_off = was[k][1]
+        newoff_of[k] = new_off
+        for j in range(len(verts)):
+            o = j if cmap is None else cmap[j]
+            if o is not None:
+                newof[old_off + o] = new_off + j
+            pos_all.append(verts[j][0])
+        new_off += len(verts)
+    return newof, pos_all, newoff_of
+
+
+def _renumber_cloth_pv(cl, newof):
+    """Every cloth object's `vertindex` moved through `newof`, and how many entries moved.
+
+    `mstudiocloth_t +0x10` is one ushort per particle naming a model-local vertex, and it is
+    the only cloth field that names one -- springs, edges, faces, blends and seams all hold
+    particle or edge indices. A vertex added to an earlier mesh moves every later mesh's
+    `vertexoffset`, so each entry past it names a vertex shifted by the count added, and
+    `ProcessMesh1_Cloth_000H` (`StudioRender 0x2c023590`) anchors the particle on whatever
+    vertex that is, every frame. All rows move, one vertex list serving every LOD.
+
+    An entry naming a vertex the edit did not keep is refused, where a positional carry
+    would name a different vertex in silence; 0 of the 28 035 shipped entries over every row
+    name one past their model's `numvertices`. An identity map writes nothing.
+    """
+    data, moved = bytearray(cl["data"]), 0
+    for at in sorted(set(at for _k, at in cl["slots"])):
+        npart, pvoff = struct.unpack_from("<i", data, at + 0x04)[0], \
+            struct.unpack_from("<i", data, at + 0x10)[0]
+        if not pvoff or npart <= 0:
+            continue
+        for p in range(npart):
+            o = at + pvoff + 2 * p
+            v = struct.unpack_from("<H", data, o)[0]
+            w = newof.get(v)
+            if w is None:
+                raise Refused(
+                    "cloth particle %d anchors on model vertex %d, which the edit did not "
+                    "keep, and nothing was deleted to regenerate the object around" % (p, v))
+            if w > 0xffff:
+                raise Refused("cloth particle %d would anchor on model vertex %d, past the "
+                              "format's 16-bit vertex index" % (p, w))
+            if w != v:
+                struct.pack_into("<H", data, o, w)
+                moved += 1
+    if moved:
+        cl["data"] = bytes(data)
+    return moved
+
+
 def _rebuild_cloth(mr, was, carry, meshes, flips=None):
     """The model's row-0 cloth object regenerated for the survivors of a geometry edit.
 
-    Returns None where nothing was deleted, having only regrown the per-vertex arrays for
-    the new counts; otherwise a dict of what the rebuild dropped, for the caller to report.
+    Where nothing was deleted, the per-vertex arrays are regrown for the new counts and
+    every object's `vertindex` is renumbered through the edit, which is the whole of it:
+    returns None where no entry moved and {"renumbered": entries moved} where one did.
+    Otherwise a dict of what the rebuild dropped, for the caller to report.
 
     Which vertices simulate is a per-vertex authored fact with no scene representation, so
     the particle set comes from the file's own binding and never from the mesh: the 84
@@ -354,10 +417,12 @@ def _rebuild_cloth(mr, was, carry, meshes, flips=None):
     lost = [k for k in range(len(meshes))
             if carry is not None and carry[k] is not None
             and was[k][0] > sum(1 for o in carry[k] if o is not None)]
+    newof, pos_all, newoff_of = _cloth_vertex_map(was, carry, meshes)
     if not lost:
         for k, (_material, verts, _tris) in enumerate(meshes):
             _regrow_cloth(mr, k, len(verts))
-        return None
+        moved = _renumber_cloth_pv(cl, newof)
+        return {"renumbered": moved} if moved else None
     if cl["cols"] != 1:
         raise Refused(
             "this model's cloth table is %d columns wide and a rebuild emits one. "
@@ -369,17 +434,6 @@ def _rebuild_cloth(mr, was, carry, meshes, flips=None):
     data = cl["data"]
     obj = cloth_mod.unpack_object(data, at)
     npart = obj[0x04]
-    newof, pos_all, new_off, newoff_of = {}, [], 0, {}
-    for k, (_material, verts, _tris) in enumerate(meshes):
-        cmap = None if carry is None else carry[k]
-        old_off = was[k][1]
-        newoff_of[k] = new_off
-        for j in range(len(verts)):
-            o = j if cmap is None else cmap[j]
-            if o is not None:
-                newof[old_off + o] = new_off + j
-            pos_all.append(verts[j][0])
-        new_off += len(verts)
     keep = [p for p in range(npart) if newof.get(obj["pv"][p]) is not None]
     pv_new = [newof[obj["pv"][p]] for p in keep]
     pos = [pos_all[v] for v in pv_new]
@@ -2250,8 +2304,9 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
     to the cloth rebuild; None keeps the bit the file carries.
 
     Returns the per-mesh face lists, how many tangents were rewritten,
-    (flex records dropped, flexes left holding none), and what a cloth rebuild dropped or
-    None where the model carries no cloth or the edit deleted nothing.
+    (flex records dropped, flexes left holding none), and the cloth outcome: what a
+    regeneration dropped where the edit deleted a vertex, {"renumbered": n} where it
+    only added and n `vertindex` entries moved, None where nothing moved.
     """
     mr = d.bodyparts[bi].kids[mi]
     if len(meshes) != len(mr.kids):

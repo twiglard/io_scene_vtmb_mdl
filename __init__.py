@@ -1268,6 +1268,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "%s: this model's cloth was regenerated for the vertices the edit "
                         "left, which dropped %s. Spawn it before believing it"
                         % (name, lost or "nothing"))
+        for name, n in mesh["cloth_renumbered"]:
+            self.report({"INFO"},
+                        "%s: %d cloth vertindex entr%s renumbered past the vertices the "
+                        "edit added -- every particle kept its anchor vertex"
+                        % (name, n, "y" if n == 1 else "ies"))
         if mesh["flex_dropped"] or mesh["flex_emptied"]:
             self.report({"WARNING"},
                         "%d morph-target delta%s named a deleted vertex and went with "
@@ -1483,9 +1488,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             "%s: %s, so %s"
                             % (e["object"] or e["model"], e["why"],
                                ("%s stayed as the file had it" % " and ".join(moved))
-                               if moved else "the file keeps the cloth object it was "
-                               "compiled with, which describes the geometry as it was "
-                               "then"))
+                               if moved else
+                               "the file keeps the cloth object the geometry rebuild "
+                               "wrote for the new vertex numbering" if e["rebuilt"] else
+                               "the file keeps the cloth object it was compiled with, "
+                               "which describes the geometry as it was then"))
                 continue
             if not moved:
                 continue

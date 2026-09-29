@@ -1029,7 +1029,12 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     renumbered through it -- a record naming the deleted vertex is dropped and the rest
     keep the vertex they named. A cloth binding is regenerated for the particles whose
     anchor vertex survived, `mstudiocloth_t.vertindex` being one ushort per particle naming
-    a model vertex that has to exist; what that drops comes back in `edits["cloth"]`.
+    a model vertex that has to exist; what that drops comes back in `edits["cloth"]`. An
+    addition alone keeps every particle and renumbers `vertindex` past it, which comes back
+    as {"renumbered": n}.
+
+    A model carrying cloth also gets `edits["cloth_map"]`, the written numbering
+    `cloth_scene` reads the scene through.
 
     `fields` is what the checkboxes asked for. Without it a face added or a winding
     reversed changes Blender's corner normal on every vertex it touches, and the split
@@ -1051,13 +1056,22 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
             raise ValueError(
                 "%s: the file's own vertex numbering could not be recovered -- %s -- and "
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
+    # `origins` is one list per run and the written model-local numbering is the runs
+    # concatenated in that order, which is the order `replace_model` is handed.
+    vertex = [vi for run in origins for vi in run]
     faces, edits["tangents"], flex, edits["cloth"] = build_mod.replace_model(
         d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris,
-        carry=carry if kept else None,
-        # `origins` is one list per run and the written model-local numbering is the runs
-        # concatenated in that order, which is the order `replace_model` is handed.
-        flips=cloth_flip_bits(obj, [vi for run in origins for vi in run]))
+        carry=carry if kept else None, flips=cloth_flip_bits(obj, vertex))
     edits["flex_dropped"], edits["flex_emptied"] = flex
+    if d.bodyparts[bi].kids[mi].extra.get("cloth"):
+        # The cloth object now names the WRITTEN numbering, which is Blender's only where
+        # nothing was added or deleted, so `cloth_edits` reads the scene through this.
+        outcome = edits["cloth"]
+        edits["cloth_map"] = {
+            "vertex": vertex, "runs": [len(v) for _s, v, _f in runs],
+            "written": [v[0] for _s, verts, _f in runs for v in verts],
+            "carry": carry if kept else None,
+            "regenerated": isinstance(outcome, dict) and "renumbered" not in outcome}
     return faces, unskinned, kept, edits
 
 
@@ -2091,12 +2105,13 @@ def _d2(p, q):
     return sum((a - b) ** 2 for a, b in zip(p, q))
 
 
-def cloth_sigma_edges(obj, pv, springs, ns0, donor):
+def cloth_sigma_edges(obj, pv, springs, ns0, pos):
     """{group-0 spring: the sigma the mesh edge carrying it holds}, empty where none does.
 
     `cloth.edge_keys` is the resolution and the import stamps the attribute through the same
     call, so a spring reaches the edge it was written to. 289 of the corpus's 30 623 group-0
     springs reach none and are absent here, which leaves them the value the file holds.
+    `pv` names Blender vertices and `pos` is the file's position per Blender vertex.
     """
     me = obj.data
     att = me.attributes.get("vtmb_cloth_sigma")
@@ -2105,7 +2120,7 @@ def cloth_sigma_edges(obj, pv, springs, ns0, donor):
     buf = [0.0] * len(me.edges)
     att.data.foreach_get("value", buf)
     at = {cloth_mod.pair(*tuple(e.vertices)): e.index for e in me.edges}
-    keys, _missed = cloth_mod.edge_keys(pv, springs, ns0, [v.pos for v in donor], set(at))
+    keys, _missed = cloth_mod.edge_keys(pv, springs, ns0, pos, set(at))
     return {q: buf[at[k]] for q, k in keys.items()}
 
 
@@ -2138,7 +2153,7 @@ def cloth_flip_bits(obj, origins):
     return scratch_mod.flip_flags(obj, origins)
 
 
-def cloth_flip_moves(cl, mo, flips, col):
+def cloth_flip_moves(cl, offsets, flips, col):
     """([(mesh, mesh-local vertex, the bit the scene wants)], [(mesh, vertices left alone)]).
 
     The binding's own entry is one owner byte and one ushort per mesh vertex -- low 15 bits
@@ -2151,15 +2166,15 @@ def cloth_flip_moves(cl, mo, flips, col):
     shipped model of 60 carrying two objects in row 0 (BUGS 154). Those are counted and
     left alone.
 
-    Model vertex index is Blender vertex index, so the scene's per-vertex answer is read at
-    the mesh's own `vertexoffset`.
+    `flips` is one answer per model vertex of the file being written and `offsets` each
+    mesh's `vertexoffset` in it, which a geometry rebuild moves.
     """
     if flips is None:
         return [], []
     data, out, other = cl["data"], [], []
     for k in sorted(cl["meshes"]):
         (own_at, p34_at, _p38_at), n = cl["meshes"][k]
-        off = mo.meshes[k].vertexoffset if k < len(mo.meshes) else 0
+        off = offsets[k] if k < len(offsets) else 0
         skipped = 0
         for j in range(n):
             own = data[own_at + j]
@@ -2225,7 +2240,42 @@ def cloth_pin_why(obj, cl, pinned, npart):
     return None
 
 
-def cloth_edits(m, source, d):
+def cloth_scene(m, mo, me, cmap=None):
+    """(Blender vertex per written vertex, rest position per written vertex, rest position
+    per Blender vertex, each mesh's written `vertexoffset`), or None.
+
+    `cmap` is `rebuild_cell`'s map for a model the geometry rebuild wrote. A carried vertex
+    rests where the donor had it, so a particle the scene moved still reads as moved; an
+    added vertex, or any vertex of a regenerated object, rests where it is written.
+    """
+    if cmap is None:
+        if len(me.vertices) != mo.numvertices:
+            return None
+        pos = [v.pos for v in m.vertices(mo)]
+        return (range(len(pos)), pos, pos, [ms.vertexoffset for ms in mo.meshes])
+    vertex, rest = cmap["vertex"], list(cmap["written"])
+    offsets, at = [], 0
+    for n in cmap["runs"]:
+        offsets.append(at)
+        at += n
+    carry = cmap["carry"]
+    if carry is not None and not cmap["regenerated"]:
+        donor = m.vertices(mo)
+        for k, w0 in enumerate(offsets):
+            if k >= len(mo.meshes):
+                break
+            ms, cm = mo.meshes[k], carry[k]
+            for j in range(cmap["runs"][k]):
+                o = j if cm is None else cm[j]
+                if o is not None and o < ms.numvertices:
+                    rest[w0 + j] = donor[ms.vertexoffset + o].pos
+    rest_b = [tuple(v.co) for v in me.vertices]
+    for x, vi in enumerate(vertex):
+        rest_b[vi] = rest[x]
+    return vertex, rest, rest_b, offsets
+
+
+def cloth_edits(m, source, d, rebuilt=None):
     """What each cloth-bound model's scene says that its donor bytes do not.
 
     One entry per model carrying cloth: which of the three authored numbers moved, how many
@@ -2233,6 +2283,9 @@ def cloth_edits(m, source, d):
     cannot be spoken for at all. Split from the write so the same comparison reports the
     narrowing when the write is off -- a cloth object left describing the geometry it was
     compiled against simulates the old garment, and nothing on screen says so.
+
+    `rebuilt` is {(bodypart, model): `edits["cloth_map"]`} for every model this export's
+    geometry rebuild wrote, whose cloth object names the written numbering.
     """
     found = mesh_objects(m, source)
     out = []
@@ -2246,7 +2299,7 @@ def cloth_edits(m, source, d):
              "why": None, "scale": None, "sigma": None, "slack": None, "moved": 0,
              "springs": 0, "flattens": False, "sigma_edges": 0,
              "flips": [], "flips_other": [], "pins": None, "pins_why": None,
-             "repin": False}
+             "repin": False, "scene": None, "rebuilt": (bi, mi) in (rebuilt or {})}
         out.append(e)
         if obj is None:
             e["why"] = "no mesh object in the scene belongs to this model"
@@ -2265,14 +2318,19 @@ def cloth_edits(m, source, d):
             e["why"] = "the file's cloth object carries no springs or no particle map"
             continue
         me = obj.data
-        if len(me.vertices) != mo.numvertices:
-            e["why"] = ("the scene holds %d vertices where the file's model has %d, so "
-                        "neither `pv` nor a particle's rest position reads against the "
-                        "donor -- the geometry rebuild has already regenerated this "
-                        "object from the scene" % (len(me.vertices), mo.numvertices))
+        scene = cloth_scene(m, mo, me, (rebuilt or {}).get((bi, mi)))
+        if scene is None:
+            e["why"] = ("the scene holds %d vertices where the file's model has %d and no "
+                        "geometry rebuild wrote this model, so nothing says which scene "
+                        "vertex a particle anchors on" % (len(me.vertices), mo.numvertices))
             continue
-        donor = m.vertices(mo)
-        was = [donor[v].pos if v < len(donor) else (0.0, 0.0, 0.0) for v in pv]
+        vertex, rest, rest_b, offsets = e["scene"] = scene
+        if any(v >= len(vertex) for v in pv):
+            e["why"] = ("the file's cloth object names a vertex past the %d this model "
+                        "writes" % len(vertex))
+            continue
+        pv_b = [vertex[v] for v in pv]
+        was = [rest[v] for v in pv]
         r = cloth_mod.recover(scale_f, springs, ns0, was)
         preset = str(obj.get("vtmb_cloth_preset") or "") or None
         if preset is not None and preset not in cloth_mod.PRESETS:
@@ -2306,19 +2364,16 @@ def cloth_edits(m, source, d):
         # wins over it and is what `flattens` reports.
         if want_sigma is None:
             e["sigma_edges"] = sum(
-                1 for q, v in cloth_sigma_edges(obj, pv, springs, ns0, donor).items()
+                1 for q, v in cloth_sigma_edges(obj, pv_b, springs, ns0, rest_b).items()
                 if abs(v - (springs[q][2] - springs[q][3]) / 2.0) > CLOTH_TOL)
-        e["moved"] = sum(1 for v, w in zip(pv, was)
-                         if v < len(me.vertices)
-                         and _d2(tuple(me.vertices[v].co), w) > CLOTH_MIN_D2)
+        e["moved"] = sum(1 for v, w in zip(pv_b, was)
+                         if _d2(tuple(me.vertices[v].co), w) > CLOTH_MIN_D2)
         e["springs"] = len(springs)
         # The scene's flip and the scene's pin set, which are what the panel draws and what
-        # the donor path read nowhere until now. Blender vertex index is model-local vertex
-        # index here -- one Blender vertex per model vertex, `vertexoffset` applied -- which
-        # is what the vertex-count comparison above has already established.
+        # the donor path read nowhere until now, both read through the written numbering.
         e["flips"], e["flips_other"] = cloth_flip_moves(
-            cl, mo, cloth_flip_bits(obj, range(len(me.vertices))), slot_k % cl["cols"])
-        e["pins"] = cloth_pin_set(obj, pv, npart)
+            cl, offsets, cloth_flip_bits(obj, list(vertex)), slot_k % cl["cols"])
+        e["pins"] = cloth_pin_set(obj, pv_b, npart)
         if e["pins"] is not None and e["pins"][0] != set(range(nfix)):
             e["pins_why"] = cloth_pin_why(obj, cl, e["pins"][0], npart)
             e["repin"] = e["pins_why"] is None
@@ -2371,11 +2426,11 @@ def apply_cloth(d, m, source, edits=None):
         _k, at = _cloth_slot(cl)
         data = bytearray(cl["data"])
         _scale_f, _npart, _nfixed, ns0, spoff, pv, springs = _cloth_header(data, at)
-        mo = m.bodyparts[bi].models[mi]
-        me, donor = found[(bi, mi)].data, m.vertices(mo)
-        now = [tuple(me.vertices[v].co) if v < len(me.vertices) else (0.0, 0.0, 0.0)
-               for v in pv]
-        was = [donor[v].pos if v < len(donor) else (0.0, 0.0, 0.0) for v in pv]
+        me = found[(bi, mi)].data
+        vertex, rest, rest_b, _offsets = e["scene"]
+        pv_b = [vertex[v] for v in pv]
+        now = [tuple(me.vertices[v].co) for v in pv_b]
+        was = [rest[v] for v in pv]
         moved = {p for p, (nw, wz) in enumerate(zip(now, was))
                  if _d2(nw, wz) > CLOTH_MIN_D2}
         if e["scale"]:
@@ -2384,7 +2439,7 @@ def apply_cloth(d, m, source, edits=None):
         sigma = e["sigma"][1] if e["sigma"] else None
         slack = e["slack"][1] if e["slack"] else None
         per_edge = ({} if sigma is not None
-                    else cloth_sigma_edges(found[(bi, mi)], pv, springs, ns0, donor))
+                    else cloth_sigma_edges(found[(bi, mi)], pv_b, springs, ns0, rest_b))
         for q, (a, b, w0, w1, rest2) in enumerate(springs):
             # The panel's one number first, then the edge the spring sits on, then the
             # file's own. Rewriting a spring whose sigma did not move would re-round w0
@@ -2450,15 +2505,14 @@ def cloth_repin(d, m, obj, e):
     keep = ([q for q in range(npart) if q in pinned]
             + [q for q in range(npart) if q not in pinned])
     me = obj.data
+    vertex, _rest, _rest_b, offsets = e["scene"]
     pv_new = [co["pv"][q] for q in keep]
-    pos = [tuple(me.vertices[v].co) if v < len(me.vertices) else (0.0, 0.0, 0.0)
-           for v in pv_new]
-    mo = m.bodyparts[bi].models[mi]
-    flips = cloth_flip_bits(obj, range(len(me.vertices)))
+    pos = [tuple(me.vertices[vertex[v]].co) for v in pv_new]
+    flips = cloth_flip_bits(obj, list(vertex))
     bound = []
     for k in sorted(cl["meshes"]):
         (own_at, p34_at, p38_at), n = cl["meshes"][k]
-        off = mo.meshes[k].vertexoffset if k < len(mo.meshes) else 0
+        off = offsets[k] if k < len(offsets) else 0
         for j in range(n):
             if data[own_at + j] == 0xff:
                 continue
@@ -3674,7 +3728,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
             "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
             "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
-            "cloth_rebuilt": [],
+            "cloth_rebuilt": [], "cloth_renumbered": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source)}
@@ -3707,6 +3761,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["tangents"] += t
     mesh["models"] = len(cells)
     bone_index = {b.name: b.index for b in m.bones}
+    cloth_maps = {}
     for (bi, mi), obj in sorted(rebuild.items()):
         was = m.bodyparts[bi].models[mi].numvertices
         tri = donor_faces.get((bi, mi))
@@ -3729,7 +3784,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["flex_dropped"] += edits.get("flex_dropped", 0)
         mesh["flex_emptied"] += edits.get("flex_emptied", 0)
         mesh["tangents"] += edits["tangents"]
-        if edits.get("cloth"):
+        if "cloth_map" in edits:
+            cloth_maps[(bi, mi)] = edits["cloth_map"]
+        if edits.get("cloth") and "renumbered" in edits["cloth"]:
+            mesh["cloth_renumbered"].append((obj.name, edits["cloth"]["renumbered"]))
+        elif edits.get("cloth"):
             mesh["cloth_rebuilt"].append((obj.name, edits["cloth"]))
 
     if write_flexes:
@@ -3749,7 +3808,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     # After the geometry: a rest length is refitted against where the vertex now sits, and
     # a rebuilt model has just moved them.
-    cloth_was = cloth_edits(m, source, d)
+    cloth_was = cloth_edits(m, source, d, cloth_maps)
     cloth = apply_cloth(d, m, source, cloth_was) if write_cloth else None
 
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
