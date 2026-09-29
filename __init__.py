@@ -1268,6 +1268,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "%s: this model's cloth was regenerated for the vertices the edit "
                         "left, which dropped %s. Spawn it before believing it"
                         % (name, lost or "nothing"))
+        for name, c in mesh["cloth_carried"]:
+            self.report({"WARNING"},
+                        "%s: this model's row-0 cloth objects were kept as they stand, %d "
+                        "vertindex entr%s renumbered past the deleted vertices; the delete "
+                        "cut the LODs, which dropped %d further cloth row%s and %d upper "
+                        "seam%s"
+                        % (name, c["renumbered"], "y" if c["renumbered"] == 1 else "ies",
+                           c["rows"], "" if c["rows"] == 1 else "s",
+                           c["seams"], "" if c["seams"] == 1 else "s"))
         for name, n in mesh["cloth_renumbered"]:
             self.report({"INFO"},
                         "%s: %d cloth vertindex entr%s renumbered past the vertices the "

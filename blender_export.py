@@ -1027,7 +1027,9 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     A delete is not that case. The survivors keep the file's own order, so `split_mesh`
     reports the donor vertex each written one came from and the flex payloads are
     renumbered through it -- a record naming the deleted vertex is dropped and the rest
-    keep the vertex they named. A cloth binding is regenerated for the particles whose
+    keep the vertex they named. Where no deleted vertex was a particle's anchor or bound in
+    row 0, the row-0 cloth objects are carried as they stand and come back as
+    {"carried": True, ...}. Otherwise the binding is regenerated for the particles whose
     anchor vertex survived, `mstudiocloth_t.vertindex` being one ushort per particle naming
     a model vertex that has to exist; what that drops comes back in `edits["cloth"]`. An
     addition alone keeps every particle and renumbers `vertindex` past it, which comes back
@@ -3728,7 +3730,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
             "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
             "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
-            "cloth_rebuilt": [], "cloth_renumbered": [],
+            "cloth_rebuilt": [], "cloth_renumbered": [], "cloth_carried": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source)}
@@ -3786,7 +3788,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["tangents"] += edits["tangents"]
         if "cloth_map" in edits:
             cloth_maps[(bi, mi)] = edits["cloth_map"]
-        if edits.get("cloth") and "renumbered" in edits["cloth"]:
+        if edits.get("cloth") and edits["cloth"].get("carried"):
+            mesh["cloth_carried"].append((obj.name, edits["cloth"]))
+        elif edits.get("cloth") and "renumbered" in edits["cloth"]:
             mesh["cloth_renumbered"].append((obj.name, edits["cloth"]["renumbered"]))
         elif edits.get("cloth"):
             mesh["cloth_rebuilt"].append((obj.name, edits["cloth"]))

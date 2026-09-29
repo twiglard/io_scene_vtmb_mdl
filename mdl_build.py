@@ -391,13 +391,106 @@ def _renumber_cloth_pv(cl, newof):
     return moved
 
 
+def _object_end(data, at):
+    """Where one cloth object's bytes end if its two seam blocks are left behind, or None.
+
+    Over the 150 shipped objects no block overlaps another object's and the 0x58 seam block
+    is the last block of all 20 row-0 objects carrying one, 0 carrying 0x54 -- so the
+    object up to its last other block is one contiguous span, alignment pads included.
+    """
+    h = dict((o, struct.unpack_from("<i", data, at + o)[0]) for o in range(0, 0x5c, 4))
+    end, seams = at + 0x5c, []
+    for off, cnts, w, _what in S.CLOTH_BLOCKS:
+        if h[off]:
+            span = (at + h[off], at + h[off] + sum(h[c] for c in cnts) * w)
+            if off in (0x54, 0x58):
+                seams.append(span)
+            else:
+                end = max(end, span[1])
+    if any(lo < end for lo, _hi in seams):
+        return None
+    return end
+
+
+def _carry_cloth(cl, carry, meshes, newof):
+    """(region, outcome) with the donor's row-0 objects carried through a delete, or None.
+
+    Taken where every row-0 `vertindex` entry survives and no deleted vertex is bound in row
+    0, so the particle set, the springs and the mass split are all still the file's own and a
+    regeneration would only restate them less exactly: one with the donor's own particle set
+    reproduces 4036 of `lantern`'s 6908 cloth bytes. Each object is copied as it stands with
+    its `vertindex` renumbered and the two seam offsets zeroed -- a seam binds onto the
+    object one row away -- and each bound mesh keeps row 0 of its three arrays, a deleted
+    vertex's entry dropped and an added one drawn rigidly. Rows past 0 go: a delete forces
+    the .vtx to one LOD and a row is a LOD. Every column is carried, so the one two-column
+    model carries where a regeneration stops -- through a delete outside its bound meshes,
+    `vtx_rebuild` refusing both of those for their cloth-flagged strip groups.
+    """
+    data, cols = cl["data"], cl["cols"]
+    row0 = sorted((k, at) for k, at in cl["slots"] if k < cols)
+    if not row0 or carry is None:
+        return None
+    ends = []
+    for _k, at in row0:
+        npart, pvoff = struct.unpack_from("<i", data, at + 0x04)[0], \
+            struct.unpack_from("<i", data, at + 0x10)[0]
+        pv = struct.unpack_from("<%dH" % npart, data, at + pvoff) \
+            if pvoff and npart > 0 else ()
+        if any(newof.get(v) is None for v in pv):
+            return None
+        ends.append(_object_end(data, at))
+    if None in ends:
+        return None
+    rows0 = {}
+    for k, ((own_at, p34_at, p38_at), old_n) in cl["meshes"].items():
+        if k >= len(meshes):
+            return None
+        new_n = len(meshes[k][1])
+        cm = carry[k] if carry[k] is not None else \
+            [j if j < old_n else None for j in range(new_n)]
+        gone = set(range(old_n)) - set(o for o in cm if o is not None)
+        if any(data[own_at + o] != 0xff for o in gone):
+            return None
+        rows0[k] = [None if o is None else
+                    (data[own_at + o], data[p34_at + 2 * o:p34_at + 2 * o + 2],
+                     data[p38_at + 2 * o:p38_at + 2 * o + 2]) for o in cm]
+    out, slots, seams = bytearray(4 * cols), [], 0
+    for (k, at), end in zip(row0, ends):
+        blob = bytearray(data[at:end])
+        seams += bool(struct.unpack_from("<i", blob, 0x54)[0]
+                      or struct.unpack_from("<i", blob, 0x58)[0])
+        struct.pack_into("<2i", blob, 0x54, 0, 0)
+        out += bytes(-len(out) % ALIGN)
+        slots.append((k, len(out)))
+        out += blob
+    spans = {}
+    for k, ent in sorted(rows0.items()):
+        arrays = (b"".join(bytes((0xff,)) if e is None else bytes((e[0],)) for e in ent),
+                  b"".join(bytes(2) if e is None else e[1] for e in ent),
+                  b"".join(bytes(2) if e is None else e[2] for e in ent))
+        spans[k] = []
+        for arr in arrays:
+            out += bytes(-len(out) % ALIGN)
+            spans[k].append(len(out))
+            out += arr
+        spans[k] = (spans[k], len(ent))
+    out += bytes(-len(out) % ALIGN)
+    region = {"data": bytes(out), "cols": cols, "rows": 1, "table": 0, "slots": slots,
+              "meshes": spans}
+    moved = _renumber_cloth_pv(region, newof)
+    return region, {"carried": True, "renumbered": moved, "rows": cl["rows"] - 1,
+                    "seams": seams}
+
+
 def _rebuild_cloth(mr, was, carry, meshes, flips=None):
     """The model's row-0 cloth object regenerated for the survivors of a geometry edit.
 
     Where nothing was deleted, the per-vertex arrays are regrown for the new counts and
     every object's `vertindex` is renumbered through the edit, which is the whole of it:
     returns None where no entry moved and {"renumbered": entries moved} where one did.
-    Otherwise a dict of what the rebuild dropped, for the caller to report.
+    Where a delete took no particle's anchor and no vertex row 0 binds, `_carry_cloth`
+    keeps the row-0 objects and says so with {"carried": True, ...}. Otherwise a dict of
+    what the regeneration dropped, for the caller to report.
 
     Which vertices simulate is a per-vertex authored fact with no scene representation, so
     the particle set comes from the file's own binding and never from the mesh: the 84
@@ -423,6 +516,10 @@ def _rebuild_cloth(mr, was, carry, meshes, flips=None):
             _regrow_cloth(mr, k, len(verts))
         moved = _renumber_cloth_pv(cl, newof)
         return {"renumbered": moved} if moved else None
+    carried = _carry_cloth(cl, carry, meshes, newof)
+    if carried is not None:
+        mr.extra["cloth"], outcome = carried
+        return outcome
     if cl["cols"] != 1:
         raise Refused(
             "this model's cloth table is %d columns wide and a rebuild emits one. "
