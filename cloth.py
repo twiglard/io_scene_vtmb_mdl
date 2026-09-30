@@ -499,6 +499,8 @@ def one_to_one(nvert, npart, flip):
     which is NOT the shipped form: on 59 of the 60 shipped row-0 objects `numblends` equals
     the bound vertex count and +0x38 runs `numparticles + i` over the bound vertices in
     mesh-then-vertex order, 31 008 of 31 008 entries at or past `numparticles`.
+    The renderer puts the vector +0x38 names in the vertex's tangent slot, so here the
+    tangent equals the normal (StudioRender 0x2c02816a).
     """
     if nvert > npart:
         raise Refused("a cloth region wants at least one particle per vertex, and this "
