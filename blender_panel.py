@@ -413,7 +413,7 @@ def draw_cloth(lay, obj):
     if not obj.get(CLOTH):
         return
     lay.prop(obj, "vtmb_cloth_preset_name")
-    lay.prop(obj, "vtmb_cloth_pin_text")
+    lay.prop_search(obj, "vtmb_cloth_pin_text", obj, "vertex_groups")
     flips = cloth_flips(obj)
     if flips is None:
         lay.prop(obj, "vtmb_cloth_flip_on")
