@@ -1033,7 +1033,9 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     anchor vertex survived, `mstudiocloth_t.vertindex` being one ushort per particle naming
     a model vertex that has to exist; what that drops comes back in `edits["cloth"]`. An
     addition alone keeps every particle and renumbers `vertindex` past it, which comes back
-    as {"renumbered": n}.
+    as {"renumbered": n}, unless an added vertex shares triangles with one cloth object's
+    particles: then the object is regenerated with it as a particle, "promoted" counting
+    them. Added vertices touching cloth and left rigid come back as "rigid" and "why".
 
     A model carrying cloth also gets `edits["cloth_map"]`, the written numbering
     `cloth_scene` reads the scene through.
@@ -2123,7 +2125,7 @@ def cloth_sigma_edges(obj, pv, springs, ns0, pos):
     att.data.foreach_get("value", buf)
     at = {cloth_mod.pair(*tuple(e.vertices)): e.index for e in me.edges}
     keys, _missed = cloth_mod.edge_keys(pv, springs, ns0, pos, set(at))
-    return {q: buf[at[k]] for q, k in keys.items()}
+    return {q: buf[at[k]] for q, k in keys.items() if buf[at[k]] != cloth_mod.SIGMA_UNSET}
 
 
 # The addon version at or past which `vtmb_pinned` holds pv[:numfixed]. Before 2026-09-12 the
@@ -3874,6 +3876,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
             "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
             "cloth_rebuilt": [], "cloth_renumbered": [], "cloth_carried": [],
+            "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source)}
@@ -3931,12 +3934,18 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["tangents"] += edits["tangents"]
         if "cloth_map" in edits:
             cloth_maps[(bi, mi)] = edits["cloth_map"]
-        if edits.get("cloth") and edits["cloth"].get("carried"):
-            mesh["cloth_carried"].append((obj.name, edits["cloth"]))
-        elif edits.get("cloth") and "renumbered" in edits["cloth"]:
-            mesh["cloth_renumbered"].append((obj.name, edits["cloth"]["renumbered"]))
-        elif edits.get("cloth"):
-            mesh["cloth_rebuilt"].append((obj.name, edits["cloth"]))
+        ce = edits.get("cloth")
+        if ce and ce.get("rigid"):
+            mesh["cloth_rigid"].append((obj.name, ce["rigid"], ce["why"]))
+        if ce and ce.get("promoted"):
+            mesh["cloth_promoted"].append((obj.name, ce))
+        elif ce and ce.get("carried"):
+            mesh["cloth_carried"].append((obj.name, ce))
+        elif ce and "renumbered" in ce:
+            if ce["renumbered"]:
+                mesh["cloth_renumbered"].append((obj.name, ce["renumbered"]))
+        elif ce:
+            mesh["cloth_rebuilt"].append((obj.name, ce))
 
     if write_flexes:
         # After the geometry, because add_flex bounds every key against the mesh's
@@ -3968,7 +3977,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # rather than being carried across from it. The cut is the whole file's and not the one
     # model's: `numLODs` agrees between the file header and every model header on all 8887
     # shipped files, and the Unofficial Patch's own cut models set both.
-    forced = bool(mesh["renumbered"] or mesh["rebuilt_deleted"]) and not cut_lods
+    # A promotion regenerates the cloth to one row, and a row is a LOD, so it cuts as well.
+    forced_by = None if cut_lods else \
+        "numbering" if mesh["renumbered"] or mesh["rebuilt_deleted"] else \
+        "cloth" if mesh["cloth_promoted"] else None
+    forced = forced_by is not None
     # A switch-value ladder and a cut to one LOD are contradictory asks, and a cut forced
     # by a renumbering rebuild is the same ask made by the file rather than by the dialog.
     # Refused before any .vtx writer runs, so a stop leaves no half-edited `.vtx` behind.
@@ -3976,7 +3989,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     if switch_vals and (cut_lods or forced):
         raise build_mod.Refused(
             "LOD switch values were given and the LODs are being cut to one LOD%s"
-            % ("" if cut_lods else " because a rebuild renumbered the vertices"))
+            % ("" if cut_lods else
+               " because a rebuild renumbered the vertices" if forced_by == "numbering"
+               else " because added vertices became cloth particles"))
     # A bone removal or an append moves no vertex and no triangle, so `revised` is empty --
     # and the .vtx still has to be rewritten, because every strip group's bone data is bound
     # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
@@ -4019,7 +4034,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                       if (revised or removed or added_bones) else []),
             "cloth": cloth, "cloth_edits": cloth_was, "lods": lods,
             "lod_switch": switches, "lod_shadow_flag": shadow,
-            "lods_forced": forced,
+            "lods_forced": forced, "lods_forced_by": forced_by,
             "phy": phy_report(source, dest, removed, renamed, bool(revised))}
 
 

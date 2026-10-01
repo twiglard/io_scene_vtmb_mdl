@@ -569,7 +569,7 @@ def sigma_edges(obj, origins, faces):
             if a >= len(origins) or b >= len(origins):
                 continue
             j = at.get(cloth_mod.pair(origins[a], origins[b]))
-            if j is not None:
+            if j is not None and buf[j] != cloth_mod.SIGMA_UNSET:
                 out[(a, b)] = buf[j]
     return out
 

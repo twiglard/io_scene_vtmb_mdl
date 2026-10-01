@@ -88,6 +88,10 @@ BONEMAP_RECORD = struct.pack("<ii", 0x0000FFFF, -1) + b"\0" * 48
 # writer is affected.
 BONECONTROLLER_STRIDE = 24
 
+# An added vertex sharing a triangle with one cloth object's particles becomes a particle and
+# the object is regenerated, the user's decision 16. False draws every added vertex rigidly.
+CLOTH_ADD_PARTICLES = True
+
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
 DEFAULTS = {
@@ -423,8 +427,7 @@ def _carry_cloth(cl, carry, meshes, newof):
     object one row away -- and each bound mesh keeps row 0 of its three arrays, a deleted
     vertex's entry dropped and an added one drawn rigidly. Rows past 0 go: a delete forces
     the .vtx to one LOD and a row is a LOD. Every column is carried, so the one two-column
-    model carries where a regeneration stops -- through a delete outside its bound meshes,
-    `vtx_rebuild` refusing both of those for their cloth-flagged strip groups.
+    model carries where a regeneration stops.
     """
     data, cols = cl["data"], cl["cols"]
     row0 = sorted((k, at) for k, at in cl["slots"] if k < cols)
@@ -482,15 +485,206 @@ def _carry_cloth(cl, carry, meshes, newof):
                     "seams": seams}
 
 
+def _bound_tris(cl, meshes):
+    """[(mesh, ((mesh, vertex),) * 3)] for every drawn triangle of a mesh the cloth binds,
+    its corners distinct, in mesh-then-triangle order."""
+    out = []
+    for k in sorted(cl["meshes"]):
+        if k >= len(meshes):
+            continue
+        for t in meshes[k][2]:
+            if len(set(t)) == 3:
+                out.append((k, tuple((k, v) for v in t)))
+    return out
+
+
+def _promote_added(cl, carry, meshes, newof):
+    """([(mesh, vertex)] of the added vertices that become particles, {why: count} of those
+    that touch cloth and stay rigid) -- the user's decision 16.
+
+    Added vertices joined through shared triangles form one group. A group touching the
+    surviving particles of exactly one cloth object is promoted; one touching none stays
+    rigid unreported, which is any addition outside the cloth. A promoted vertex has to sit
+    in a triangle whose every corner is cloth or promoted, or it would be a particle in no
+    face and nothing would tie it to the sheet.
+    """
+    if carry is None:
+        return [], {}
+    data, cols, slots = cl["data"], cl["cols"], dict(cl["slots"])
+    alive = {}
+    for c in range(cols):
+        at = slots.get(c)
+        if at is None:
+            continue
+        npart = struct.unpack_from("<i", data, at + 0x04)[0]
+        pvoff = struct.unpack_from("<i", data, at + 0x10)[0]
+        pv = struct.unpack_from("<%dH" % npart, data, at + pvoff) \
+            if pvoff and npart > 0 else ()
+        alive[c] = set(p for p in range(len(pv)) if newof.get(pv[p]) is not None)
+    col_of, added = {}, []
+    for k in sorted(cl["meshes"]):
+        if k >= len(meshes):
+            continue
+        (own_at, p34_at, _p38_at), old_n = cl["meshes"][k]
+        cm = carry[k] if carry[k] is not None else \
+            [j if j < old_n else None for j in range(len(meshes[k][1]))]
+        for j, o in enumerate(cm):
+            if o is None:
+                added.append((k, j))
+                continue
+            c = data[own_at + o] if o < old_n else 0xff
+            if c in alive and \
+                    struct.unpack_from("<H", data, p34_at + 2 * o)[0] & 0x7fff in alive[c]:
+                col_of[(k, j)] = c
+    if not added:
+        return [], {}
+    tris, parent = _bound_tris(cl, meshes), dict((a, a) for a in added)
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for _k, vs in tris:
+        new = [v for v in vs if v in parent]
+        for a in new[1:]:
+            ra, rb = find(new[0]), find(a)
+            if ra != rb:
+                parent[ra] = rb
+    groups, touched = {}, {}
+    for a in added:
+        groups.setdefault(find(a), []).append(a)
+    for _k, vs in tris:
+        new = [v for v in vs if v in parent]
+        if new:
+            touched.setdefault(find(new[0]), set()).update(
+                col_of[v] for v in vs if v in col_of)
+    rigid, cand = {}, set()
+    for r, members in groups.items():
+        cs = touched.get(r)
+        if not cs:
+            continue
+        if not CLOTH_ADD_PARTICLES:
+            why = "CLOTH_ADD_PARTICLES is off"
+        elif len(cs) > 1:
+            why = "shares triangles with more than one cloth object"
+        elif cols != 1:
+            why = ("this model's cloth table is %d columns wide and a regeneration emits one"
+                   % cols)
+        else:
+            cand.update(members)
+            continue
+        rigid[why] = rigid.get(why, 0) + len(members)
+    while cand:
+        held = set()
+        for _k, vs in tris:
+            if all(v in col_of or v in cand for v in vs):
+                held.update(v for v in vs if v in cand)
+        drop = cand - held
+        if not drop:
+            break
+        why = "in no triangle whose every corner is cloth"
+        rigid[why] = rigid.get(why, 0) + len(drop)
+        cand = held
+    return sorted(cand), rigid
+
+
+def _with_rigid(outcome, rigid):
+    """`outcome` with the count of added vertices drawn rigidly beside it, and why."""
+    if not rigid:
+        return outcome
+    out = dict(outcome or {"renumbered": 0})
+    out["rigid"] = sum(rigid.values())
+    out["why"] = sorted(rigid.items())
+    return out
+
+
+def _promoted_bind(cl, meshes, promote, bound, keep, pos, newoff_of, flips):
+    """The `added` argument `cloth.rebuild` takes for the promoted vertices.
+
+    A promoted vertex at the exact position of a particle binds to it, the way a seam's
+    duplicates share one: 18 998 of the 25 564 named shipped particles are named by
+    vertices disagreeing about the flip bit. Its flip is the scene's where it has one, else
+    the majority of its triangle neighbours'. The face set is the particle image of the
+    drawn triangles whose corners are all bound, each in the drawn copy with the most flip
+    bits, the first on a tie -- which gives the winding of 20 430 of 20 430 shipped faces.
+    """
+    pmap = dict((p, i) for i, p in enumerate(keep))
+    part_of, flip_of = {}, {}
+    for k, j, p, flip, _n38 in bound:
+        part_of[(k, j)] = pmap[p]
+        flip_of[(k, j)] = flip
+    at_pos, apv, apos, new = {}, [], [], set()
+    for i, xyz in enumerate(pos):
+        at_pos.setdefault(tuple(xyz), i)
+    for k, j in promote:
+        xyz = tuple(meshes[k][1][j][0])
+        i = at_pos.get(xyz)
+        if i is None:
+            w = newoff_of[k] + j
+            if w > 0xffff:
+                raise Refused("a new cloth particle would anchor on model vertex %d, past "
+                              "the format's 16-bit vertex index" % w)
+            i = len(keep) + len(apv)
+            apv.append(w)
+            apos.append(xyz)
+            at_pos[xyz] = i
+            new.add(i)
+        part_of[(k, j)] = i
+    tris = _bound_tris(cl, meshes)
+    if flips is not None:
+        for k, j in promote:
+            flip_of[(k, j)] = flips if isinstance(flips, bool) \
+                else bool(flips[newoff_of[k] + j])
+    left = set(promote) - set(flip_of)
+    while left:
+        votes = {}
+        for _k, vs in tris:
+            for v in vs:
+                if v in left:
+                    votes.setdefault(v, []).extend(flip_of[u] for u in vs if u in flip_of)
+        votes = dict((v, b) for v, b in votes.items() if b)
+        if not votes:
+            break
+        for v, b in votes.items():
+            yes = sum(b)
+            flip_of[v] = b[0] if 2 * yes == len(b) else 2 * yes > len(b)
+            left.discard(v)
+    for v in left:
+        flip_of[v] = False
+    copies, order = {}, []
+    for _k, vs in tris:
+        if not all(v in part_of for v in vs):
+            continue
+        ps = tuple(part_of[v] for v in vs)
+        if len(set(ps)) < 3:
+            continue
+        key, nf = frozenset(ps), sum(flip_of[v] for v in vs)
+        if key not in copies:
+            order.append(key)
+            copies[key] = (nf, ps)
+        elif nf > copies[key][0]:
+            copies[key] = (nf, ps)
+    faces = [copies[key][1] for key in order]
+    stray = new - set(i for f in faces for i in f)
+    if stray:
+        raise Refused("%d new cloth particles sit in no triangle whose corners are all "
+                      "cloth" % len(stray))
+    return {"pv": apv, "pos": apos, "faces": faces,
+            "bound": [(k, j, part_of[(k, j)], flip_of[(k, j)]) for k, j in promote]}
+
+
 def _rebuild_cloth(mr, was, carry, meshes, flips=None):
     """The model's row-0 cloth object regenerated for the survivors of a geometry edit.
 
-    Where nothing was deleted, the per-vertex arrays are regrown for the new counts and
-    every object's `vertindex` is renumbered through the edit, which is the whole of it:
-    returns None where no entry moved and {"renumbered": entries moved} where one did.
-    Where a delete took no particle's anchor and no vertex row 0 binds, `_carry_cloth`
-    keeps the row-0 objects and says so with {"carried": True, ...}. Otherwise a dict of
-    what the regeneration dropped, for the caller to report.
+    Where nothing was deleted and no added vertex becomes a particle, the per-vertex arrays
+    are regrown for the new counts and every object's `vertindex` is renumbered through the
+    edit, which is the whole of it: returns None where no entry moved and {"renumbered":
+    entries moved} where one did. Where a delete took no particle's anchor and no vertex row
+    0 binds, `_carry_cloth` keeps the row-0 objects and says so with {"carried": True, ...}.
+    Otherwise a dict of what the regeneration dropped and, under "promoted", how many added
+    vertices `_promote_added` made particles. Added vertices touching cloth and drawn rigidly
+    come back as "rigid" and "why" on any of the three.
 
     Which vertices simulate is a per-vertex authored fact with no scene representation, so
     the particle set comes from the file's own binding and never from the mesh: the 84
@@ -511,15 +705,16 @@ def _rebuild_cloth(mr, was, carry, meshes, flips=None):
             if carry is not None and carry[k] is not None
             and was[k][0] > sum(1 for o in carry[k] if o is not None)]
     newof, pos_all, newoff_of = _cloth_vertex_map(was, carry, meshes)
-    if not lost:
+    promote, rigid = _promote_added(cl, carry, meshes, newof)
+    if not lost and not promote:
         for k, (_material, verts, _tris) in enumerate(meshes):
             _regrow_cloth(mr, k, len(verts))
         moved = _renumber_cloth_pv(cl, newof)
-        return {"renumbered": moved} if moved else None
-    carried = _carry_cloth(cl, carry, meshes, newof)
+        return _with_rigid({"renumbered": moved} if moved else None, rigid)
+    carried = None if promote else _carry_cloth(cl, carry, meshes, newof)
     if carried is not None:
         mr.extra["cloth"], outcome = carried
-        return outcome
+        return _with_rigid(outcome, rigid)
     if cl["cols"] != 1:
         raise Refused(
             "this model's cloth table is %d columns wide and a rebuild emits one. "
@@ -553,7 +748,9 @@ def _rebuild_cloth(mr, was, carry, meshes, flips=None):
                 flip = bool(flips[newoff_of[k] + j])
             bound.append((k, j, raw & 0x7fff, flip,
                           struct.unpack_from("<H", data, p38_at + o * 2)[0]))
-    c, bind, counts = cloth_mod.rebuild(obj, keep, pv_new, pos, bound)
+    added = _promoted_bind(cl, meshes, promote, bound, keep, pos, newoff_of, flips) \
+        if promote else None
+    c, bind, counts = cloth_mod.rebuild(obj, keep, pv_new, pos, bound, added=added)
     full = {}
     for k in sorted(cl["meshes"]):
         ent = [None] * len(meshes[k][1])
@@ -562,7 +759,9 @@ def _rebuild_cloth(mr, was, carry, meshes, flips=None):
         full[k] = ent
     mr.extra["cloth"] = cloth_mod.region(cloth_mod.pack(c), c.numparticles, full)
     counts["rows"] = cl["rows"] - 1
-    return counts
+    if promote:
+        counts["promoted"] = len(promote)
+    return _with_rigid(counts, rigid)
 
 
 def _sized(b, base, cnt_off, idx_off, stride):

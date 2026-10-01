@@ -61,6 +61,17 @@ def _two_bone_capsule(gi, k, bone0, bone1):
             % (k, gi, bone0, bone1))
 
 
+def _cloth_lost(c):
+    """What a cloth regeneration dropped, for its report line. Rows and seams are in the
+    list because a regeneration emits one row -- mdl_build._rebuild_cloth says why."""
+    lost = ", ".join(
+        "%d %s" % (c[k], w) for k, w in
+        (("particles", "particles"), ("springs", "springs"), ("faces", "faces"),
+         ("blends", "blend normals"), ("rows", "further cloth rows"),
+         ("seams", "upper seams")) if c.get(k))
+    return lost or "nothing"
+
+
 def _mode_tally(actions):
     """`(label, count)` per root-motion mode present, in `ROOT_MOTION_MODES` order.
 
@@ -1265,17 +1276,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "the flex payloads follow the new numbering"
                         % mesh["rebuilt_deleted"])
         for name, c in mesh["cloth_rebuilt"]:
-            # Rows and seams are in the list because a rebuild emits one row --
-            # mdl_build._rebuild_cloth says why.
-            lost = ", ".join(
-                "%d %s" % (c[k], w) for k, w in
-                (("particles", "particles"), ("springs", "springs"), ("faces", "faces"),
-                 ("blends", "blend normals"), ("rows", "further cloth rows"),
-                 ("seams", "upper seams")) if c[k])
             self.report({"WARNING"},
                         "%s: this model's cloth was regenerated for the vertices the edit "
                         "left, which dropped %s. Spawn it before believing it"
-                        % (name, lost or "nothing"))
+                        % (name, _cloth_lost(c)))
         for name, c in mesh["cloth_carried"]:
             self.report({"WARNING"},
                         "%s: this model's row-0 cloth objects were kept as they stand, %d "
@@ -1290,6 +1294,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "%s: %d cloth vertindex entr%s renumbered past the vertices the "
                         "edit added -- every particle kept its anchor vertex"
                         % (name, n, "y" if n == 1 else "ies"))
+        for name, c in mesh["cloth_promoted"]:
+            n = c["promoted"]
+            self.report({"WARNING"},
+                        "%s: %d added vert%s became cloth particles and the cloth was "
+                        "regenerated around them, which dropped %s. Spawn it before "
+                        "believing it" % (name, n, "ex" if n == 1 else "ices", _cloth_lost(c)))
+        for name, n, why in mesh["cloth_rigid"]:
+            self.report({"WARNING"},
+                        "%s: %d added vert%s touching cloth %s drawn rigidly, not simulated: "
+                        "%s" % (name, n, "ex" if n == 1 else "ices",
+                                "is" if n == 1 else "are",
+                                "; ".join("%d %s" % (c, w) for w, c in why)))
         if mesh["flex_dropped"] or mesh["flex_emptied"]:
             self.report({"WARNING"},
                         "%d morph-target delta%s named a deleted vertex and went with "
@@ -1430,13 +1446,16 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     self.report({"INFO"}, "%s was already at one LOD" % row["file"])
             elif forced:
                 self.report({"WARNING"},
-                            "%s cut from %d LODs to 1, %d byte%s dropped: the file's own "
-                            "vertex numbering was rebuilt, so every lower LOD named "
-                            "vertices that are no longer there. A lower LOD is an authored "
-                            "decimation and is not carried over from the donor. It used to "
-                            "swap at %s"
+                            "%s cut from %d LODs to 1, %d byte%s dropped: %s. A lower LOD is "
+                            "an authored decimation and is not carried over from the donor. "
+                            "It used to swap at %s"
                             % (row["file"], row["was"], row["bytes"],
                                "" if row["bytes"] == 1 else "s",
+                               "added vertices became cloth particles, and the regenerated "
+                               "cloth has one row, which is one LOD"
+                               if r.get("lods_forced_by") == "cloth" else
+                               "the file's own vertex numbering was rebuilt, so every lower "
+                               "LOD named vertices that are no longer there",
                                ", ".join("%g" % x for x in row["dropped"])))
             else:
                 self.report({"INFO"},

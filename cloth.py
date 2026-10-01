@@ -22,6 +22,9 @@ HDR = 0x5c
 # The naive pair (p0p1, p1p2), which inverts half the faces because a stored edge is
 # ascending and cannot carry the sign; plans/cloth-gen.py --naive-face-edges is the control.
 NAIVE_FACE_EDGES = False
+# A `vtmb_cloth_sigma` edge value meaning "no sigma here": 0 of 118 654 shipped springs carry
+# exactly 0.0, and an edge Blender creates inside a face -- a subdivide's -- starts at it.
+SIGMA_UNSET = 0.0
 
 
 class Refused(Exception):
@@ -586,7 +589,7 @@ def unpack_object(data, at):
     return out
 
 
-def rebuild(obj, keep, pv_new, pos, bound, npin=None):
+def rebuild(obj, keep, pv_new, pos, bound, npin=None, added=None):
     """A shipped cloth object regenerated for a survivor set -- (Cloth, bind, counts).
 
     `keep` is the surviving donor particles in the file's own order, which is what keeps the
@@ -616,6 +619,14 @@ def rebuild(obj, keep, pv_new, pos, bound, npin=None):
     the pinned set is spelled by the order alone, so a caller changing it hands `keep` already
     ordered pinned-first and says how many.  Left None the donor's own pins are kept, which is
     what a delete wants.
+
+    `added` carries free particles appended after the survivors, decision 16: {"pv", "pos"}
+    one entry per new particle, "faces" the face set as the particle image of the drawn
+    LOD-0 triangles over new indices, and "bound" (mesh, new vertex, particle, flip) per
+    promoted vertex, the particle a new one or the survivor at its exact position.  A donor
+    face stays where the image still holds it and the image's others are appended, which is
+    the corpus rule: over 20 430 shipped faces the face set equals that image with 0
+    duplicates and 0 orphans.
     """
     npart, nfix = obj[0x04], obj[0x08]
     pmap = dict((p, i) for i, p in enumerate(keep))
@@ -623,6 +634,18 @@ def rebuild(obj, keep, pv_new, pos, bound, npin=None):
         npin = sum(1 for p in keep if p < nfix)
     faces = [tuple(pmap[p] for p in f[2:5]) for f in obj["faces"]
              if all(p in pmap for p in f[2:5])]
+    kept = len(faces)
+    if added:
+        want = set(frozenset(f) for f in added["faces"])
+        faces = [f for f in faces if frozenset(f) in want]
+        kept = len(faces)
+        have = set(frozenset(f) for f in faces)
+        for f in added["faces"]:
+            if frozenset(f) not in have:
+                have.add(frozenset(f))
+                faces.append(tuple(f))
+        pv_new = list(pv_new) + list(added["pv"])
+        pos = list(pos) + list(added["pos"])
     if not faces:
         raise Refused("every cloth face lost a corner: %d of the object's %d particles "
                       "survived the edit and no triangle of the face list is whole"
@@ -666,7 +689,7 @@ def rebuild(obj, keep, pv_new, pos, bound, npin=None):
         if rec is None:
             n = pmap[p]
         else:
-            n = len(keep) + len(c.blends)
+            n = c.numparticles + len(c.blends)
             c.blends.append(rec)
             kept_blends += 1
         bind.setdefault(k, {})[v] = (pmap[p], flip, n)
@@ -675,4 +698,15 @@ def rebuild(obj, keep, pv_new, pos, bound, npin=None):
               "faces": len(obj["faces"]) - len(faces),
               "blends": len(obj["blends"]) - kept_blends,
               "seams": 1 if (obj[0x54] or obj[0x58]) else 0}
+    if added:
+        for k, v, i, flip in added["bound"]:
+            bind.setdefault(k, {})[v] = (i, flip, i)
+        now = set(pair(a, b) for a, b, _w0, _w1, _r in c.springs)
+        was = [pair(pmap[a], pmap[b]) for a, b, _w0, _w1, _r in obj["springs"]
+               if a in pmap and b in pmap]
+        counts["springs"] = len(obj["springs"]) - len(was) + sum(e not in now for e in was)
+        counts["springs_added"] = len(now - set(was))
+        counts["faces"] = len(obj["faces"]) - kept
+        counts["faces_added"] = len(faces) - kept
+        counts["added"] = len(added["pv"])
     return c, bind, counts
