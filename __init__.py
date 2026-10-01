@@ -53,6 +53,14 @@ def _pair(box, key, value, icon="NONE"):
     row.label(text=value, icon=icon)
 
 
+def _two_bone_capsule(gi, k, bone0, bone1):
+    """The warning for a capsule written with its ends on two bones."""
+    return ("cloth capsule %d on model %d has end 0 on %r and end 1 on %r: written, and the "
+            "engine moves each end with its own bone, but no shipped capsule spans two bones "
+            "-- all 227 hang both ends on one -- so spawn it before trusting it"
+            % (k, gi, bone0, bone1))
+
+
 def _mode_tally(actions):
     """`(label, count)` per root-motion mode present, in `ROOT_MOTION_MODES` order.
 
@@ -1559,6 +1567,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if vol:
             self.report({"INFO"}, "%d cloth collision capsule or sphere record%s written "
                                   "from the scene's empties" % (vol, "" if vol == 1 else "s"))
+        for two in r["scene"].get("cloth_two_bone") or ():
+            self.report({"WARNING"}, _two_bone_capsule(*two))
         vol = r["scene"].get("cloth_volumes_unread")
         if vol:
             self.report({"WARNING"},
@@ -2241,6 +2251,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                            "" if not vmoved else
                            "; %d named a model no object here carries and went on the first"
                            % vmoved))
+        for two in r.get("cloth_two_bone") or ():
+            self.report({"WARNING"}, _two_bone_capsule(*two))
         nbox, nset = r.get("scene_hitboxes") or (0, 0)
         nfit = r.get("refit_hitboxes") or 0
         if nset:

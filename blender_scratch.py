@@ -766,7 +766,8 @@ def scene_hitboxes(d, arm_obj, bone_index, scale=1.0):
 
 def add_cloth_volumes(d, arm_obj, owners, bone_index, scale=1.0):
     """Every cloth capsule and sphere empty, on the model its object came from. Returns
-    (records, records put on the first model because no imported object carries theirs).
+    (records, records put on the first model because no imported object carries theirs,
+    capsules with their ends on two bones as `apply_cloth_volumes` names them).
 
     Where one lands decides nothing the engine does: the gather at 0x2c014a00 collects the
     selected submodel of every bodypart into one list, and each bodypart here has one.
@@ -784,7 +785,7 @@ def add_cloth_volumes(d, arm_obj, owners, bone_index, scale=1.0):
                           % (obj.name, want or "<none>"))
         return bone_index[want]
 
-    blobs, n, moved = {}, 0, 0
+    blobs, n, moved, two = {}, 0, 0, []
     for key in sorted(caps):
         ends = caps[key]
         if set(ends) != {0, 1}:
@@ -793,6 +794,8 @@ def add_cloth_volumes(d, arm_obj, owners, bone_index, scale=1.0):
                           "delete it too, or add a capsule with Add Cloth Capsule"
                           % (obj.name, end, key[1]))
         ends = (ends[0], ends[1])
+        if bone(ends[0]) != bone(ends[1]):
+            two.append((key[0], key[1], ends[0].parent_bone, ends[1].parent_bone))
         rec = struct.pack("<2i7f", bone(ends[0]), bone(ends[1]),
                           export_mod._capsule_radius(ends, key[0], key[1], scale),
                           *(export_mod.cloth_volume_centre(ends[0], arm_obj, scale)
@@ -811,7 +814,7 @@ def add_cloth_volumes(d, arm_obj, owners, bone_index, scale=1.0):
         n += 1
     for (bi, k), recs in blobs.items():
         d.bodyparts[bi].kids[0].extra[k] = b"".join(recs)
-    return n, moved
+    return n, moved, two
 
 
 def add_attachments(d, arm_obj, bone_index, scale=1.0):
@@ -987,7 +990,9 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     nfit = fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale) if (
         hitboxes and not nset) else 0
     add_attachments(d, arm_obj, bone_index, scale)
-    d.cloth_volumes = add_cloth_volumes(d, arm_obj, owners, bone_index, scale)
+    nvol, vmoved, d.cloth_two_bone = add_cloth_volumes(d, arm_obj, owners, bone_index,
+                                                       scale)
+    d.cloth_volumes = (nvol, vmoved)
     add_springbones(d, arm_obj, bone_index)
     _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
                                                   use_range, activity, root_motion)
@@ -1073,6 +1078,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "anims": len(d.anims), "seqs": len(d.seqs),
             "includes": len(d.includes),
             "springs": len(d.springbones), "cloth_volumes": d.cloth_volumes,
+            "cloth_two_bone": d.cloth_two_bone,
             "hitboxes": sum(len(r.kids) for r in d.hitboxsets),
             "faces": st["tris_out"], "verts": st["verts_out"],
             "model_verts": sum(len(x.extra.get("tangents") or b"") // 16

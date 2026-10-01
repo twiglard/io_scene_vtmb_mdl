@@ -2899,20 +2899,23 @@ def _volume_blob(recs, was, fmt, nint):
 def apply_cloth_volumes(d, m, arm_obj, scale):
     """Every model's cloth collision capsules and spheres, rebuilt from the scene's empties.
 
-    Answers `{changed, unread}`. An armature without `vtmb_cloth_volumes` was imported
-    before volumes were drawn or lacks a volume's bone, so its file keeps its own and any
-    volume empty on it is `unread`.
+    Answers `{changed, unread, two_bone}`. An armature without `vtmb_cloth_volumes` was
+    imported before volumes were drawn or lacks a volume's bone, so its file keeps its own
+    and any volume empty on it is `unread`. `two_bone` is every capsule written with its
+    ends on two bones, `(model, capsule, bone name, bone name)`: 0x2c014a00 moves each end
+    by its own bone, and none of the 227 shipped capsules does it.
     """
     caps, sphs = cloth_volume_objects(arm_obj)
     if not arm_obj.get("vtmb_cloth_volumes"):
-        return {"changed": 0, "unread": sum(len(e) for e in caps.values()) + len(sphs)}
+        return {"changed": 0, "unread": sum(len(e) for e in caps.values()) + len(sphs),
+                "two_bone": []}
     flat = [mr for dbp in d.bodyparts for mr in dbp.kids]
     for gi, _k in list(caps) + list(sphs):
         if not 0 <= gi < len(flat):
             raise ValueError("a cloth volume empty names model %d, and the file has %d"
                              % (gi, len(flat)))
     bmap = bone_map(m, arm_obj)
-    changed = 0
+    changed, two = 0, []
     for gi, mr in enumerate(flat):
         recs = []
         for key in sorted(k for k in caps if k[0] == gi):
@@ -2923,6 +2926,8 @@ def apply_cloth_volumes(d, m, arm_obj, scale):
                                  "Cloth Capsule" % (obj.name, end, key[1], gi))
             ends = (caps[key][0], caps[key][1])
             b = [_accessory_bone(o, m, arm_obj, bmap, "cloth capsule end") for o in ends]
+            if b[0] != b[1]:
+                two.append((gi, key[1], ends[0].parent_bone, ends[1].parent_bone))
             p = [cloth_volume_centre(o, arm_obj, scale) for o in ends]
             recs.append((b[0], b[1], _capsule_radius(ends, gi, key[1], scale)) + p[0] + p[1])
         old = mr.extra.get("clothcollide") or b""
@@ -2941,7 +2946,7 @@ def apply_cloth_volumes(d, m, arm_obj, scale):
         if blob != old:
             mr.extra["clothsphere"] = blob
             changed += n
-    return {"changed": changed, "unread": 0}
+    return {"changed": changed, "unread": 0, "two_bone": two}
 
 
 def _apply_params(rec, params, names, where):
@@ -3808,6 +3813,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     vol = apply_cloth_volumes(d, m, arm_obj, scale)
     scene["cloth_volumes"], scene["cloth_volumes_unread"] = vol["changed"], vol["unread"]
+    scene["cloth_two_bone"] = vol.get("two_bone") or []
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)
     face = apply_face(d, m, arm_obj, scale)
