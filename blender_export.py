@@ -2279,6 +2279,32 @@ def cloth_scene(m, mo, me, cmap=None):
     return vertex, rest, rest_b, offsets
 
 
+def remove_cloth(d, m, source):
+    """Takes the cloth object off every model whose scene object has the Cloth box unticked.
+
+    Absent and 0 are different states: the import stamps `vtmb_cloth` 1 on a model carrying
+    cloth, the box writes 0 rather than deleting the key, and a scene imported before the
+    stamp carries no key and keeps the file's cloth. Only the cloth object goes -- the
+    collision capsules and spheres name bones and no vertex, and the gather at
+    `StudioRender 0x2c014a00` collides them with every cloth object of the model, so they
+    stay where the file has them. With no cloth left the mesh binding arrays at
+    `mstudiomesh_t +0x30..+0x38` emit zero and `studiohdr_t.flags` 0x400 clears.
+
+    Answers one (object, model, objects, rows, meshes) per model whose cloth went.
+    """
+    found = mesh_objects(m, source)
+    out = []
+    for bi, mi, _bp, mo in mesh_mod.models_of(m):
+        rec = d.bodyparts[bi].kids[mi]
+        cl = rec.extra.get("cloth")
+        obj = found.get((bi, mi))
+        if not cl or obj is None or "vtmb_cloth" not in obj or obj["vtmb_cloth"]:
+            continue
+        rec.extra["cloth"] = None
+        out.append((obj.name, mo.name, len(cl["slots"]), cl["rows"], len(cl["meshes"])))
+    return out
+
+
 def cloth_edits(m, source, d, rebuilt=None):
     """What each cloth-bound model's scene says that its donor bytes do not.
 
@@ -2312,9 +2338,16 @@ def cloth_edits(m, source, d, rebuilt=None):
         if slot is None:
             e["why"] = "the file's cloth table names no object in row 0"
             continue
-        if not obj.get("vtmb_cloth"):
-            e["why"] = ("the Cloth box is off and the file's cloth object stays -- "
-                        "removing one is not a write this exporter has")
+        if "vtmb_cloth" not in obj:
+            e["why"] = ("the object carries no Cloth setting -- a scene imported before the "
+                        "import stamped one -- so the file's cloth object stays; tick or "
+                        "untick the Cloth box to say which")
+            continue
+        if not obj["vtmb_cloth"]:
+            # `remove_cloth` takes it out where Cloth from the scene is on, so this is
+            # reached only with that option off.
+            e["why"] = ("the Cloth box is off and Cloth from the scene is off, so the "
+                        "file's cloth object stays")
             continue
         slot_k, at = slot
         scale_f, npart, nfix, ns0, _spoff, pv, springs = _cloth_header(cl["data"], at)
@@ -3870,6 +3903,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.rename_animation(d, d.anims.index(rec), now)
         scene["renamed_anims"].append((was, now))
 
+    # Before the geometry, so a rebuilt model regenerates no cloth the scene removed.
+    cloth_removed = remove_cloth(d, m, source) if write_cloth else []
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
@@ -4001,7 +4036,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # vertices, and the cut drops them anyway.
     touched = (revise_vtx(source, dest, data, revised, vtx_flavours,
                           lod0_only=bool(cut_lods or forced))
-               if (revised or removed or added_bones) else [])
+               if (revised or removed or added_bones or cloth_removed) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that
     # pass wrote and would otherwise be laid back over.
@@ -4031,8 +4066,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "includes": [r.name for r in d.includes],
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
-                      if (revised or removed or added_bones) else []),
-            "cloth": cloth, "cloth_edits": cloth_was, "lods": lods,
+                      if (revised or removed or added_bones or cloth_removed) else []),
+            "cloth": cloth, "cloth_edits": cloth_was, "cloth_removed": cloth_removed,
+            "lods": lods,
             "lod_switch": switches, "lod_shadow_flag": shadow,
             "lods_forced": forced, "lods_forced_by": forced_by,
             "phy": phy_report(source, dest, removed, renamed, bool(revised))}

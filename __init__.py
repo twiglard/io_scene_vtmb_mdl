@@ -1487,6 +1487,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "(0x40) -- the LOD stops being reachable by distance and nothing "
                         "draws it as a shadow either. This writer does not touch .mdl "
                         "flags")
+        for name, model, nobj, rows, nmesh in r.get("cloth_removed") or []:
+            self.report({"WARNING"},
+                        "%s: the Cloth box is off, so model %s's cloth was removed -- %d "
+                        "cloth object%s over %d row%s, binding %d mesh%s. The collision "
+                        "capsules and spheres stay"
+                        % (name, model, nobj, "" if nobj == 1 else "s",
+                           rows, "" if rows == 1 else "s", nmesh,
+                           "" if nmesh == 1 else "es"))
         cl = r.get("cloth")
         for e in r.get("cloth_edits") or []:
             moved = [w for w in ("stiffness" if e["sigma"] else None,

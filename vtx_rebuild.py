@@ -135,11 +135,21 @@ def _format_bits(v, mesh, lod):
     return None, 0
 
 
+def _cloth_row(src_mesh, li):
+    """The written mesh's cloth binding for LOD `li`, {} where it binds nothing there.
+
+    Row `li` of the binding belongs to LOD `li` of the .vtx: every shipped cloth-flagged
+    strip group, 183 over both flavours, sits in a LOD whose row is non-empty.
+    """
+    rows = src_mesh.clothbind or []
+    return rows[li] if li < len(rows) else {}
+
+
 def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, force_no_flex,
-                 i, j, k):
+                 i, j, k, li=0):
     """New triangles dealt out over one mesh's strip groups, as [(group, triangles)].
 
-    A triangle with a corner in the LOD-0 cloth binding goes to the cloth group, placed
+    A triangle with a corner in LOD `li`'s cloth binding goes to the cloth group, placed
     ahead of the software unflexed pass or last; the rest go through `assign_groups`.
     A pass the donor lacks gets a new group, and a donor group no pass needs is dropped.
     """
@@ -149,7 +159,7 @@ def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, force_no_fl
             if not 0 <= x < n:
                 raise ValueError("origMeshVertID %d is outside bodypart %d model %d mesh "
                                  "%d, which has %d vertices" % (x, i, j, k, n))
-    row = src_mesh.clothbind[0] if src_mesh.clothbind else {}
+    row = _cloth_row(src_mesh, li)
     drape = [t for t in new if any(x in row for x in t)]
     rest = [t for t in new if not any(x in row for x in t)]
     flexed = set()
@@ -198,11 +208,14 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
     vertices. A cell not named keeps the donor's own triangles, which `rebuild` reproduces
     byte for byte, so editing one mesh leaves every other alone.
 
-    Only LOD 0 is revised; the lower LODs keep their own triangles, which stay valid
-    because an addition never moves an original vertex id. `lod0_only` is for an export
-    that cuts the file to one LOD next, which a renumbering rebuild forces: there the lower
-    LODs name vertices by the donor's numbering, so they are left as read and not rebuilt
-    against the written model, whose vertex at the same index is another one.
+    Only LOD 0 is revised from `faces`; the lower LODs keep their own triangles, which
+    stay valid because an addition never moves an original vertex id. A mesh whose donor
+    groups include a cloth-flagged one while the written model binds none of its vertices
+    in that LOD's row is dealt out again in every LOD, keeping its triangles. `lod0_only`
+    is for an export that cuts the file to one LOD next, which a renumbering rebuild
+    forces: there the lower LODs name vertices by the donor's numbering, so they are left
+    as read and not rebuilt against the written model, whose vertex at the same index is
+    another one.
 
     A named mesh whose triangles differ from the donor's is dealt out by `_repartition`,
     and its strip groups become the passes that rule asks for, so their number and kind
@@ -243,17 +256,23 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
                                       [tuple(t) for t in reader.triangles(sg)]
                                       if grp.numverts else []))
                     ri += len(mesh.groups)
-                    if new is not None:
-                        # The comparison is in mesh-local indices, which is what the caller
-                        # speaks; `rebuild_group` wants the group-local ones kept above.
-                        flat = [tuple(ids[x] for x in t) for _g, ids, ts in donor for t in ts]
-                        if _same_faces(flat, new):
-                            new = None
+                    # The comparison is in mesh-local indices, which is what the caller
+                    # speaks; `rebuild_group` wants the group-local ones kept above.
+                    flat = [tuple(ids[x] for x in t) for _g, ids, ts in donor for t in ts]
+                    if new is not None and _same_faces(flat, new):
+                        new = None
+                    if new is None and not _cloth_row(src_mesh, li) and any(
+                            g.flags & W.SG_IS_CLOTH for g, _i, _t in donor):
+                        # The model as written binds no vertex of this mesh in this LOD's
+                        # row -- its cloth object was removed -- so the cloth group's
+                        # triangles are dealt out again over the plain passes.
+                        new = flat
                     if new is None:
                         cells = [(g, ids, tris) for g, ids, tris in donor if g.numverts]
                     else:
                         dealt = _repartition(mesh, src_mesh, new, verts, v, lod,
-                                             fixed_function, force_no_flex, i, j, k)
+                                             fixed_function, force_no_flex, i, j, k,
+                                             li=li)
                         if not dealt and mesh.groups:
                             # Every triangle deleted leaves one empty group.
                             dealt = [(mesh.groups[0], [])]

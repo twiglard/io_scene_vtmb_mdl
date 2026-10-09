@@ -304,6 +304,12 @@ def _cloth_set(obj, key, value):
         del obj[key]
 
 
+def _cloth_on_set(obj, value):
+    """Stores 0 rather than deleting the key: absent is a scene imported before the import
+    stamped it, which keeps the file's cloth, and 0 is the box unticked, which removes it."""
+    obj[CLOTH] = 1 if value else 0
+
+
 _PRESET_ITEMS = []              # Blender frees a dynamic items list it does not own
 
 
@@ -410,6 +416,8 @@ def cloth_pins(obj):
 
 def draw_cloth(lay, obj):
     lay.prop(obj, "vtmb_cloth_on")
+    if CLOTH in obj and not obj[CLOTH]:
+        lay.label(text="no cloth written; an imported model's cloth object is removed")
     if not obj.get(CLOTH):
         return
     lay.prop(obj, "vtmb_cloth_preset_name")
@@ -2713,9 +2721,11 @@ def register_props():
             set=(lambda k: lambda self, v: _store(self, k, v))(key)))
     bpy.types.Object.vtmb_cloth_on = bpy.props.BoolProperty(
         name="Cloth", description="Export this mesh as a cloth object -- the model's "
-                                  "whole particle array, so it must use one material",
+                                  "whole particle array, so it must use one material. "
+                                  "Unticked on a model imported with cloth, the export "
+                                  "removes that model's cloth object from the file",
         get=lambda self: _cloth_get(self, CLOTH),
-        set=lambda self, v: _cloth_set(self, CLOTH, v))
+        set=_cloth_on_set)
     bpy.types.Object.vtmb_cloth_flip_on = bpy.props.BoolProperty(
         name="Flip normals", description="Bit 15 of every particle index, which flips the "
                                          "cloth normal the solver hands the draw path",
