@@ -7,6 +7,10 @@ Clean-room: written from the game's own binaries and shipped files, with no exis
 model tool consulted. It ships no game content of any kind — everything it reads comes
 from your own installation.
 
+**Prerelease.** `master` past the `0.2.51` tag has not yet had its next major test in
+Blender, so no `.zip` is built from it until then and the add-on list shows a warning.
+To try it, put this directory under Blender's `scripts/addons/` as `io_scene_vtmb_mdl`.
+
 ## What it does
 
 **Import** — skeletons, meshes, UVs, vertex weights, textures and animations, including

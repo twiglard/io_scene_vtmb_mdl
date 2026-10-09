@@ -18,6 +18,8 @@ bl_info = {
                    "second exporter authors a .mdl and .dx80.vtx from the scene with "
                    "no donor file at all",
     "version": (0, 2, 51),
+    "warning": "Prerelease: what is past the 0.2.51 tag has not had its major test "
+               "in Blender yet",
     "category": "Import-Export",
 }
 
