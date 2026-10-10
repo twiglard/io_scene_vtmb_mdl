@@ -72,6 +72,12 @@ MAXSTUDIOBONES = 350
 # 17 over 1587 records, so nothing shipped reaches it.  Recon §54.1.
 MAXSTUDIOKNOCKBACKS = 20
 
+# Cloth collide StudioRender 0x2c0031a0 copies both into 16-record stack arrays and checks
+# neither count, and client.dll 0x10092cfa adds up to one capsule per draw.  Shipped maximum
+# is 9 capsules and 2 spheres.
+CLOTH_CAPSULES_MAX = 15
+CLOTH_SPHERES_MAX = 16
+
 # A bone carrying no bit of the 0xfffc used-by mask gets no bone matrix, so anything skinned
 # to it draws nothing.  0x10 is the corpus norm: 62439 of 62702 bones carry it.
 BONE_USED = 0x10
@@ -1003,6 +1009,38 @@ def model_vertex_counts(d):
     return out
 
 
+def cloth_volume_counts(d):
+    """(bodypart name, capsules, spheres) per bodypart: the most any one of its submodels
+    carries, since the engine draws one submodel per bodypart and gathers all of their volumes
+    into one list.  Summed, these are the most collide is ever handed."""
+    out = []
+    for i, bp in enumerate(d.bodyparts):
+        caps = max((len(mr.extra.get("clothcollide") or b"") // 36 for mr in bp.kids), default=0)
+        sphs = max((len(mr.extra.get("clothsphere") or b"") // 20 for mr in bp.kids), default=0)
+        out.append((bp.name if bp.name else str(i), caps, sphs))
+    return out
+
+
+def _check_cloth_volumes(d):
+    if not any(mr.extra.get("cloth") for r in d.bodyparts for mr in r.kids):
+        return
+    counts = cloth_volume_counts(d)
+    for k, what, limit in ((1, "capsule", CLOTH_CAPSULES_MAX), (2, "sphere", CLOTH_SPHERES_MAX)):
+        n = sum(c[k] for c in counts)
+        if n <= limit:
+            continue
+        split = [c for c in counts if c[k]]
+        raise Refused("the model draws up to %d cloth %ss at once against %d: cloth collision "
+                      "copies them into a 16-record stack array and never checks the count%s, "
+                      "so the ones past it overwrite the stack%s. Delete %s, or put them on "
+                      "submodels of one bodypart that are never drawn together"
+                      % (n, what, limit,
+                         ", and the game adds one capsule of its own" if k == 1 else "",
+                         "" if len(split) < 2 else " (%s)" % ", ".join(
+                             "%s %d" % (c[0], c[k]) for c in split),
+                         "one" if n - limit == 1 else "%d of them" % (n - limit)))
+
+
 STUDIOHDR_FLAGS_CLOTH = 0x0400
 
 
@@ -1061,6 +1099,7 @@ def emit(d, checksum=None, drop=False):
                       % (over[0][1], over[0][2], MAXSTUDIOVERTS,
                          "" if len(counts) == 1 else
                          " (%s)" % ", ".join("%s %d" % (n, c) for _, n, c in counts)))
+    _check_cloth_volumes(d)
     d.refit_count = stamp_sequence_boxes(d, force=bool(d.refit_boxes))
     _stamp_cloth_flag(d)
     quantise(d)

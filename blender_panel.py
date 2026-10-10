@@ -19,6 +19,7 @@ from . import blender_export
 from . import blender_import
 from . import blender_scratch
 from . import mdl as mdl_mod
+from . import mdl_build as build_mod
 from . import paths as paths_mod
 
 INCLUDES = "vtmb_includes"
@@ -688,19 +689,47 @@ def _link_beside(arm_obj, obj):
     bpy.context.scene.collection.objects.link(obj)
 
 
+def cloth_volume_worst(arm_obj, caps, sphs):
+    """(capsules, spheres) drawn at once at most: per bodypart the model carrying the most,
+    summed, which is what `mdl_build` refuses on.  A model no imported object names is a
+    bodypart of its own."""
+    bp = {}
+    for obj in arm_obj.children_recursive:
+        if obj.get("vtmb_index") is not None and obj.get("vtmb_bodypart") is not None:
+            bp.setdefault(int(obj["vtmb_index"]), str(obj["vtmb_bodypart"]))
+
+    def worst(keys):
+        per = {}
+        for gi, _ in keys:
+            n = per.setdefault(bp.get(gi, gi), {})
+            n[gi] = n.get(gi, 0) + 1
+        return sum(max(n.values()) for n in per.values())
+    return worst(caps), worst(sphs)
+
+
 def cloth_volume_line(arm_obj):
-    """What the panel says about the cloth collision volumes: the counts, or why none is read.
+    """What the panel says about the cloth collision volumes: the counts against what collide
+    has room for, or why none is read, plus a second line where a count is past it.
 
     Removing one is deleting its empties -- both ends, for a capsule.
     """
     try:
         caps, sphs = blender_export.cloth_volume_objects(arm_obj)
     except ValueError as exc:
-        return str(exc)
+        return str(exc), None
     if arm_obj.get("vtmb_source") and not arm_obj.get("vtmb_cloth_volumes"):
-        return "cloth volumes: the file's own are carried -- import it again to edit them"
-    return "cloth volumes: %d capsule%s, %d sphere%s; delete the empties to remove one" % (
-        len(caps), "" if len(caps) == 1 else "s", len(sphs), "" if len(sphs) == 1 else "s")
+        return "cloth volumes: the file's own are carried -- import it again to edit them", None
+    nc, ns = cloth_volume_worst(arm_obj, caps, sphs)
+    line = "cloth volumes: %d of %d capsules, %d of %d spheres%s; delete the empties to " \
+           "remove one" % (nc, build_mod.CLOTH_CAPSULES_MAX, ns, build_mod.CLOTH_SPHERES_MAX,
+                           "" if (nc, ns) == (len(caps), len(sphs)) else
+                           " drawn at once, %d and %d over every model, which the no-donor "
+                           "export draws together" % (len(caps), len(sphs)))
+    over = [w for w, n, lim in (("capsules", nc, build_mod.CLOTH_CAPSULES_MAX),
+                                ("spheres", ns, build_mod.CLOTH_SPHERES_MAX)) if n > lim]
+    return line, None if not over else (
+        "too many %s for cloth collision; an export of a model carrying cloth is refused"
+        % " and ".join(over))
 
 
 def draw_accessories(lay, context, arm_obj):
@@ -711,7 +740,10 @@ def draw_accessories(lay, context, arm_obj):
     row = lay.row(align=True)
     row.operator("vtmb.add_cloth_capsule", icon="SPHERE")
     row.operator("vtmb.add_cloth_sphere", icon="MESH_UVSPHERE")
-    lay.label(text=cloth_volume_line(arm_obj), icon="INFO")
+    line, over = cloth_volume_line(arm_obj)
+    lay.label(text=line, icon="INFO")
+    if over:
+        lay.label(text=over, icon="ERROR")
     if not attach and not boxes:
         lay.label(text="no attachment and no hitbox", icon="INFO")
         return
