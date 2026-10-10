@@ -503,7 +503,12 @@ def one_to_one(nvert, npart, flip):
     the bound vertex count and +0x38 runs `numparticles + i` over the bound vertices in
     mesh-then-vertex order, 31 008 of 31 008 entries at or past `numparticles`.
     The renderer puts the vector +0x38 names in the vertex's tangent slot, so here the
-    tangent equals the normal (StudioRender 0x2c02816a).
+    tangent equals the normal (StudioRender 0x2c02816a), the binormal cross(N, S) is zero,
+    and on a material with a `$bumpmap` the bump map has no visible effect on these vertices
+    (in game, 2026-10-10). No blend table is generated anyway: 0 of the 84 shipped
+    cloth-bound meshes carry a `$bumpmap`, and `blender_export.cloth_bumpmaps` is what warns
+    when a written one does. source-2003 picks the tangent-space clone off the material
+    (`r_studiodraw.cpp:1377`); whether StudioRender does the same is unread.
     """
     if nvert > npart:
         raise Refused("a cloth region wants at least one particle per vertex, and this "
@@ -687,6 +692,7 @@ def rebuild(obj, keep, pv_new, pos, bound, npin=None, added=None):
             if e0 in enew and e1 in enew:
                 rec = (enew[e0], enew[e1], w0, w1)
         if rec is None:
+            # the particle's own normal, as `one_to_one` writes it -- no bump map on it
             n = pmap[p]
         else:
             n = c.numparticles + len(c.blends)
@@ -700,6 +706,7 @@ def rebuild(obj, keep, pv_new, pos, bound, npin=None, added=None):
               "seams": 1 if (obj[0x54] or obj[0x58]) else 0}
     if added:
         for k, v, i, flip in added["bound"]:
+            # own normal as well, see `one_to_one`
             bind.setdefault(k, {})[v] = (i, flip, i)
         now = set(pair(a, b) for a, b, _w0, _w1, _r in c.springs)
         was = [pair(pmap[a], pmap[b]) for a, b, _w0, _w1, _r in obj["springs"]

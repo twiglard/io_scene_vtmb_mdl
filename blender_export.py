@@ -2305,6 +2305,51 @@ def remove_cloth(d, m, source):
     return out
 
 
+def cloth_bumpmaps(m, content):
+    """The cloth-bound meshes of a written file whose material carries a `$bumpmap`.
+
+    Answers (hits, unread). A hit is (model name, mesh index, bumped materials, own,
+    records) over row 0's bound vertices: `own` counts those whose +0x38 names the
+    particle's own normal, where the shader's tangent equals the normal and the bump map
+    has no visible effect, and `records` those naming a blend record, which only a donor's
+    own object carries and which draws the bump frame turned 90 degrees from the rigid
+    vertices' (both seen in game, task-vtmb-cloth-blend-table.md). `unread` is every cloth
+    material no content root resolves, so its `$bumpmap` is unknown. Every skin family is
+    read, since a family swaps the material at runtime. Nothing is written differently for
+    a hit -- the export generates no blend record (`cloth.one_to_one`).
+    """
+    fams = m.skins or [list(range(len(m.materials)))]
+    hits, unread, bump = [], [], {}
+    for _bi, _mi, _bp, mo in mesh_mod.models_of(m):
+        size = {c.col: c.numparticles for c in mo.cloths if c.row == 0}
+        for ms in mo.meshes:
+            if not ms.clothbind or not ms.clothbind[0]:
+                continue
+            names = sorted({m.materials[f[ms.material]] for f in fams
+                            if 0 <= ms.material < len(f)
+                            and 0 <= f[ms.material] < len(m.materials)})
+            for name in names:
+                if name in bump:
+                    continue
+                blob = None
+                for stem in paths_mod.material_stems(name, m.material_paths):
+                    blob = content.read(stem + ".vmt")
+                    if blob is not None:
+                        break
+                bump[name] = (None if blob is None
+                              else paths_mod.vmt_value(blob, "$bumpmap") is not None)
+                if blob is None:
+                    unread.append(name)
+            bumped = [n for n in names if bump[n]]
+            if not bumped:
+                continue
+            nrm = (ms.clothnormal or [{}])[0]
+            own = sum(1 for v, (col, _p, _f) in ms.clothbind[0].items()
+                      if nrm.get(v, 0) < size.get(col, 0))
+            hits.append((mo.name, ms.index, bumped, own, len(ms.clothbind[0]) - own))
+    return hits, unread
+
+
 def cloth_edits(m, source, d, rebuilt=None):
     """What each cloth-bound model's scene says that its donor bytes do not.
 

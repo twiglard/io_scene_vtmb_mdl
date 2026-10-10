@@ -1899,6 +1899,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "\"no material\", so that record keeps the name the file gave "
                         "it. A rename made in the same edit cannot be told from the "
                         "delete and was not taken either" % name)
+        for line in _cloth_bumps(context, obj, self.filepath):
+            self.report({"WARNING"}, line)
         self.report({"INFO"}, "wrote %d of %d animations over %d bones and %d sequences, "
                               "%d -> %d bytes: %s%s"
                               % (len(r["wrote"]), r["anims"], r["bones"], r["sequences"],
@@ -1958,6 +1960,49 @@ def _unresolved(context, arm_obj, filepath, includes, cdtextures):
         blender_import.Content(roots), includes, cdtextures,
         blender_panel.scene_material_names(context, arm_obj))
     return {k: v for k, v in bad.items() if v}
+
+
+def _cloth_bumps(context, arm_obj, filepath):
+    """A WARNING per cloth-bound mesh of the written file whose material has a `$bumpmap`.
+
+    Read off the file just written rather than off any one writer, so a donor's carried
+    objects, a regeneration and the no-donor path are all covered. The roots are the
+    written file's own tree and the armature's source, since the `.vmt` may sit in either.
+    A material no root resolves is not named here: `_unresolved` already names it, and the
+    engine draws it with the error material, which has no bump map either.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(232)
+    except OSError:
+        return []
+    if (len(head) < 232 or not int.from_bytes(head[228:232], "little")
+            & mdl_build.STUDIOHDR_FLAGS_CLOTH):
+        return []
+    game_root, mods, extract = _prefs(context)
+    roots = []
+    for anchor in (filepath, arm_obj.get("vtmb_source") or ""):
+        for r in paths.roots(anchor, game_root, mods, extract):
+            if r not in roots:
+                roots.append(r)
+    if not roots:
+        return []
+    hits, _unread = blender_export.cloth_bumpmaps(mdl.Mdl(filepath),
+                                                  blender_import.Content(roots))
+    out = []
+    for name, k, mats, own, rec in hits:
+        said = []
+        if own:
+            said.append("the bump map has no visible effect on its %d cloth vert%s, whose "
+                        "tangent is their own normal" % (own, "ex" if own == 1 else "ices"))
+        if rec:
+            said.append("%d cloth vert%s keep%s the donor's blend records, which draw it "
+                        "turned 90 degrees from the rigid vertices"
+                        % (rec, "ex" if rec == 1 else "ices", "s" if rec == 1 else ""))
+        out.append("%s mesh %d is cloth and %s %s a $bumpmap: %s"
+                   % (name, k, ", ".join(mats), "carries" if len(mats) == 1 else "carry",
+                      "; ".join(said)))
+    return out
 
 
 def _scratch_actions(arm_obj=None):
@@ -2319,6 +2364,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                ", ".join(mats[:3]),
                                "" if len(mats) <= 3 else " and %d more" % (len(mats) - 3),
                                said))
+        for line in _cloth_bumps(context, obj, self.filepath):
+            self.report({"WARNING"}, line)
         self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
                               "%d materials, %d animations (%d with root motion), "
                               "%d sequences, %d chained, %d hitboxes, %d faces, "

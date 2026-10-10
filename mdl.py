@@ -538,7 +538,7 @@ class Event:
 
 class Mesh:
     __slots__ = ("index", "material", "numvertices", "vertexoffset", "materialtype",
-                 "materialparam", "flexes", "cloth", "clothbind")
+                 "materialparam", "flexes", "cloth", "clothbind", "clothnormal")
 
 
 class Flex:
@@ -932,7 +932,7 @@ class Mdl:
             # particle index, cloth normal index.  All three are 0 on a mesh without cloth,
             # and the .vtx strip group of one that has them must carry SG_IS_CLOTH.
             e.cloth = all(struct.unpack_from("<3i", d, eo + 0x30))
-            e.clothbind = None
+            e.clothbind = e.clothnormal = None
             e.flexes = self._read_flexes(eo)
             m.meshes.append(e)
         self._read_cloths(off, m, meshindex)
@@ -1030,7 +1030,9 @@ class Mdl:
 
         A mesh's three arrays are `rows * numvertices` entries laid out row-major, and the
         0x8000 bit on a +0x34 entry is per VERTEX and not per mesh: 30 361 entries carry it
-        against 25 367 that do not.
+        against 25 367 that do not. `clothnormal` is the +0x38 entry per bound vertex: below
+        the object's `numparticles` it names the particle's own normal, at or past it a blend
+        record.
         """
         d = self.d
         m.cloths, m.clothrows, m.clothcols = [], 0, 0
@@ -1063,20 +1065,24 @@ class Mdl:
             m.cloths.append(c)
         for k, e in enumerate(m.meshes):
             eo = off + meshindex + k * MESH_STRIDE
-            own, par = struct.unpack_from("<2i", d, eo + 0x30)
+            own, par, nrm = struct.unpack_from("<3i", d, eo + 0x30)
             if not own or not par:
                 continue
             n = e.numvertices
-            e.clothbind = []
+            e.clothbind, e.clothnormal = [], [] if nrm else None
             for r in range(rows):
-                row = {}
+                row, nrow = {}, {}
                 for v in range(n):
                     col = d[eo + own + r * n + v]
                     if col == 0xff:
                         continue
                     raw = struct.unpack_from("<H", d, eo + par + (r * n + v) * 2)[0]
                     row[v] = (col, raw & 0x7fff, bool(raw & 0x8000))
+                    if nrm:
+                        nrow[v] = struct.unpack_from("<H", d, eo + nrm + (r * n + v) * 2)[0]
                 e.clothbind.append(row)
+                if nrm:
+                    e.clothnormal.append(nrow)
 
     def _read_flexdescs(self):
         n, idx = struct.unpack_from("<ii", self.d, HDR_NUMFLEXDESC)
