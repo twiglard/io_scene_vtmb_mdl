@@ -397,11 +397,12 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
 
         A corner further than NORMAL_EPS from what the vertex settled on is a hard edge
         the scene put there and still splits; the rest resolve to the one value, so an
-        edit moves the vertex instead of duplicating it. A UV is float32 on both sides and
-        needs none of that.
+        edit moves the vertex instead of duplicating it. A corner on a face with no area
+        reads no normal at all and resolves too -- BUGS 158. A UV is float32 on both sides
+        and needs none of that.
         """
         base = decided[vi]
-        n = base if not take_normal else tuple(normals[li].vector)
+        n = base if not take_normal or li in dead else tuple(normals[li].vector)
         u, w = uv_layer.data[li].uv if take_uv else uvs[vi]
         if base == (0.0, 0.0, 0.0) or max(abs(a - b) for a, b in zip(n, base)) \
                 <= export_mod.NORMAL_EPS:
