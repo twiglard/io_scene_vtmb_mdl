@@ -291,17 +291,32 @@ def _cached_mdl(path):
     return _MDL_CACHE[key]
 
 
-def _base_path(op, context):
-    """The .mdl the active action belongs to, which is the one being rewritten.
+def _base_from(op, context):
+    """The .mdl being rewritten, and what named it: "source", "action", "armature" or "".
 
     Never the save path: importing with the chain on gives actions from about 29 files at
-    once, so the file is a property of the action and not of where the result is put.
+    once, so the action's own stamp wins. An action keyed in Blender carries none, and then
+    the file the armature was imported from is the one it goes into.
     """
     if getattr(op, "source", ""):
-        return bpy.path.abspath(op.source)
+        return bpy.path.abspath(op.source), "source"
     obj = context.active_object
     ad = obj.animation_data if obj else None
-    return (ad.action.get("vtmb_source") if ad and ad.action else None) or ""
+    got = ad.action.get("vtmb_source") if ad and ad.action else None
+    if got:
+        return got, "action"
+    got = obj.get("vtmb_source") if obj else None
+    return (got, "armature") if got else ("", "")
+
+
+def _base_path(op, context):
+    return _base_from(op, context)[0]
+
+
+def _appends_active(op, act, adds):
+    """Whether the active action goes in as a new animation: it matches none of the file's
+    and the dialog's add-new box is on."""
+    return op.target == ACTIVE and op.add_new and act in adds
 
 
 def _restamp_sequences(obj, written, src, added, dropped_seqs, seqlist=None):
@@ -716,8 +731,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     # Drawn disabled purely to hang a tooltip off the filename; a label cannot have one.
     reading: bpy.props.StringProperty(
         name="File", default="",
-        description="The .mdl the active action was imported from. It is the template for "
-                    "the output: its hitboxes, attachments, cloth, flex, spring bones and "
+        description="The .mdl the active action was imported from, or for an action made "
+                    "in Blender the one the armature was imported from. It is the template "
+                    "for the output: its hitboxes, attachments, cloth, flex, spring bones and "
                     "every animation you are not replacing are copied across byte for "
                     "byte, and so are its mesh, skeleton, materials and sequences unless "
                     "you tick them below. Everything written comes from this scene's "
@@ -919,20 +935,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         # carries through. Empty with no stamp, which keeps the donor's.
         self.cdtexture = ";".join(
             blender_scratch.scene_cdtextures(context.active_object))
-        base = _base_path(self, context)
-        self.reading = os.path.basename(base) or "(none)"
+        base, why = _base_from(self, context)
+        self.reading = ("%s (the armature's)" % os.path.basename(base) if why == "armature"
+                        else os.path.basename(base) or "(none)")
         self.filepath = base or self.filepath
         return super().invoke(context, event)
 
     def draw(self, context):
         lay = self.layout
-        base = _base_path(self, context)
+        base, why = _base_from(self, context)
         act = context.active_object.animation_data.action
 
         box = _section(lay, "vtmb_model", "Model", icon="FILE_3D")
         if box is not None:
             if not base:
-                box.label(text="the active action came from no .mdl", icon="ERROR")
+                box.label(text="neither the active action nor the armature came from a .mdl",
+                          icon="ERROR")
             else:
                 row = box.row()
                 row.enabled = False
@@ -1028,8 +1046,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         box.label(text="    and %d more" % (len(rest) - 3))
             elif self.target != NONE:
                 auto = _auto_name(self, context)
-                if self.target == ACTIVE and not auto:
-                    box.label(text="that action came from no animation", icon="ERROR")
+                if self.target == ACTIVE and not auto and self.add_new:
+                    _pair(box, "into", "a new animation and sequence, %s" % act.name,
+                          icon="ADD")
+                elif self.target == ACTIVE and not auto:
+                    box.label(text="that action came from no animation: tick Unmatched "
+                                   "to append it", icon="ERROR")
                 else:
                     lo, hi = act.frame_range
                     a, b = (context.scene.frame_start, context.scene.frame_end) \
@@ -1100,9 +1122,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         obj = context.active_object
         src = _base_path(self, context)
         if not src:
-            self.report({"ERROR"}, "nothing to read from: this action was not imported "
-                                   "from a .mdl, and the file being written does not "
-                                   "exist yet, so there is no model to put it into")
+            self.report({"ERROR"}, "nothing to read from: neither this action nor the "
+                                   "armature was imported from a .mdl, so there is no "
+                                   "model to put it into")
             return {"CANCELLED"}
         one = self.target not in (ALL, NONE)
         frame = context.scene.frame_current
@@ -1123,9 +1145,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                 blender_export.describe_unwritten(rest))
             else:
                 act = obj.animation_data.action
-                actions = {blender_export.resolve_target(
-                    m, act, "" if self.target == ACTIVE else self.target): act}
-                adds = [a for a in adds if a is not act]
+                if _appends_active(self, act, adds):
+                    actions = {}
+                else:
+                    actions = {blender_export.resolve_target(
+                        m, act, "" if self.target == ACTIVE else self.target): act}
+                    adds = [a for a in adds if a is not act]
             # Writing an animation and removing it in the same pass is contradictory, and
             # appending its action back is worse: the delete runs last and would leave the
             # file holding a fresh copy of what was asked to go.
@@ -1440,8 +1465,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 # One value per model per LOD, so a file of several models repeats them, and
                 # a negative marks the shadow LOD, which ComputeModelLod never picks.
                 swaps = list(dict.fromkeys(x for x in row["dropped"] if x >= 0))
-                lost = (["the model no longer swaps at %s" % ", ".join("%g" % x for x in swaps)]
-                        if swaps else [])
+                lost = (["the model no longer swaps at %s"
+                         % ", ".join("%g" % x for x in swaps)] if swaps else [])
                 if any(x < 0 for x in row["dropped"]):
                     lost.append("its shadow LOD is gone")
                 self.report({"INFO"},
