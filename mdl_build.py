@@ -2513,7 +2513,11 @@ def add_model(d, meshes, bodypart="studio", model="model"):
     mo = Rec(moraw, None, recs,
              {"verts": bytes(vb), "tangents": bytes(tb), "eyes": []})
     bp = Rec(bytearray(16), bodypart, [mo])
-    struct.pack_into("<i", bp.raw, 0x08, 1)
+    # The product of the earlier bodyparts' model counts, as on 4540 of 4540 shipped ones.
+    base = 1
+    for was in d.bodyparts:
+        base *= max(1, len(was.kids))
+    struct.pack_into("<i", bp.raw, 0x08, base)
     d.bodyparts.append(bp)
     d.faces.append([face_lists])
     return len(d.bodyparts) - 1

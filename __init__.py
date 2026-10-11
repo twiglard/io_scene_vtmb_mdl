@@ -432,16 +432,18 @@ def _mesh_fields(op):
 
 
 def _mesh_status(op, context, base, fields):
-    """(models the scene supplies, models the file has, fields it cannot store)."""
+    """(models the scene supplies, models the file has, fields it cannot store, objects
+    the export appends as models)."""
     try:
         m = _cached_mdl(base)
     except Exception:
-        return 0, 0, []
+        return 0, 0, [], 0
     no = set()
     for _bi, _mi, _bp, mo in mesh_write.models_of(m):
         no |= set(mesh_write.supported(mo.filetype, fields)[1])
     return (len(blender_export.mesh_objects(m, base)),
-            len(mesh_write.models_of(m)), sorted(no))
+            len(mesh_write.models_of(m)), sorted(no),
+            len(blender_export.new_model_objects(m, base, context.active_object)))
 
 
 def _drop_takes(op, context, base):
@@ -1069,9 +1071,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             if not nverts:
                 _pair(box, "meshes", "none: the file declares no vertices", icon="INFO")
             elif fields:
-                got, total, no = _mesh_status(self, context, base, fields)
+                got, total, no, new = _mesh_status(self, context, base, fields)
                 _pair(box, "meshes", "%d of %d" % (got, total),
                       icon="NONE" if got == total else "ERROR")
+                if new:
+                    _pair(box, "appended", "%d new object%s, a bodypart each"
+                          % (new, "" if new == 1 else "s"), icon="ADD")
                 if no:
                     _pair(box, "cannot store", ", ".join(no), icon="INFO")
             else:
@@ -1148,7 +1153,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                              if self.options.is_invoke else "")),
                 cdtexture=self.cdtexture or None,
                 hull=(blender_scratch.fit_hull(
-                    list(blender_export.mesh_objects(m, src).values()), arm_scale)
+                    list(blender_export.mesh_objects(m, src).values())
+                    + blender_export.new_model_objects(m, src, obj), arm_scale)
                     if self.fit_hull else None),
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
@@ -1182,6 +1188,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name, was, now in mesh["rebuilt"]:
             self.report({"INFO"}, "%s was rebuilt: %d vertices -> %d, and the "
                                   ".dx80.vtx rewritten with it" % (name, was, now))
+        for x in mesh.get("appended") or ():
+            self.report({"INFO"}, "%s appended as bodypart %d, one model of %d vertices "
+                                  "and %d triangles%s%s"
+                        % (x["name"], x["bodypart"], x["verts"], x["tris"],
+                           "; %s not written" % " and ".join(x["unwritten"])
+                           if x["unwritten"] else "",
+                           "" if x["stamped"] else "; not stamped, since the armature "
+                           "still describes %s" % os.path.basename(src)))
+        for name, why in mesh.get("not_appended") or ():
+            self.report({"WARNING"}, "%s claims no model of %s and was not appended: %s"
+                        % (name, os.path.basename(src), why))
         if mesh["unskinned"]:
             self.report({"WARNING"}, "%d vertices are driven by no bone -- in no vertex "
                                      "group, in none above a zero weight, or in none that "
@@ -1790,8 +1807,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "keeps the record" % (name, was, was))
         for name, model in scene.get("dup_models") or ():
             self.report({"WARNING"}, "%r claims model %r, which another object owns, so "
-                                     "nothing of it reached the file -- the donor path "
-                                     "writes one mesh per model and cannot add one"
+                                     "nothing of it reached the file -- a copy is appended "
+                                     "as a model of its own only as the armature's child"
                         % (name, model))
         if scene.get("face"):
             extra += ("; rewrote %d eyeball or mouth record%s"

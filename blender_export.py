@@ -589,10 +589,10 @@ def _one_model(objs):
 
 
 def duplicate_models(m, source):
-    """(copies not written, models no one object owns), out of the objects claiming one.
+    """(copies, models no one object owns), out of the objects claiming one.
 
-    A copy is not written at all: the format holds one mesh per model and the donor path
-    has no way to add one, so the file keeps what the object it was copied from says.
+    A copy never writes the model it claims. `new_model_objects` appends one parented to
+    the armature as a model of its own; any other reaches the file nowhere.
     """
     dups, clash = [], []
     for key, objs in sorted(_model_claims(m, source).items()):
@@ -621,6 +621,101 @@ def mesh_objects(m, source):
         if obj is not None:
             out[key] = obj
     return out
+
+
+def new_model_objects(m, source, arm_obj):
+    """The armature's mesh children that claim no model of `source`, or are a Shift+D copy
+    of one that does, by name."""
+    if arm_obj is None or not same_file(arm_obj.get("vtmb_source"), source):
+        return []
+    claimed, copies = set(), set()
+    for objs in _model_claims(m, source).values():
+        claimed |= set(id(o) for o in objs)
+        got = _one_model(objs) if len(objs) > 1 else None
+        if got is not None:
+            copies |= set(id(o) for o in objs if o is not got)
+    return sorted((o for o in arm_obj.children
+                   if o.type == "MESH" and (id(o) not in claimed or id(o) in copies)),
+                  key=lambda o: o.name)
+
+
+def _skin_ref(d, tex, family):
+    """The skinref that draws texture `tex` in skin family `family`, appended if none does.
+
+    One that draws it in every family is preferred, so another family's skin does not
+    repaint the new mesh."""
+    if not d.skin:
+        return tex
+    row = d.skin[family] if 0 <= family < len(d.skin) else d.skin[0]
+    refs = [r for r, t in enumerate(row) if t == tex]
+    same = [r for r in refs if all(r < len(x) and x[r] == tex for x in d.skin)]
+    if same or refs:
+        return (same or refs)[0]
+    for x in d.skin:
+        x.append(tex)
+    return len(row) - 1
+
+
+def append_models(d, objs, bone_index, family, added, scale=1.0):
+    """Each object appended as a bodypart of one model, read as the no-donor path reads it.
+
+    ([row], {(bodypart, 0, mesh): triangles}, [(object name, why not appended)])."""
+    from . import blender_scratch as scratch_mod
+    rows, faces, skipped = [], {}, []
+    for obj in objs:
+        try:
+            runs, unskinned = scratch_mod.split_mesh(obj, bone_index, scale)[:2]
+            cloth = scratch_mod.cloth_params(obj) is not None
+        except scratch_mod.Refused as e:
+            skipped.append((obj.name, str(e)))
+            continue
+        mats = obj.data.materials
+        meshes, slots = [], []
+        for slot, verts, tris in runs:
+            name = mats[slot].name if slot < len(mats) and mats[slot] else obj.name
+            ref = _skin_ref(d, _material_index(d, name, added), family)
+            meshes.append((ref, verts, tris))
+            slots.append((slot, ref, len(verts)))
+        bi = build_mod.add_model(d, meshes, bodypart=obj.name, model=obj.name + ".smd")
+        d.faces.pop()
+        for k, (_r, _v, tris) in enumerate(meshes):
+            faces[(bi, 0, k)] = list(tris)
+        unwritten = []
+        keys = obj.data.shape_keys
+        if keys is not None and len(keys.key_blocks) > 1:
+            n = len(keys.key_blocks) - 1
+            unwritten.append("%d shape key%s" % (n, "" if n == 1 else "s"))
+        if cloth:
+            unwritten.append("its cloth")
+        rows.append({"object": obj, "name": obj.name, "bodypart": bi, "slots": slots,
+                     "verts": sum(len(v) for _r, v, _t in meshes),
+                     "tris": sum(len(t) for _r, _v, t in meshes),
+                     "unskinned": unskinned, "unwritten": unwritten, "stamped": False})
+    return rows, faces, skipped
+
+
+def stamp_appended(d, rows):
+    """The import's own stamps on each appended object, so the next export rewrites its
+    model rather than appending another."""
+    for row in rows:
+        obj, me = row["object"], row["object"].data
+        obj["vtmb_index"] = sum(len(bp.kids) for bp in d.bodyparts[:row["bodypart"]])
+        obj["vtmb_bodypart"] = obj.name
+        obj["vtmb_model"] = obj.name + ".smd"
+        obj["vtmb_filetype"] = 0
+        obj["vtmb_appended"] = True
+        # A copy keeps the import's, which numbers the vertices its `vtmb_orig` tags name.
+        if obj.get("vtmb_meshes") is None:
+            obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
+        obj["vtmb_slot_mats"] = [x.name if x else "" for x in me.materials]
+        refs = dict((slot, ref) for slot, ref, _n in row["slots"])
+        # The skin-family switch reads one per slot, and an empty slot has none.
+        if all(s in refs for s in range(len(me.materials))):
+            obj["vtmb_skinrefs"] = [refs[s] for s in range(len(me.materials))]
+        obj["vtmb_uv_layer"] = uv_layer_of(obj)[0].name
+        me["vtmb_model_name"] = obj.name + ".smd"
+        me["vtmb_model_label"] = me.name
+        row["stamped"] = True
 
 
 def renamed_models(m, source):
@@ -1000,6 +1095,10 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
     or a UV, so every other test here passes on an edit the file never took.
     """
     me = obj.data
+    # An appended model's vertices are in `split_mesh` order, so patching it index for
+    # index would write each Blender vertex onto another file vertex.
+    if obj.get("vtmb_appended"):
+        return True
     if len(me.vertices) != model.numvertices:
         return True
     if donor_faces is not None and _scene_faces(me) != donor_faces:
@@ -3630,6 +3729,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # Before `bone_map` raises on an unresolvable one, and before the appends make each copy
     # a bone of the file in its own right.
     dup_bones = duplicate_bones(m, arm_obj)
+    new_objs = new_model_objects(m, source, arm_obj)
+    appending = set(o.name for o in new_objs)
+    dup_models = [x for x in dup_models if x[0] not in appending]
     # Before the first reader: `read_poses` and `read_bones` both walk the FILE's bone list
     # and refuse by name on one the armature does not have, so a bone deleted in Blender has
     # to leave the description here or it never reaches the writer.
@@ -3945,6 +4047,19 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         elif ce:
             mesh["cloth_rebuilt"].append((obj.name, ce))
 
+    # After the donor's own models, so every stamped `vtmb_index` keeps its model.
+    appended, add_faces, mesh["not_appended"] = append_models(
+        d, new_objs, bone_index, skin_family(m, arm_obj), scene["added_materials"], scale)
+    revised.update(add_faces)
+    for x in appended:
+        mesh["unskinned"] += x["unskinned"]
+        over = crowded_vertices(x["object"], bone_index)
+        if over:
+            mesh["crowded"].append((x["name"], over))
+        odd = stray_groups(x["object"], bone_index)
+        if odd:
+            mesh["stray_groups"].append((x["name"], odd))
+
     if write_flexes:
         # After the geometry, because add_flex bounds every key against the mesh's
         # numvertices as written and a rebuild has just changed it.
@@ -3982,6 +4097,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     no_vtx = not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
     with open(dest, "wb") as f:
         f.write(data)
+    # A save-as leaves the armature describing the donor, which has no such model.
+    if same_file(source, dest):
+        stamp_appended(d, appended)
+    mesh["appended"] = [dict((k, v) for k, v in x.items() if k != "object")
+                        for x in appended]
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
             "unkeepable": unkeepable, "bones": len(m.bones),
             "mesh": mesh, "scene": scene, "bytes": len(data), "was": len(m.d),

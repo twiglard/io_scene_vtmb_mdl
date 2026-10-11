@@ -284,17 +284,42 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
                             local = dict((o, m) for m, o in enumerate(orig))
                             cells.append((g, orig, [tuple(local[x] for x in t)
                                                     for t in mine]))
-                    for grp, orig, tris in cells:
-                        vb = (vertex_bones(src_mesh, orig, verts)
-                              if grp.flags & W.SG_VERTS_ARE_BONED else None)
-                        W.rebuild_group(grp, orig, tris, vb,
-                                        max_bones=v.maxbones_strip,
-                                        max_per_vert=v.maxbones_vert)
-                        st["tris_out"] += len(grp.indices) // 3
-                        st["verts_out"] += grp.numverts
-                        st["strips"] += len(grp.strips)
-                        st["groups"] += 1
+                    _fill(v, src_mesh, verts, cells, st)
+    # A bodypart past the donor's is one `mdl_build.add_model` appended, given one LOD.
+    for i in range(len(v.bodyparts), len(mdl.bodyparts)):
+        bp = W.BodyPart()
+        for j, src_model in enumerate(mdl.bodyparts[i].models):
+            verts = mdl.vertices(src_model)
+            lod = W.Lod(0.0)
+            for k, src_mesh in enumerate(src_model.meshes):
+                mesh = W.Mesh(0)
+                lod.meshes.append(mesh)
+                dealt = _repartition(mesh, src_mesh, faces.get((i, j, k)) or [], verts, v,
+                                     lod, fixed_function, False, i, j, k)
+                mesh.groups[:] = [g for g, _t in dealt]
+                cells = []
+                for g, mine in dealt:
+                    st["revised"] += 1
+                    orig = sorted(set(x for t in mine for x in t))
+                    local = dict((o, n) for n, o in enumerate(orig))
+                    cells.append((g, orig, [tuple(local[x] for x in t) for t in mine]))
+                _fill(v, src_mesh, verts, cells, st)
+            bp.models.append(W.Model([lod]))
+        v.bodyparts.append(bp)
     return v.to_bytes(), st
+
+
+def _fill(v, src_mesh, verts, cells, st):
+    """Each strip group of `cells` rebuilt from its (group, vertex ids, triangles)."""
+    for grp, orig, tris in cells:
+        vb = (vertex_bones(src_mesh, orig, verts)
+              if grp.flags & W.SG_VERTS_ARE_BONED else None)
+        W.rebuild_group(grp, orig, tris, vb, max_bones=v.maxbones_strip,
+                        max_per_vert=v.maxbones_vert)
+        st["tris_out"] += len(grp.indices) // 3
+        st["verts_out"] += grp.numverts
+        st["strips"] += len(grp.strips)
+        st["groups"] += 1
 
 
 def seed(mdl, checksum, boned=True):
