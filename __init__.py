@@ -23,7 +23,7 @@ bl_info = {
     "category": "Import-Export",
 }
 
-from . import (checksum, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write,
+from . import (checksum, cloth, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write,
                normal_table, paths,
                relocs, sections, tth, vmt_write, vpk, vtx, vtx_rebuild, vtx_write,
                bone_templates,
@@ -564,6 +564,13 @@ def _target_items(self, context):
                              "did not come from")))
     _ANIM_ITEMS = items
     return _ANIM_ITEMS
+
+
+def _refused():
+    """Every module's `Refused`, looked up at the raise: `register` reloads the modules, and
+    a tuple built at import would keep the classes the reload replaced."""
+    return (mdl_build.Refused, mdl_rebuild.Refused, blender_scratch.Refused,
+            bone_templates.Refused, cloth.Refused)
 
 
 class VTMB_AddonPreferences(bpy.types.AddonPreferences):
@@ -1158,7 +1165,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     if self.fit_hull else None),
                 frame_start=context.scene.frame_start if self.use_range and one else None,
                 frame_end=context.scene.frame_end if self.use_range and one else None)
-        except mdl_build.Refused as exc:
+        except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
         except Exception as exc:
@@ -2242,7 +2249,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 activity=self.activity, hitboxes=self.fit_hitboxes,
                 root_motion=self.root_motion,
                 includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
-        except (blender_scratch.Refused, mdl_build.Refused) as exc:
+        except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
         except Exception as exc:
@@ -2391,9 +2398,9 @@ def register():
     # other module survives a disable/enable cycle as stale code.
     # Dependency order: a module has to be reloaded before anything that imports it, or the
     # importer keeps the old object and the reload buys nothing.
-    for m in (checksum, sections, relocs, normal_table, mdl, mdl_write, mdl_build,
-              mdl_rebuild, mesh_write, paths, tth, vpk, vtx, vtx_write, vtx_rebuild,
-              bone_templates,
+    for m in (checksum, sections, relocs, normal_table, cloth, mdl, mdl_write, mdl_build,
+              mdl_rebuild, mesh_write, paths, tth, vmt_write, vpk, vtx, vtx_write,
+              vtx_rebuild, bone_templates,
               blender_import, blender_export, blender_scratch, blender_templates,
               blender_panel):
         importlib.reload(m)
