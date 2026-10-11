@@ -242,6 +242,27 @@ def _report_unkeepable(op, names):
                  + ("" if len(names) <= 3 else " and %d more" % (len(names) - 3))))
 
 
+def _report_placed(op, moved, fields, whole):
+    """Name each object `placed` baked, or the unticked field that kept the file's own
+    placement. `fields` is None on the no-donor path, which writes every field, and an
+    appended object in `whole` is written whole on the donor path too."""
+    for row in moved:
+        name = row["object"]
+        kept = fields is not None and name not in whole
+        if kept and "positions" not in fields:
+            op.report({"WARNING"}, "%s is moved in Object mode, but Positions is not "
+                                   "ticked, so the file keeps its old placement" % name)
+            continue
+        op.report({"INFO"}, "%s is written where it stands in Object mode, relative to "
+                            "the armature" % name)
+        if kept and row["turned"] and "normals" not in fields:
+            op.report({"WARNING"}, "%s is turned in Object mode, but Normals is not "
+                                   "ticked, so its normals keep the file's direction" % name)
+        if row["stretched"]:
+            op.report({"WARNING"}, "%s has a non-uniform scale, which bends its custom "
+                                   "normals as Ctrl+A would" % name)
+
+
 def _report_unfitted(op, names):
     """Actions asking the engine to carry them whose keys do not travel.
 
@@ -1166,30 +1187,32 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             # this the bone positions, the poses, the accessories and the face all go in
             # unscaled while `fit_hull` alone divides.
             arm_scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
-            r = blender_export.export_actions(
-                context, obj, src, self.filepath, actions, scale=arm_scale,
-                root_motion_in_keys=self.root_motion_in_keys,
-                root_motion=self.root_motion,
-                mesh_fields=_mesh_fields(self), add=adds, drop=gone,
-                write_flexes=self.write_flexes,
-                write_cloth=self.write_cloth,
-                vtx_flavours=(("dx80", "dx7_2bone") if self.write_2bone_vtx
-                              else ("dx80",)),
-                # Derived only for a dialog, where the field is on screen with the
-                # derived value in it and the user can see and change it. A scripted call
-                # runs `execute` straight and gets `""`, which keeps the donor's name --
-                # otherwise every export to a new path would silently rewrite @12 and an
-                # otherwise-unedited file would stop coming back byte for byte.
-                model_name=(self.model_name or
-                            (blender_scratch.embedded_name(self.filepath)
-                             if self.options.is_invoke else "")),
-                cdtexture=self.cdtexture or None,
-                hull=(blender_scratch.fit_hull(
-                    list(blender_export.mesh_objects(m, src).values())
-                    + blender_export.new_model_objects(m, src, obj), arm_scale)
-                    if self.fit_hull else None),
-                frame_start=context.scene.frame_start if self.use_range and one else None,
-                frame_end=context.scene.frame_end if self.use_range and one else None)
+            objs = (list(blender_export.mesh_objects(m, src).values())
+                    + blender_export.new_model_objects(m, src, obj))
+            with blender_export.placed(objs, obj) as moved:
+                r = blender_export.export_actions(
+                    context, obj, src, self.filepath, actions, scale=arm_scale,
+                    placed={row["object"]: row["matrix"] for row in moved},
+                    root_motion_in_keys=self.root_motion_in_keys,
+                    root_motion=self.root_motion,
+                    mesh_fields=_mesh_fields(self), add=adds, drop=gone,
+                    write_flexes=self.write_flexes,
+                    write_cloth=self.write_cloth,
+                    vtx_flavours=(("dx80", "dx7_2bone") if self.write_2bone_vtx
+                                  else ("dx80",)),
+                    # Derived only for a dialog, where the field is on screen with the
+                    # derived value in it and the user can see and change it. A scripted call
+                    # runs `execute` straight and gets `""`, which keeps the donor's name --
+                    # otherwise every export to a new path would silently rewrite @12 and an
+                    # otherwise-unedited file would stop coming back byte for byte.
+                    model_name=(self.model_name or
+                                (blender_scratch.embedded_name(self.filepath)
+                                 if self.options.is_invoke else "")),
+                    cdtexture=self.cdtexture or None,
+                    hull=(blender_scratch.fit_hull(objs, arm_scale) if self.fit_hull
+                          else None),
+                    frame_start=context.scene.frame_start if self.use_range and one else None,
+                    frame_end=context.scene.frame_end if self.use_range and one else None)
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -1203,6 +1226,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
         mesh = r["mesh"]
+        _report_placed(self, moved, mesh["fields"],
+                       {row["name"] for row in mesh.get("appended") or ()})
         if mesh["missing"] and mesh["fields"]:
             self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "
                                      "the file's own: %s"
@@ -1220,6 +1245,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name, was, now in mesh["rebuilt"]:
             self.report({"INFO"}, "%s was rebuilt: %d vertices -> %d, and the "
                                   ".dx80.vtx rewritten with it" % (name, was, now))
+        for name, ft, out in mesh.get("dequantised") or ():
+            if out:
+                self.report({"WARNING"}, "%s has %d vertices outside the box its filetype %d "
+                                         "positions are quantised into, so it is written as "
+                                         "filetype 0, 44 bytes of floats per vertex"
+                            % (name, out, ft))
+            else:
+                self.report({"INFO"}, "%s was filetype %d, quantised, and is written as "
+                                      "filetype 0, 44 bytes of floats per vertex" % (name, ft))
         for x in mesh.get("appended") or ():
             self.report({"INFO"}, "%s appended as bodypart %d, one model of %d vertices "
                                   "and %d triangles%s%s"
@@ -2265,15 +2299,16 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         obj = context.active_object
         meshes = _scratch_meshes(context, obj)
-        hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
         try:
-            r = blender_scratch.export_scene(
-                context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
-                scale=self.scale, surfaceprop=self.surfaceprop,
-                cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
-                activity=self.activity, hitboxes=self.fit_hitboxes,
-                root_motion=self.root_motion,
-                includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
+            with blender_export.placed(meshes, obj) as moved:
+                hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
+                r = blender_scratch.export_scene(
+                    context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
+                    scale=self.scale, surfaceprop=self.surfaceprop,
+                    cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
+                    activity=self.activity, hitboxes=self.fit_hitboxes,
+                    root_motion=self.root_motion,
+                    includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -2284,6 +2319,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             return {"CANCELLED"}
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
+        _report_placed(self, moved, None, set())
         if r["unskinned"]:
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
                                      "bone 0, which drags them wherever it goes"

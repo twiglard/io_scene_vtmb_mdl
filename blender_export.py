@@ -11,6 +11,8 @@ spells by duplicating the vertex -- is rebuilt whole and its `.dx80.vtx` rewritt
 the model. A mesh that did not move takes the index-for-index patch instead.
 """
 
+import array
+import contextlib
 import math
 import os
 import re
@@ -623,6 +625,98 @@ def mesh_objects(m, source):
     return out
 
 
+PLACED_TOL = 1e-6
+
+
+@contextlib.contextmanager
+def placed(objs, arm_obj):
+    """Each mesh object's transform relative to the armature, baked into its vertices and
+    shape keys for one export as Ctrl+A would, then the saved arrays written back.
+
+    Every reader takes `co` in mesh space, and the file holds the mesh where the viewport
+    draws it. Custom normals are stored relative to the faces, so a rotation turns them and
+    a non-uniform scale bends them as Ctrl+A does. The importer's stashes are mesh space
+    too and move with it: `NORMAL_ATTR` is what `_one_normal` writes for a vertex on no
+    live face and for one within `NORMAL_EPS` of it, and `vtmb_orig_co` is what
+    `identity_map` measures a duplicated vertex against. Yields one dict per object moved.
+    """
+    inv = arm_obj.matrix_world.inverted()
+    todo = []
+    for obj in objs:
+        rel = inv @ obj.matrix_world
+        if all(abs(rel[r][c] - (r == c)) <= PLACED_TOL for r in range(4) for c in range(4)):
+            continue
+        if rel.determinant() < 0:
+            raise build_mod.Refused(
+                "%s has a negative scale in Object mode, which would turn its faces inside "
+                "out in the file -- clear it before exporting" % obj.name)
+        users = [o.name for o in bpy.data.objects if o.data is obj.data and o is not obj]
+        if users:
+            raise build_mod.Refused(
+                "%s is moved in Object mode and shares its mesh with %s, so writing it where "
+                "it stands would move the other as well" % (obj.name, ", ".join(users)))
+        lin = rel.to_3x3()
+        s = rel.to_scale()
+        todo.append((obj, rel, {
+            "object": obj.name,
+            "matrix": tuple(tuple(rel[r][c] for c in range(4)) for r in range(4)),
+            "offset": tuple(rel.translation),
+            "turned": any(abs(lin[r][c] - (r == c)) > PLACED_TOL
+                          for r in range(3) for c in range(3)),
+            "stretched": max(s) - min(s) > PLACED_TOL * max(s)}))
+    saved = []
+    try:
+        for obj, rel, _row in todo:
+            me = obj.data
+            co = array.array("f", [0.0]) * (len(me.vertices) * 3)
+            me.vertices.foreach_get("co", co)
+            keys = []
+            for kb in me.shape_keys.key_blocks if me.shape_keys else ():
+                a = array.array("f", [0.0]) * (len(kb.data) * 3)
+                kb.data.foreach_get("co", a)
+                keys.append(a)
+            att = me.attributes.get(NORMAL_ATTR)
+            nor = None
+            if att is not None and att.data_type == "FLOAT_VECTOR":
+                nor = array.array("f", [0.0]) * (len(att.data) * 3)
+                att.data.foreach_get("vector", nor)
+            home = obj.get("vtmb_orig_co")
+            home = list(home) if home is not None else None
+            saved.append((obj, me, co, keys, nor, home))
+            me.transform(rel, shape_keys=True)
+            if nor is not None:
+                att.data.foreach_set("vector", _turned_normals(rel, nor))
+            if home is not None:
+                obj["vtmb_orig_co"] = [c for i in range(0, len(home) - 2, 3)
+                                       for c in rel @ mathutils.Vector(home[i:i + 3])]
+            me.update()
+        yield [row for _obj, _rel, row in todo]
+    finally:
+        for obj, me, co, keys, nor, home in saved:
+            me.vertices.foreach_set("co", co)
+            for kb, a in zip(me.shape_keys.key_blocks if me.shape_keys else (), keys):
+                kb.data.foreach_set("co", a)
+            if nor is not None:
+                me.attributes[NORMAL_ATTR].data.foreach_set("vector", nor)
+            if home is not None:
+                obj["vtmb_orig_co"] = home
+            me.update()
+
+
+def _turned_normals(rel, flat):
+    """`flat` normals through the inverse transpose of `rel`'s 3x3, each kept at its own
+    length: a zero stash stays zero and a unit one unit, whatever the scale."""
+    nm = rel.to_3x3().inverted_safe().transposed()
+    out = array.array("f", flat)
+    for i in range(0, len(out) - 2, 3):
+        n = mathutils.Vector(flat[i:i + 3])
+        v = nm @ n
+        if v.length:
+            v *= n.length / v.length
+        out[i:i + 3] = array.array("f", v)
+    return out
+
+
 def new_model_objects(m, source, arm_obj):
     """The armature's mesh children that claim no model of `source`, or are a Shift+D copy
     of one that does, by name."""
@@ -1103,6 +1197,8 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
         return True
     if donor_faces is not None and _scene_faces(me) != donor_faces:
         return True
+    if "positions" in fields and outside_box(me, model):
+        return True
     if "uvs" not in fields:
         return False
     uv = uv_layer_of(obj)[0]
@@ -1113,8 +1209,27 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
                for vs in per)
 
 
+def outside_box(me, model):
+    """How many vertices stand where a quantised model's positions cannot reach.
+
+    `pack_model` clamps each coordinate into the box `quant_offset`/`quant_scale` span, and
+    every shipped quantised model has a vertex on each wall (4324 of 4324 model-axes), so
+    any outward move would land on the wall. The split writes 44-byte float records.
+    """
+    if model.filetype not in mdl_mod.QUANT_MAX:
+        return 0
+    lim = mdl_mod.QUANT_MAX[model.filetype]
+    norm = mdl_mod.QUANT_NORM[model.filetype]
+    co = [0.0] * (len(me.vertices) * 3)
+    me.vertices.foreach_get("co", co)
+    return sum(1 for i in range(len(me.vertices))
+               if any(not 0 <= mesh_mod.quantise(co[i * 3 + c], model.quant_offset[c],
+                                                 model.quant_scale[c], norm) <= lim
+                      for c in range(3)))
+
+
 def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
-                 donor_tris=None):
+                 donor_tris=None, place=None):
     """One model's geometry replaced from the scene, its per-mesh triangles and its edits.
 
     Refuses a renumbering the file cannot absorb rather than dropping what it would break:
@@ -1164,7 +1279,7 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     vertex = [vi for run in origins for vi in run]
     faces, edits["tangents"], flex, edits["cloth"] = build_mod.replace_model(
         d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris,
-        carry=carry if kept else None, flips=cloth_flip_bits(obj, vertex))
+        carry=carry if kept else None, flips=cloth_flip_bits(obj, vertex), place=place)
     edits["flex_dropped"], edits["flex_emptied"] = flex
     if d.bodyparts[bi].kids[mi].extra.get("cloth"):
         # The cloth object now names the WRITTEN numbering, which is Blender's only where
@@ -3675,7 +3790,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
-                   write_cloth=True, vtx_flavours=("dx80",)):
+                   write_cloth=True, vtx_flavours=("dx80",), placed=None):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -3699,6 +3814,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     The skeleton, the material names and the sequence table come from the scene too, and
     unconditionally: each is compared against what the file already says and written only
     where it differs, so an unedited model still comes back byte for byte.
+
+    `placed` is {object name: the 4x4 `placed` baked into it}, which turns the donor's
+    tangents with the object rather than recomputing every one.
 
     `mesh_fields` says which per-vertex fields a model that still has the file's own
     triangles takes from the scene. It does not decide whether the geometry is read: a
@@ -3979,7 +4097,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
-            "stale_stamps": stale_stamps(m, source)}
+            "stale_stamps": stale_stamps(m, source), "dequantised": []}
     revised = {}
     # Whatever the four checkboxes say. Triangles live in the .vtx alone, so a face
     # added, deleted or re-wound moves no .mdl byte and no checkbox names one -- and a
@@ -3994,6 +4112,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         # list and that is the whole of a default export rather than a scene that belongs
         # to another file.
         raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
+    placed = placed or {}
+    place_of = {k: placed[o.name] for k, o in mesh_objects(m, source).items()
+                if o.name in placed} if placed else {}
     for (bi, mi), verts in sorted(cells.items()):
         rec = d.bodyparts[bi].kids[mi]
         mo = m.bodyparts[bi].models[mi]
@@ -4002,20 +4123,26 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         # _must_rebuild sends every changed triangle set to the rebuild, so on this
         # path the donor's triangles are still the written vertices' own.
         tri = donor_faces.get((bi, mi))
+        place = place_of.get((bi, mi))
+        tb = rec.extra.get("tangents") or b""
         rec.extra["tangents"], t = build_mod.retangent_block(
-            mo.filetype, was_vb, rec.extra["verts"], rec.extra.get("tangents") or b"",
-            tri.elements() if tri else (), mo.quant_offset, mo.quant_scale)
+            mo.filetype, was_vb, rec.extra["verts"],
+            tb if place is None else build_mod.turn_tangents(tb, place),
+            tri.elements() if tri else (), mo.quant_offset, mo.quant_scale, place=place)
         mesh["verts"] += n
         mesh["tangents"] += t
     mesh["models"] = len(cells)
     bone_index = {b.name: b.index for b in m.bones}
     cloth_maps = {}
     for (bi, mi), obj in sorted(rebuild.items()):
-        was = m.bodyparts[bi].models[mi].numvertices
+        mo = m.bodyparts[bi].models[mi]
+        was = mo.numvertices
+        if mo.filetype in mdl_mod.QUANT_MAX:
+            mesh["dequantised"].append((obj.name, mo.filetype, outside_box(obj.data, mo)))
         tri = donor_faces.get((bi, mi))
         faces, unskinned, kept, edits = rebuild_cell(
             d, obj, bi, mi, bone_index, mesh_fields,
-            list(tri.elements()) if tri else None)
+            list(tri.elements()) if tri else None, place=placed.get(obj.name))
         for k, tris in enumerate(faces):
             revised[(bi, mi, k)] = tris
         now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]

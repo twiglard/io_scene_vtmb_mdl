@@ -2324,6 +2324,63 @@ def moved_vertices(filetype, donor, new, n, carry=None):
     return out
 
 
+# How far a written vertex may stand off the donor's own carried through `place` and read
+# as unedited. A quantised normal snaps to a table 2.0 or 10.5 degrees apart.
+_PLACED_POS = 1e-3
+_PLACED_NRM = {0: 1e-4, 1: 0.035, 2: 0.19}
+
+
+def _cofactor(L):
+    """det(L) times L's inverse transpose, which is what carries a normal, and defined
+    where L is singular."""
+    (a, b, c), (d, e, f), (g, h, i) = L
+    return [[e * i - f * h, f * g - d * i, d * h - e * g],
+            [c * h - b * i, a * i - c * g, b * g - a * h],
+            [b * f - c * e, c * d - a * f, a * e - b * d]]
+
+
+def turn_tangents(tb, place):
+    """`tb` with each record's direction carried through `place`'s 3x3 and made unit again.
+    `w` is kept: `placed` refuses a transform that mirrors."""
+    L = [row[:3] for row in place[:3]]
+    out = bytearray(tb)
+    for o in range(0, len(tb) - 15, 16):
+        x, y, z, w = struct.unpack_from("<4f", tb, o)
+        t = _unit([L[r][0] * x + L[r][1] * y + L[r][2] * z for r in range(3)])
+        if t is not None:
+            struct.pack_into("<4f", out, o, t[0], t[1], t[2], w)
+    return bytes(out)
+
+
+def _placed_moved(filetype, donor, new, n, place, carry, quant_offset, quant_scale):
+    """`moved_vertices` for a model `placed` moved: an unedited vertex reads back as the
+    donor's own carried through `place`, which float rounding keeps from matching bytes."""
+    stride = M.VERTEX_STRIDE[filetype]
+    dv = M.decode_vertices(filetype, donor, 0, len(donor) // stride, quant_offset,
+                           quant_scale)
+    nv = M.decode_vertices(filetype, new, 0, n, quant_offset, quant_scale)
+    L = [row[:3] for row in place[:3]]
+    C = _cofactor(L)
+    tol = _PLACED_NRM.get(filetype, _PLACED_NRM[0])
+    out = set()
+    for i in range(n):
+        j = i if carry is None else (carry[i] if i < len(carry) else None)
+        if j is None or not 0 <= j < len(dv):
+            out.add(i)
+            continue
+        a, b = nv[i], dv[j]
+        p = [sum(L[r][c] * b.pos[c] for c in range(3)) + place[r][3] for r in range(3)]
+        q = [sum(C[r][c] * b.normal[c] for c in range(3)) for r in range(3)]
+        lq = sum(x * x for x in q) ** 0.5
+        ln = sum(x * x for x in b.normal) ** 0.5
+        q = [x * ln / lq for x in q] if lq else q
+        if (max(abs(a.pos[c] - p[c]) for c in range(3)) > _PLACED_POS
+                or max(abs(a.normal[c] - q[c]) for c in range(3)) > tol
+                or max(abs(a.uv[c] - b.uv[c]) for c in range(2)) > 1e-6):
+            out.add(i)
+    return out
+
+
 def _ring(moved, tris, n):
     """`moved` plus every vertex sharing a triangle with one of them."""
     out = set(moved)
@@ -2334,7 +2391,7 @@ def _ring(moved, tris, n):
 
 
 def retangent_block(filetype, donor_vb, new_vb, donor_tb, tris,
-                    quant_offset=None, quant_scale=None, also=(), carry=None):
+                    quant_offset=None, quant_scale=None, also=(), carry=None, place=None):
     """(the model's tangent block, how many records it rewrote).
 
     A tangent is a function of the geometry, so an edit stales it -- and not only on the
@@ -2352,14 +2409,20 @@ def retangent_block(filetype, donor_vb, new_vb, donor_tb, tris,
     `also` is the vertices a changed triangle set stales, which moves no vertex byte. They
     are not `_ring`-expanded: dropping a triangle changes the accumulation of its own three
     corners and of nothing else.
+
+    `place` is the 4x4 `placed` baked into the model's object, with `donor_tb` already put
+    through `turn_tangents`. A tangent is carried by the transform as the geometry is, so a
+    vertex counts as moved only where it stands off the donor's own carried through it.
     """
     stride = M.VERTEX_STRIDE.get(filetype)
     n = len(new_vb) // stride if stride else 0
     tris = list(tris)
     if not n or len(donor_tb) < n * 16 or not tris:
         return donor_tb, 0
-    want = _ring(moved_vertices(filetype, donor_vb, new_vb, n, carry), tris, n) | \
-        {x for x in also if 0 <= x < n}
+    moved = (moved_vertices(filetype, donor_vb, new_vb, n, carry) if place is None
+             else _placed_moved(filetype, donor_vb, new_vb, n, place, carry, quant_offset,
+                                quant_scale))
+    want = _ring(moved, tris, n) | {x for x in also if 0 <= x < n}
     if not want:
         return donor_tb, 0
     vs = M.decode_vertices(filetype, new_vb, 0, n, quant_offset, quant_scale)
@@ -2422,7 +2485,7 @@ def _face_moved(old_tris, tris, was, new_n, carry=None):
 
 
 def _retangent_run(ptb, pvb, old_vb, old_tb, was, new_n, tris, old_tris=None,
-                   carry=None):
+                   carry=None, place=None):
     """Rewrite one mesh run's tangents: the donor's, patched where the edit reached.
 
     `_pack_verts` has already put a fresh accumulation in `ptb`, which is right for a
@@ -2451,7 +2514,7 @@ def _retangent_run(ptb, pvb, old_vb, old_tb, was, new_n, tris, old_tris=None,
                              bytes(pvb), bytes(base), tris,
                              also=() if old_tris is None
                              else _face_moved(old_tris, tris, was, new_n, carry),
-                             carry=carry)
+                             carry=carry, place=place)
     ptb[:] = out
     return n
 
@@ -2621,7 +2684,7 @@ def set_model_name(d, bi, mi, name):
 
 
 def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
-                  carry=None, flips=None):
+                  carry=None, flips=None, place=None):
     """Rewrite one existing model's geometry, keeping everything else its records carry.
 
     `meshes` is `add_model`'s -- [(material, verts, faces), ...] -- one entry per mesh the
@@ -2642,6 +2705,9 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
     `flips` is the scene's cloth normal flip per written model-local vertex, passed through
     to the cloth rebuild; None keeps the bit the file carries.
 
+    `place` is the 4x4 `placed` baked into the object, which turns the donor's tangents
+    under the ones the edit did not reach -- see `retangent_block`.
+
     Returns the per-mesh face lists, how many tangents were rewritten,
     (flex records dropped, flexes left holding none), and the cloth outcome: what a
     regeneration dropped where the edit deleted a vertex, {"renumbered": n} where it
@@ -2659,6 +2725,8 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
     old_ft = struct.unpack_from("<i", mr.raw, 0x9c)[0]
     old_vb = mr.extra.get("verts") or b""
     old_tb = mr.extra.get("tangents") or b""
+    if place is not None and old_ft == 0:
+        old_tb = turn_tangents(old_tb, place)
     vb, tb, offset, faces, retang = bytearray(), bytearray(), 0, [], 0
     flexdrop = flexempty = 0
     for k, (material, verts, tris) in enumerate(meshes):
@@ -2667,7 +2735,7 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
         if old_ft == 0:
             _carry_vertex_fields(pvb, old_vb, was[k], len(verts), cmap)
             retang += _retangent_run(ptb, pvb, old_vb, old_tb, was[k], len(verts),
-                                     tris, donor_tris, cmap)
+                                     tris, donor_tris, cmap, place)
         vb += pvb
         tb += ptb
         raw = mr.kids[k].raw

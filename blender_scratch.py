@@ -1015,7 +1015,8 @@ def fit_hull(mesh_objs, scale=1.0):
     A starting point and not a truth: @180/@192 is the movement hull the .qc's `$hbox`
     sets, which is why `build` takes it from the caller rather than deriving it. Without
     one `mdl_build.new` leaves (-16,-16,0)..(16,16,72), so a bat claims a humanoid volume.
-    Mesh-local like `split_mesh`, so an object transform is ignored by both alike.
+    Mesh-local like `split_mesh`: both operators call it inside `placed`, which bakes the
+    object transform in first.
     """
     lo = hi = None
     for obj in mesh_objs:
