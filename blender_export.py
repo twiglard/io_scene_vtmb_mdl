@@ -2134,13 +2134,6 @@ def cloth_sigma_edges(obj, pv, springs, ns0, pos):
 # pins, and the group existing before its meaning changed is what absence cannot separate.
 CLOTH_PIN_VERSION = (0, 2, 51)
 
-# A regeneration emits one row and a row is a LOD. The geometry rebuild already cuts the
-# written .vtx to one, so it loses nothing there; an in-place export writes no .vtx at all, so
-# a shipped object of several rows would be left with LODs whose cloth row is gone. 28 of the
-# 60 shipped carriers are single-row -- 4 carry 2, 7 carry 6 and 21 carry 7.
-CLOTH_PIN_ROWS = 1
-
-
 def cloth_flip_bits(obj, origins):
     """The scene's cloth normal flip per output vertex, or None where the scene never said.
 
@@ -2232,11 +2225,6 @@ def cloth_pin_why(obj, cl, pinned, npart):
     if cl["cols"] != 1:
         return ("this model's cloth table is %d columns wide and a regeneration emits one"
                 % cl["cols"])
-    if cl["rows"] != CLOTH_PIN_ROWS:
-        return ("this model's cloth table has %d rows, a row is a LOD, and a regeneration "
-                "emits one -- an in-place export writes no .vtx, so the other LODs would be "
-                "left naming a cloth row that is gone. Delete a vertex to take the geometry "
-                "rebuild, which cuts the .vtx to one LOD as well" % cl["rows"])
     if not pinned:
         return "the pin group holds no particle's anchor vertex, so every particle would be free"
     if len(pinned) >= npart:
@@ -3462,25 +3450,24 @@ def stale_flavours(dest, written=("dx80",)):
             if os.path.exists(p)]
 
 
-def cut_vtx_lods(source, dest, written=(), flavours=None):
+def cut_vtx_lods(source, dest, written=(), carry=True):
     """Every `.vtx` beside the written model turned down to one LOD. One row per file.
 
-    The LOD 1..n payload leaves the file with them -- `vtx_write.cut_lods` re-lays the
-    bytes rather than patching the two counts -- so `bytes` is what the file lost.
+    Every export runs it: the addon writes LOD 0 and nothing else. The LOD 1..n payload
+    leaves the file -- `vtx_write.cut_lods` re-lays the bytes rather than patching the two
+    counts -- so `bytes` is what the file lost. A file already at one LOD re-lays byte for
+    byte and is not rewritten in place.
 
-    Every flavour that exists is edited, not only the one the geometry pass rewrote: the
+    Every flavour beside `dest` is cut, not only the ones the geometry pass rewrote: the
     engine picks by `-dxlevel` and a flavour left at seven LODs still swaps to a coarse
-    mesh. A flavour the geometry pass did not write is copied across from the donor first,
-    since the cut is the only reason that file would appear beside a new `dest`.
-
-    `flavours` narrows that to the ones named, which is what a cut forced by a renumbering
-    rebuild wants: a donor flavour nobody rewrote describes the old numbering whole, so
-    copying a cut version of it across replaces one wrong file with another.
+    mesh. A flavour missing there is copied across from the donor only under `carry`, which
+    the caller clears once any `.vtx` was rewritten: a flavour that pass did not write still
+    describes the donor's geometry, and copying it would put a stale file beside a new model.
     """
     out = []
-    for flavour in (VTX_FLAVOURS if flavours is None else flavours):
+    for flavour in VTX_FLAVOURS:
         src_p, dst_p = vtx_path(source, flavour), vtx_path(dest, flavour)
-        at = dst_p if (flavour in written and os.path.exists(dst_p)) else src_p
+        at = dst_p if flavour in written else src_p if carry else dst_p
         if not os.path.exists(at):
             continue
         with open(at, "rb") as f:
@@ -3498,72 +3485,6 @@ def cut_vtx_lods(source, dest, written=(), flavours=None):
                     "dropped": dropped, "why": None,
                     "bytes": len(data) - len(cut)})
     return out
-
-
-def parse_lod_switch(text):
-    """A comma-separated switch-value list off the dialog, or [] where the field is empty.
-
-    A string and not a float vector because the count is the file's `numLODs` and a
-    `FloatVectorProperty` is fixed at registration; `cdtexture` is the same field type for
-    the same reason.
-    """
-    out = []
-    for word in (text or "").replace(";", ",").split(","):
-        word = word.strip()
-        if not word:
-            continue
-        try:
-            out.append(float(word))
-        except ValueError:
-            raise ValueError("LOD switch values: %r is not a number" % word)
-    return out
-
-
-def set_vtx_lod_switch(source, dest, written, values):
-    """Every `.vtx` beside the written model given one switch-value ladder. One row per file.
-
-    Every flavour that exists is edited, the way a cut is: the engine picks the file by
-    `-dxlevel` and a flavour left at the donor's ladder swaps at the donor's distances.
-    A flavour the geometry pass did not write is copied across from the donor first, since
-    the edit is the only reason that file would appear beside a new `dest`.
-    """
-    out = []
-    for flavour in VTX_FLAVOURS:
-        src_p, dst_p = vtx_path(source, flavour), vtx_path(dest, flavour)
-        at = dst_p if (flavour in written and os.path.exists(dst_p)) else src_p
-        if not os.path.exists(at):
-            continue
-        with open(at, "rb") as f:
-            data = f.read()
-        try:
-            new, was, uneven = vtxw_mod.set_lod_switch(data, values)
-        except (ValueError, struct.error) as exc:
-            out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": None,
-                        "now": [], "uneven": [], "why": str(exc)})
-            continue
-        if new != data or at != dst_p:
-            with open(dst_p, "wb") as f:
-                f.write(new)
-        out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": was,
-                    "now": [float(v) for v in values], "uneven": uneven, "why": None,
-                    "bytes": sum(1 for a, b in zip(data, new) if a != b)})
-    return out
-
-
-def shadow_lod_flag(data):
-    """Whether the `.mdl` about to be written carries `STUDIOHDR_FLAGS_HASSHADOWLOD`.
-
-    A negative last switch value is Valve's shadow LOD and `l_studio.cpp` forces the
-    shadow to that LOD off `studiohdr_t.flags` bit 0x40, so a file carrying one without
-    the other is worth a word. The `.vtx` writer does not touch `.mdl` flags: the flag
-    agrees with a negative last value on 4433 of the 4437 shipped pairs and the four
-    exceptions are the Unofficial Patch's own LOD-cut models, which cut to one LOD and
-    left the bit set.
-    """
-    try:
-        return bool(struct.unpack_from("<i", data, 228)[0] & 0x40)
-    except struct.error:
-        return None
 
 
 def phy_path(p):
@@ -3620,7 +3541,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved):
             "removed": gone, "renamed": moved, "geometry": geometry_moved}
 
 
-def revise_vtx(source, dest, data, revised, flavours=("dx80",), lod0_only=False):
+def revise_vtx(source, dest, data, revised, flavours=("dx80",)):
     """Rewrite the .vtx for a model whose geometry moved, and return what each cost.
 
     The donor's own file supplies every strip group the edit did not touch, so a change to
@@ -3628,21 +3549,19 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",), lod0_only=False)
     revised from its own donor: the two files cap bones per triangle at 9 and at 2, so
     they do not share a strip-group partition and neither can be derived from the other.
 
-    A flavour asked for but absent beside the source is skipped, except `.dx80.vtx`, which
-    the engine takes first and without which it draws nothing.
+    LOD 0 alone is revised. The lower LODs are left as read, naming vertices by the donor's
+    numbering, and `cut_vtx_lods` drops them right after.
+
+    A flavour asked for but absent beside the source is skipped. A donor with no
+    `.dx80.vtx` at all gets none written, and the export says so.
     """
     written = mdl_mod.Mdl("<written>", data=data)
     out = []
     for flavour in flavours:
         src = vtx_path(source, flavour)
         if not os.path.exists(src):
-            if flavour == "dx80":
-                raise ValueError(
-                    "%s has no .dx80.vtx beside it, and a changed vertex or face count "
-                    "needs one rewritten -- the engine draws nothing when the pair "
-                    "disagrees" % os.path.basename(source))
             continue
-        blob, st = vtxr_mod.revise(written, src, revised, lod0_only=lod0_only)
+        blob, st = vtxr_mod.revise(written, src, revised, lod0_only=True)
         path = vtx_path(dest, flavour)
         with open(path, "wb") as f:
             f.write(blob)
@@ -3657,8 +3576,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
-                   write_cloth=True, cut_lods=False, lod_switch="",
-                   vtx_flavours=("dx80",)):
+                   write_cloth=True, vtx_flavours=("dx80",)):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -4050,49 +3968,18 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
-    # `revise` rewrites LOD 0 and leaves the lower ones the donor's own triangles, which
-    # index by original vertex id -- valid while the numbering holds and meaningless once a
-    # rebuild renumbers or a delete shifts every survivor after the hole. A lower LOD is an
-    # authored decimation and the file the export writes is not the donor, so the LODs go
-    # rather than being carried across from it. The cut is the whole file's and not the one
-    # model's: `numLODs` agrees between the file header and every model header on all 8887
-    # shipped files, and the Unofficial Patch's own cut models set both.
-    # A promotion regenerates the cloth to one row, and a row is a LOD, so it cuts as well.
-    forced_by = None if cut_lods else \
-        "numbering" if mesh["renumbered"] or mesh["rebuilt_deleted"] else \
-        "cloth" if mesh["cloth_promoted"] else None
-    forced = forced_by is not None
-    # A switch-value ladder and a cut to one LOD are contradictory asks, and a cut forced
-    # by a renumbering rebuild is the same ask made by the file rather than by the dialog.
-    # Refused before any .vtx writer runs, so a stop leaves no half-edited `.vtx` behind.
-    switch_vals = parse_lod_switch(lod_switch)
-    if switch_vals and (cut_lods or forced):
-        raise build_mod.Refused(
-            "LOD switch values were given and the LODs are being cut to one LOD%s"
-            % ("" if cut_lods else
-               " because a rebuild renumbered the vertices" if forced_by == "numbering"
-               else " because added vertices became cloth particles"))
     # A bone removal or an append moves no vertex and no triangle, so `revised` is empty --
     # and the .vtx still has to be rewritten, because every strip group's bone data is bound
     # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
     # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
     # was named, so an empty face map is the whole of what either needs.
-    # Under a cut the lower LODs are not rebound: after a renumbering they name the donor's
-    # vertices, and the cut drops them anyway.
-    touched = (revise_vtx(source, dest, data, revised, vtx_flavours,
-                          lod0_only=bool(cut_lods or forced))
+    touched = (revise_vtx(source, dest, data, revised, vtx_flavours)
                if (revised or removed or added_bones or cloth_removed) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
-    # After the geometry pass, which writes whole .vtx files: the cut re-lays what that
-    # pass wrote and would otherwise be laid back over.
-    lods = (cut_vtx_lods(source, dest, [x["flavour"] for x in touched],
-                         None if cut_lods else [x["flavour"] for x in touched])
-            if (cut_lods or forced) else [])
-    switches = (set_vtx_lod_switch(source, dest, [x["flavour"] for x in touched],
-                                   switch_vals)
-                if switch_vals else [])
-    shadow = (shadow_lod_flag(data)
-              if (switch_vals and switch_vals[-1] < 0.0) else None)
+    # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
+    # wrote.
+    lods = cut_vtx_lods(source, dest, [x["flavour"] for x in touched], carry=not touched)
+    no_vtx = not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
     with open(dest, "wb") as f:
         f.write(data)
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
@@ -4113,9 +4000,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
                       if (revised or removed or added_bones or cloth_removed) else []),
             "cloth": cloth, "cloth_edits": cloth_was, "cloth_removed": cloth_removed,
-            "lods": lods,
-            "lod_switch": switches, "lod_shadow_flag": shadow,
-            "lods_forced": forced, "lods_forced_by": forced_by,
+            "lods": lods, "no_vtx": no_vtx,
             "phy": phy_report(source, dest, removed, renamed, bool(revised))}
 
 

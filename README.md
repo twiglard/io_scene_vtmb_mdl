@@ -27,9 +27,9 @@ the Unofficial Patch works with no extraction step.
   mesh that did not comes back byte for byte. Geometry is written to `.dx80.vtx` only, so
   a `.dx7_2bone.vtx`, `.dx90.vtx` or `.sw.vtx` beside the model goes stale and is named in
   a warning — the engine asks for `.dx80.vtx` first and tests only the flavour it loaded.
-  **Turn LODs off** is the exception and edits every flavour that is there, since the
-  engine picks one by `-dxlevel` and a flavour left at seven LODs still swaps to a coarse
-  mesh at distance.
+  **The addon writes one LOD and nothing else.** Every export cuts every `.vtx` flavour
+  beside the model to LOD 0, so the model draws its full mesh at every distance and never
+  swaps to a coarse one; the lower LODs and any shadow LOD leave the file.
 - *File > Export > VTMB Model, no donor (.mdl)* authors a `.mdl` **and** its matching
   `.dx80.vtx` from the scene alone, with no donor file at all.
 
@@ -39,8 +39,7 @@ The donor path also edits the parts of a model that have no geometry: bones adde
 renamed or deleted (with the animations re-based onto the new bind and everything indexing
 a bone renumbered), an animation replaced, appended or deleted, materials renamed with a
 `.vmt` and a `.tth`/`.ttz` pair written beside the model on request, cloth gravity and
-stiffness taken from the scene, and **Turn LODs off**, which writes 1 into every `.vtx`
-LOD count so the model never swaps to a coarse mesh.
+stiffness taken from the scene.
 
 **Bone sets** — *Add > VTMB > Bone set...* drops a skeleton into the scene, or merges one
 onto the armature already there. Each template is a small `.json` under `templates/`

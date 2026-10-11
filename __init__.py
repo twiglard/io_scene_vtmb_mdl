@@ -772,28 +772,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "the garment the model used to be; either way the report says what "
                     "the scene asked for. Nothing is written where the scene and the file "
                     "already agree, so an unedited model still comes back byte for byte")
-    cut_lods: bpy.props.BoolProperty(
-        name="Turn LODs off", default=False,
-        description="Write 1 into every numLODs field of every .vtx beside the model, so "
-                    "the engine draws LOD 0 at any distance and never swaps to a coarse "
-                    "mesh. Two dwords per file over the finished bytes and nothing else, "
-                    "which is the edit the Unofficial Patch makes to its own four cut "
-                    "models -- the LOD 1..n payload stays on disk with nothing pointing "
-                    "at it, and the file keeps its length. Every flavour present is cut, "
-                    "not only the .dx80.vtx, because the engine picks by -dxlevel and one "
-                    "left alone still swaps. A model already at one LOD is untouched")
-    lod_switch: bpy.props.StringProperty(
-        name="LOD switch values", default="",
-        description="One switch value per LOD, comma separated, written over every .vtx "
-                    "beside the model -- empty keeps the ladder the donor has. A switch "
-                    "value is not a distance: ComputeModelLod turns the model's screen "
-                    "size into 100/size and picks the first LOD whose successor's value "
-                    "exceeds it, so the number rises as the model gets further away and "
-                    "the list ascends. The count must equal the file's numLODs and the "
-                    "first entry is read by nothing, which is why every shipped model "
-                    "writes 0 there. A negative last value is Valve's $shadowlod marker "
-                    "and not a free number -- the LOD stops being reachable by distance "
-                    "at all")
     write_flexes: bpy.props.BoolProperty(
         name="Shape keys as flexes", default=False,
         description="Rewrite each model's flexes from its shape keys -- the way to get a "
@@ -959,12 +937,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                               icon="INFO")
                 box.prop(self, "write_flexes")
                 box.prop(self, "write_cloth")
-                box.prop(self, "cut_lods")
-                row = box.split(factor=SPLIT)
-                row.label(text="LOD switch values")
-                sub = row.row()
-                sub.enabled = not self.cut_lods
-                sub.prop(self, "lod_switch", text="")
                 box.prop(self, "write_2bone_vtx")
                 box.prop(self, "fit_hull")
                 row = box.split(factor=SPLIT)
@@ -1164,8 +1136,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 mesh_fields=_mesh_fields(self), add=adds, drop=gone,
                 write_flexes=self.write_flexes,
                 write_cloth=self.write_cloth,
-                cut_lods=self.cut_lods,
-                lod_switch=self.lod_switch,
                 vtx_flavours=(("dx80", "dx7_2bone") if self.write_2bone_vtx
                               else ("dx80",)),
                 # Derived only for a dialog, where the field is on screen with the
@@ -1438,55 +1408,29 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            "ies" if len(gaps) == 1 else "y",
                            ", ".join(gaps[:3])
                            + ("" if len(gaps) <= 3 else " and %d more" % (len(gaps) - 3))))
-        forced = r.get("lods_forced")
         for row in r.get("lods") or []:
             if row["why"] is not None:
                 self.report({"WARNING"}, "%s could not be cut to one LOD: %s"
                             % (row["file"], row["why"]))
-            elif row["was"] in (None, 1):
-                if not forced:
-                    self.report({"INFO"}, "%s was already at one LOD" % row["file"])
-            elif forced:
-                self.report({"WARNING"},
-                            "%s cut from %d LODs to 1, %d byte%s dropped: %s. A lower LOD is "
-                            "an authored decimation and is not carried over from the donor. "
-                            "It used to swap at %s"
-                            % (row["file"], row["was"], row["bytes"],
-                               "" if row["bytes"] == 1 else "s",
-                               "added vertices became cloth particles, and the regenerated "
-                               "cloth has one row, which is one LOD"
-                               if r.get("lods_forced_by") == "cloth" else
-                               "the file's own vertex numbering was rebuilt, so every lower "
-                               "LOD named vertices that are no longer there",
-                               ", ".join("%g" % x for x in row["dropped"])))
-            else:
+            elif row["was"] not in (None, 1):
+                # One value per model per LOD, so a file of several models repeats them, and
+                # a negative marks the shadow LOD, which ComputeModelLod never picks.
+                swaps = list(dict.fromkeys(x for x in row["dropped"] if x >= 0))
+                lost = (["the model no longer swaps at %s" % ", ".join("%g" % x for x in swaps)]
+                        if swaps else [])
+                if any(x < 0 for x in row["dropped"]):
+                    lost.append("its shadow LOD is gone")
                 self.report({"INFO"},
-                            "%s cut from %d LODs to 1, %d byte%s dropped. It used to swap "
-                            "at %s, and that geometry is no longer in the file"
+                            "%s cut from %d LODs to 1, %d byte%s dropped: the addon writes "
+                            "LOD 0 alone, so %s"
                             % (row["file"], row["was"], row["bytes"],
                                "" if row["bytes"] == 1 else "s",
-                               ", ".join("%g" % x for x in row["dropped"])))
-        for row in r.get("lod_switch") or []:
-            if row["why"] is not None:
-                self.report({"WARNING"}, "%s kept its own switch values: %s"
-                            % (row["file"], row["why"]))
-                continue
-            self.report({"INFO"}, "%s now swaps at %s, %d byte%s changed"
-                        % (row["file"], ", ".join("%g" % x for x in row["now"]),
-                           row["bytes"], "" if row["bytes"] == 1 else "s"))
-            for k, a, b in row["uneven"]:
-                self.report({"WARNING"},
-                            "%s: LOD %d's switch value %g does not exceed LOD %d's %g, so "
-                            "LOD %d is never picked -- the engine takes the first LOD "
-                            "whose successor's value is above the metric"
-                            % (row["file"], k + 1, b, k, a, k))
-        if r.get("lod_shadow_flag") is False:
+                               " and ".join(lost) or "nothing else changes"))
+        if r.get("no_vtx"):
             self.report({"WARNING"},
-                        "the last switch value is negative, which marks the shadow LOD, "
-                        "but studiohdr_t.flags is missing STUDIOHDR_FLAGS_HASSHADOWLOD "
-                        "(0x40) -- the LOD stops being reachable by distance and nothing "
-                        "draws it as a shadow either. This writer does not touch .mdl "
-                        "flags")
+                        "%s has no .dx80.vtx beside it, so none was written, and the "
+                        "engine draws nothing for a .mdl without one"
+                        % os.path.basename(src))
         for name, model, nobj, rows, nmesh in r.get("cloth_removed") or []:
             self.report({"WARNING"},
                         "%s: the Cloth box is off, so model %s's cloth was removed -- %d "
