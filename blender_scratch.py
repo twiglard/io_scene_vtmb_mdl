@@ -1009,19 +1009,26 @@ def _set_hull(d, lo, hi):
     struct.pack_into("<3f", d.hdr, 168, *[(a + b) * 0.5 for a, b in zip(lo, hi)])
 
 
-def fit_hull(mesh_objs, scale=1.0):
+def fit_hull(mesh_objs, scale=1.0, arm_obj=None):
     """(min, max) over every vertex handed in, in file units, or None when there are none.
 
     A starting point and not a truth: @180/@192 is the movement hull the .qc's `$hbox`
     sets, which is why `build` takes it from the caller rather than deriving it. Without
     one `mdl_build.new` leaves (-16,-16,0)..(16,16,72), so a bat claims a humanoid volume.
     Mesh-local like `split_mesh`: both operators call it inside `placed`, which bakes the
-    object transform in first.
+    object transform in first. A dialog's `draw` may not write a mesh, so it passes the
+    armature instead and each `co` goes through the matrix `placed` would apply.
     """
     lo = hi = None
+    inv = arm_obj.matrix_world.inverted() if arm_obj is not None else None
     for obj in mesh_objs:
+        rel = None if inv is None else inv @ obj.matrix_world
+        if rel is not None and all(abs(rel[r][c] - (r == c)) <= export_mod.PLACED_TOL
+                                   for r in range(4) for c in range(4)):
+            rel = None
         for v in obj.data.vertices:
-            p = [v.co[c] / scale for c in range(3)]
+            co = v.co if rel is None else rel @ v.co
+            p = [co[c] / scale for c in range(3)]
             if lo is None:
                 lo, hi = list(p), list(p)
                 continue

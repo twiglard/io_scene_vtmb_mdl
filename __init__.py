@@ -2287,7 +2287,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         if box is not None:
             box.prop(self, "fit_hull")
             box.prop(self, "fit_hitboxes")
-            hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
+            hull = (blender_scratch.fit_hull(meshes, self.scale, obj) if self.fit_hull
+                    else None)
             if hull is not None:
                 _pair(box, "hull", "%.0f %.0f %.0f .. %.0f %.0f %.0f"
                       % (hull[0] + hull[1]))
