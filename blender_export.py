@@ -1550,9 +1550,10 @@ def resolve_target(m, action, name):
         return names.index(name)
     i = name_index(names, action)
     if i is None:
-        raise ValueError("action %r is not named after any animation of %s and carries "
-                         "no usable index, so name the target animation explicitly"
-                         % (action.name, os.path.basename(m.path)))
+        raise build_mod.Refused(
+            "action %r is not named after any animation of %s and carries no usable "
+            "index: tick \"Add the rest as new\" to append it, or pick the animation it "
+            "replaces" % (action.name, os.path.basename(m.path)))
     return i
 
 

@@ -1158,8 +1158,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             elif self.target == ALL:
                 actions = matched
                 if not actions and not adds:
-                    raise ValueError("no action shares a name with an animation of %s"
-                                     % os.path.basename(src))
+                    raise mdl_build.Refused(
+                        "no action shares a name with an animation of %s%s"
+                        % (os.path.basename(src),
+                           "; tick \"Add the rest as new\" to append %d of them"
+                           % len(addable) if addable else ""))
                 _taken, rest = blender_export.split_unwritten(unwritten, self.add_new)
                 if rest:
                     self.report({"WARNING"},
