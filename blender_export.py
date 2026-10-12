@@ -13,6 +13,7 @@ the model. A mesh that did not move takes the index-for-index patch instead.
 
 import array
 import contextlib
+import copy
 import math
 import os
 import re
@@ -1185,7 +1186,7 @@ def _scene_faces(me):
     return _canon_faces(tuple(tri.vertices)[::-1] for tri in me.loop_triangles)
 
 
-def _must_rebuild(obj, model, fields, donor_faces=None):
+def _must_rebuild(obj, model, fields, donor_faces=None, box=None):
     """Whether this object has outgrown the in-place path.
 
     In place patches fields index for index; the split path rewrites the whole model and
@@ -1197,6 +1198,8 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
     what stops a face deleted, added between existing vertices, or flipped from writing a
     file identical to the one it was edited from: none of the three moves the vertex count
     or a UV, so every other test here passes on an edit the file never took.
+
+    `box` is the quantisation box `rebased_box` moved with the object, if it did.
     """
     me = obj.data
     # An appended model's vertices are in `split_mesh` order, so patching it index for
@@ -1207,7 +1210,7 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
         return True
     if donor_faces is not None and _scene_faces(me) != donor_faces:
         return True
-    if "positions" in fields and outside_box(me, model):
+    if "positions" in fields and outside_box(me, model, box):
         return True
     if "uvs" not in fields:
         return False
@@ -1219,23 +1222,47 @@ def _must_rebuild(obj, model, fields, donor_faces=None):
                for vs in per)
 
 
-def outside_box(me, model):
+def outside_box(me, model, box=None):
     """How many vertices stand where a quantised model's positions cannot reach.
 
     `pack_model` clamps each coordinate into the box `quant_offset`/`quant_scale` span, and
     every shipped quantised model has a vertex on each wall (4324 of 4324 model-axes), so
     any outward move would land on the wall. The split writes 44-byte float records.
+    `box` is (offset, scale) in place of the model's own, as `rebased_box` gives.
     """
     if model.filetype not in mdl_mod.QUANT_MAX:
         return 0
     lim = mdl_mod.QUANT_MAX[model.filetype]
     norm = mdl_mod.QUANT_NORM[model.filetype]
+    off, sc = box or (model.quant_offset, model.quant_scale)
     co = [0.0] * (len(me.vertices) * 3)
     me.vertices.foreach_get("co", co)
     return sum(1 for i in range(len(me.vertices))
-               if any(not 0 <= mesh_mod.quantise(co[i * 3 + c], model.quant_offset[c],
-                                                 model.quant_scale[c], norm) <= lim
+               if any(not 0 <= mesh_mod.quantise(co[i * 3 + c], off[c], sc[c], norm) <= lim
                       for c in range(3)))
+
+
+def rebased_box(model, place):
+    """(offset, scale) of the quantisation box a quantised model moved by `placed` takes, or
+    None where the move has no such box.
+
+    A vertex is `offset + q * norm * scale`, so moved by a uniform scale `s` and a
+    translation `T` it is the same `q` in the box (s * offset + T, s * scale): the vertex
+    records, the normal indices and the tangents stand, and only the box moves. A rotation
+    or a stretch turns the normals, and an index into the renderer's table cannot be turned
+    without moving it up to 10.5 degrees, so that model is rebuilt as filetype 0. Rounded
+    to f32, which is what the record holds and what the quantise divides by.
+    """
+    if place is None or model.filetype not in mdl_mod.QUANT_MAX:
+        return None
+    s = place[0][0]
+    if s <= 0.0 or any(abs(place[r][c] - (s if r == c else 0.0)) > PLACED_TOL * s
+                       for r in range(3) for c in range(3)):
+        return None
+    f32 = struct.Struct("<f")
+    return (tuple(f32.unpack(f32.pack(s * model.quant_offset[c] + place[c][3]))[0]
+                  for c in range(3)),
+            tuple(f32.unpack(f32.pack(s * model.quant_scale[c]))[0] for c in range(3)))
 
 
 def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
@@ -1477,7 +1504,7 @@ def stale_stamps(m, source):
     return out
 
 
-def read_meshes(m, source, fields):
+def read_meshes(m, source, fields, boxes=None):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
     fifth bone group no record can hold, the vertices whose normal moved by more than the
@@ -1509,7 +1536,8 @@ def read_meshes(m, source, fields):
         odd = stray_groups(obj, bone_index)
         if odd:
             stray.append((obj.name, odd))
-        if _must_rebuild(obj, mo, ok, donor_faces.get((bi, mi))):
+        if _must_rebuild(obj, mo, ok, donor_faces.get((bi, mi)),
+                         (boxes or {}).get((bi, mi))):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.
             rebuild[(bi, mi)] = obj
@@ -4108,8 +4136,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
-            "stale_stamps": stale_stamps(m, source), "dequantised": []}
+            "stale_stamps": stale_stamps(m, source), "dequantised": [], "rebased": []}
     revised = {}
+    placed = placed or {}
+    scene_objs = mesh_objects(m, source)
+    place_of = {k: placed[o.name] for k, o in scene_objs.items() if o.name in placed}
+    # Only with Positions ticked: without it the file keeps its old placement, box and all.
+    boxes = {k: b for k, p in place_of.items() if "positions" in mesh_fields
+             for b in [rebased_box(m.bodyparts[k[0]].models[k[1]], p)] if b is not None}
     # Whatever the four checkboxes say. Triangles live in the .vtx alone, so a face
     # added, deleted or re-wound moves no .mdl byte and no checkbox names one -- and a
     # mesh the scene changed is rebuilt from the scene rather than from the file, which
@@ -4117,24 +4151,30 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
         mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
         mesh["unskinned"], mesh["stray_groups"] = read_meshes(
-            m, source, mesh_fields)
+            m, source, mesh_fields, boxes)
     if mesh_fields and not cells and not rebuild and not mesh["missing"]:
         # Only where a field was asked for: with none, an untouched scene reaches neither
         # list and that is the whole of a default export rather than a scene that belongs
         # to another file.
         raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
-    placed = placed or {}
-    place_of = {k: placed[o.name] for k, o in mesh_objects(m, source).items()
-                if o.name in placed} if placed else {}
     for (bi, mi), verts in sorted(cells.items()):
         rec = d.bodyparts[bi].kids[mi]
         mo = m.bodyparts[bi].models[mi]
         was_vb = rec.extra["verts"]
+        place = place_of.get((bi, mi))
+        box = boxes.get((bi, mi))
+        if box is not None:
+            # In the moved box nothing moved, so the tangents need no turning either.
+            mo = copy.copy(mo)
+            mo.quant_offset, mo.quant_scale = box
+            struct.pack_into("<3f", rec.raw, 0xa0, *box[0])
+            struct.pack_into("<3f", rec.raw, 0xac, *box[1])
+            mesh["rebased"].append((scene_objs[(bi, mi)].name, mo.filetype))
+            place = None
         rec.extra["verts"], n = mesh_mod.pack_model(mo, verts, mesh_fields, was_vb)
         # _must_rebuild sends every changed triangle set to the rebuild, so on this
         # path the donor's triangles are still the written vertices' own.
         tri = donor_faces.get((bi, mi))
-        place = place_of.get((bi, mi))
         tb = rec.extra.get("tangents") or b""
         rec.extra["tangents"], t = build_mod.retangent_block(
             mo.filetype, was_vb, rec.extra["verts"],
@@ -4149,7 +4189,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mo = m.bodyparts[bi].models[mi]
         was = mo.numvertices
         if mo.filetype in mdl_mod.QUANT_MAX:
-            mesh["dequantised"].append((obj.name, mo.filetype, outside_box(obj.data, mo)))
+            mesh["dequantised"].append((obj.name, mo.filetype,
+                                        outside_box(obj.data, mo, boxes.get((bi, mi)))))
         tri = donor_faces.get((bi, mi))
         faces, unskinned, kept, edits = rebuild_cell(
             d, obj, bi, mi, bone_index, mesh_fields,
