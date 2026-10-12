@@ -1007,6 +1007,16 @@ def _one_skin(v, groups, bone_index, stash):
     return w, b, n, False
 
 
+def skin_counted(model):
+    """Whether a vertex no bone drives on this model is reported.
+
+    Not on a quantised one: its record has no weight field and the engine binds each of its
+    vertices to bone 0 at full weight (StudioRender 0x2c018720), which is what the split
+    writes for a vertex in no group. A scene imported before the importer put them in bone
+    0's group holds none in any."""
+    return model.filetype not in mdl_mod.QUANT_MAX
+
+
 def crowded_vertices(obj, bone_index):
     """Vertices carrying a fifth bone group, which no record can hold.
 
@@ -1509,7 +1519,7 @@ def read_meshes(m, source, fields):
             edits[(bi, mi)], n, nb, nu = read_mesh(obj, mo, bone_index, ok)
             renormals += n
             blind_normals += nb
-            unskinned += nu
+            unskinned += nu if skin_counted(mo) else 0
     return (edits, rebuild, missing, sorted(unsupported), renormals, crowded,
             blind_normals, uv_spare, donor_faces, unskinned, stray)
 
@@ -4149,7 +4159,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
                   for x in d.bodyparts[bi].kids[mi].kids)
         mesh["rebuilt"].append((obj.name, was, now))
-        mesh["unskinned"] += unskinned
+        mesh["unskinned"] += unskinned if skin_counted(mo) else 0
         mesh["renumbered"] += 0 if kept else 1
         # Same meaning as the in-place path's, so they share the report line.
         mesh["normals"] += edits["normals"]

@@ -926,10 +926,10 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         obj["vtmb_index"] = gi
         context.collection.objects.link(obj)
 
+        for b in m.bones:
+            obj.vertex_groups.new(name=b.name)
+        groups = obj.vertex_groups
         if model.filetype == 0:
-            for b in m.bones:
-                obj.vertex_groups.new(name=b.name)
-            groups = obj.vertex_groups
             for vi, v_ in enumerate(verts):
                 # Sliced to numbones: `bones` and `weights` are always four long and the
                 # fourth weight is the shortfall 255 - sum(stored), so a vertex with none
@@ -939,6 +939,11 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
                 for bone, weight in zip(v_.bones[:n_], v_.weights[:n_]):
                     if weight > 0.0 and 0 <= bone < len(m.bones):
                         groups[m.bones[bone].name].add([vi], weight, "REPLACE")
+        elif m.bones:
+            # A quantised record has no weight field. StudioRender's weight accessor
+            # 0x2c018720 hands each of its vertices one static record, 0x2c06c520: bone 0
+            # at 255, numbones 1. So they follow bone 0 in game, and here too.
+            groups[m.bones[0].name].add(list(range(len(verts))), 1.0, "REPLACE")
         cloth_notes += _stamp_cloth(obj, model, verts)
         if with_flexes:
             k, r, dropped = build_shape_keys(obj, model, scale)
