@@ -3113,6 +3113,14 @@ def add_sequence(d, label, anim, activity=None, flags=0):
     return len(d.seqs) - 1
 
 
+def add_poseparam(d, name, flags, start, end, loop):
+    """One `mstudioposeparamdesc_t`, the 20 bytes `from_bytes` reads: name@0, flags@4,
+    start, end and loop@8. Returns its index, which is what a sequence's paramindex names."""
+    d.poseparams.append(Rec(struct.pack("<2i3f", 0, int(flags), float(start), float(end),
+                                        float(loop)), name))
+    return len(d.poseparams) - 1
+
+
 def encode_params(params, names, where=""):
     """[{name, start, end}] x2 -> (paramindex, paramstart, paramend) for one seqdesc.
 
@@ -3123,9 +3131,9 @@ def encode_params(params, names, where=""):
     that carry it, so a wrong index reads past the array -- and 0 of 14012 shipped
     sequences name a pose parameter their model does not have.
 
-    The array itself is carried through the rebuild and is not authored from a scene:
-    what reads `move_yaw` and `hit_yaw` at runtime is not located, so an invented name
-    would drive nothing.
+    The array itself is carried, through the rebuild or by `add_poseparam` off what an
+    import stamped, and is not authored from a scene: what reads `move_yaw` and `hit_yaw`
+    at runtime is not located, so an invented name would drive nothing.
     """
     idx, start, end = [-1, -1], [0.0, 0.0], [0.0, 0.0]
     for k, p in enumerate(list(params or ())[:2]):

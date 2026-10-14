@@ -2,10 +2,12 @@
 
 `blender_export` rewrites a file that already exists: it opens with `Mdl(source)` and
 carries every record the scene does not supply. This does not open anything. The armature
-becomes `mstudiobone_t[]`, the mesh objects become bodyparts, the actions become animations
-and one sequence each. Attachments, hitboxes, the include chain, cloth and spring bone
-chains are written from the scene too. Everything else is emitted with a count of zero, and
-`SCRATCH_DROPS` in `__init__` is the list of it the export dialog prints.
+becomes `mstudiobone_t[]`, the mesh objects become bodyparts, the actions become animations.
+The sequences are the imported list where the armature carries one, `vtmb_sequences` with its
+pose parameters, and one per action for every action that list does not cite. Attachments,
+hitboxes, the include chain, cloth and spring bone chains are written from the scene too.
+Everything else is emitted with a count of zero, and `SCRATCH_DROPS` in `__init__` is the list
+of it the export dialog prints.
 
 The rest pose is re-derived from the armature rather than carried. That costs `2.198e-04`
 units of bone translation and `6.386e-04` units of vertex displacement at r=8 worst over
@@ -910,7 +912,7 @@ def _ordered(actions):
 
 
 def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
-                activity="ACT_IDLE", root_motion="extract"):
+                activity="ACT_IDLE", root_motion="extract", bone_index=None):
     """`root_motion` is what becomes of the root bone's path. "extract" takes its net
     ground displacement into one `mstudiomovement_t` and leaves the rest -- the sway and
     rise -- in the keys, which is how a walk cycle is stored: the engine carries the
@@ -918,8 +920,11 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
     poses, which is right only for an animation that really does translate in model
     space. "in_place" takes the same net displacement out and writes no block, so nothing
     travels on either side. "per_action" reads each action's own stamp instead, where a
-    stored "keep" becomes "extract" -- there is no donor file here to keep blocks from."""
-    moved, unfitted, unkeepable = 0, [], []
+    stored "keep" becomes "extract" -- there is no donor file here to keep blocks from.
+
+    Every action becomes an animation; the sequences come after, out of
+    `scene_sequences`, and an action no imported sequence cites gets one of its own."""
+    moved, unfitted, unkeepable, written = 0, [], [], []
     for act in _ordered(actions):
         poses = sample_action(context, arm_obj, act, d, scale, use_range)
         if not poses:
@@ -939,13 +944,207 @@ def add_actions(context, arm_obj, d, actions, scale=1.0, use_range=False,
             unkeepable.append(act.name)
         fps = float(act.get("vtmb_fps", context.scene.render.fps))
         flags = int(act.get("vtmb_flags", 0))
-        a = build_mod.add_animation(d, act.name, poses, fps, flags, movements)
+        written.append((act, build_mod.add_animation(d, act.name, poses, fps, flags,
+                                                     movements)))
+    seqs = scene_sequences(d, arm_obj, written, bone_index or {})
+    cited = set()
+    for rec in d.seqs:
+        cited.update(build_mod._seq_anims(rec.raw))
+    for act, a in written:
+        if a in cited:
+            continue
         # `get(key, default)` and not `or`: an imported action carries "" where its
         # sequence claimed no activity, and that is a value, not a gap for the
         # dialog to fill.
         build_mod.add_sequence(d, act.name, a, act.get("vtmb_activity", activity),
                                int(act.get("vtmb_seq_flags", 0)))
-    return len(actions), moved, unfitted, unkeepable
+    return len(actions), moved, unfitted, unkeepable, seqs
+
+
+def add_poseparams(d, arm_obj):
+    """`mstudioposeparamdesc_t[]` off `vtmb_poseparams`, which an import stamps from the
+    file. Carried rather than authored: a blend grid names its axis by one of these, and
+    what reads `move_yaw` and `hit_yaw` at runtime is not located."""
+    for p in arm_obj.get("vtmb_poseparams") or ():
+        build_mod.add_poseparam(d, str(p.get("name") or ""), int(p.get("flags") or 0),
+                                float(p.get("start") or 0.0), float(p.get("end") or 0.0),
+                                float(p.get("loop") or 0.0))
+    return len(d.poseparams)
+
+
+def stash_bones(arm_obj, bone_index):
+    """{the name the file gave a bone: its index in the file being written}.
+
+    A knockback in the stash names its bone by the file's name, and `add_bones` keys by
+    Blender's, which a rename moves; `vtmb_bone_name` on the pose bone is the bridge. A
+    bone with no stamp answers to its own name.
+    """
+    out = {}
+    for pb in arm_obj.pose.bones:
+        if pb.name in bone_index:
+            out.setdefault(str(pb.get("vtmb_bone_name") or pb.name), bone_index[pb.name])
+    return out
+
+
+class _Cells(object):
+    """Which written animation a stash cell names, decided once per export.
+
+    The name decides, as `match_indices` has it on the donor path: an action called what
+    the cell says, from this file or from none. Failing that, the one action this file
+    stamped with that animation name, which is a rename. A name the file carried twice
+    is matched by `blend_index`, the file's own index, since the name cannot say which.
+    """
+
+    def __init__(self, arm_obj, written):
+        source = arm_obj.get("vtmb_source")
+        self.by_name, self.stamped = {}, {}
+        for act, a in written:
+            mine = export_mod.same_file(act.get("vtmb_source"), source)
+            if mine or not act.get("vtmb_source"):
+                self.by_name[act.name] = a
+            if mine and act.get("vtmb_anim_name") is not None:
+                self.stamped.setdefault(str(act["vtmb_anim_name"]), []).append(
+                    (act.get("vtmb_anim_index"), act.name, a))
+
+    def find(self, name, hint):
+        """(animation index, None), or (None, why). `why` is None as well where no action
+        being written is a candidate at all, which is what leaves a sequence out."""
+        got = self.stamped.get(name) or []
+        if len(got) > 1:
+            hit = [a for i, _n, a in got
+                   if hint is not None and i is not None and int(i) == int(hint)]
+            if len(hit) == 1:
+                return hit[0], None
+            return None, ("animation %r, which the file carried %d times -- actions %s -- "
+                          "and the stash does not say which"
+                          % (name, len(got), ", ".join(sorted(n for _i, n, _a in got))))
+        if name in self.by_name:
+            return self.by_name[name], None
+        if got:
+            return got[0][2], None
+        return None, None
+
+
+# The 16 activity-name pointers of an mstudioknockback_t, the only struct-relative words in
+# it -- the ones `mdl_build.from_bytes` zeroes.
+_KNOCKBACK_NAMES = tuple(0x78 + t * 4 for t in range(16))
+
+
+def plan_sequences(arm_obj, written):
+    """([(stash entry, grid of animation indices)], [labels left out]) for the stash.
+
+    An entry with a cell naming an animation no action being written carries is left out
+    and named -- an export handed no actions, or the first few of a file's, writes only the
+    sequences whose every cell it has, since writing one short of a cell would play another
+    animation in its place -- and an action it cited gets one of its own. A name two actions
+    could be is refused, and so is a cell the stash holds as "", the file's own index having
+    named nothing.
+    """
+    cells = _Cells(arm_obj, written)
+    out, skipped = [], []
+    for k, s in enumerate(arm_obj.get("vtmb_sequences") or ()):
+        label = str(s.get("label") or "")
+        blends = [[str(v) for v in col] for col in s.get("blends") or ()]
+        hint = [list(col) for col in s.get("blend_index") or ()]
+        gx = len(blends)
+        gy = max((len(col) for col in blends), default=0)
+        if not gx or not gy or any(len(col) != gy for col in blends):
+            raise Refused("sequence %d, %r, has a blend grid of %s cells, which is not a "
+                          "grid" % (k, label, [len(col) for col in blends]))
+        if gx > 16 or gy > 16:
+            raise Refused("sequence %d, %r, has a %d x %d blend grid; the record holds 16 x "
+                          "16" % (k, label, gx, gy))
+        grid, why, missing = [], [], False
+        for x, col in enumerate(blends):
+            row = []
+            for y, name in enumerate(col):
+                h = hint[x][y] if x < len(hint) and y < len(hint[x]) else None
+                a, bad = cells.find(name, h) if name else (None, None)
+                if bad is not None:
+                    why.append("blend %d, %d names %s" % (x, y, bad))
+                missing |= a is None and bool(name)
+                row.append(a)
+            grid.append(row)
+        if why:
+            raise Refused("sequence %r: %s" % (label, "; ".join(why)))
+        if missing or all(a is None for row in grid for a in row):
+            skipped.append(label)
+            continue
+        empty = [(x, y) for x, row in enumerate(grid) for y, a in enumerate(row)
+                 if a is None and not blends[x][y]]
+        if empty:
+            raise Refused("sequence %r has blend cell%s %s naming no animation -- the "
+                          "file's own index there named none. Pick one with the cell's "
+                          "button, drawn (kept), in the Dope Sheet's VTMB sequence panel"
+                          % (label, "" if len(empty) == 1 else "s",
+                             ", ".join("%d, %d" % c for c in empty)))
+        out.append((s, grid))
+    return out, skipped
+
+
+def scene_sequences(d, arm_obj, written, bone_index):
+    """`arm["vtmb_sequences"]` written as the file's own sequences, in the stash's order.
+
+    `written` is [(action, animation index)]. The label, activity, blend grid, events,
+    pose parameters, autolayers, tail fields and knockbacks come off the stash through the
+    donor path's own writers, and then each action's Loops and Activity off the action,
+    as `apply_sequences` has it. A knockback is rebuilt from the raw record the import
+    stashed; a sequence any of whose records lacks one -- a `.blend` imported before the
+    stash carried it -- is written with none, and named.
+
+    Returns {"imported", "written", "skipped", "knockbacks_dropped"}.
+    """
+    stash = list(arm_obj.get("vtmb_sequences") or ())
+    plan, skipped = plan_sequences(arm_obj, written)
+    out = {"imported": len(stash), "written": len(plan), "skipped": skipped,
+           "knockbacks_dropped": []}
+    if not plan:
+        return out
+    for s, grid in plan:
+        rec = d.seqs[build_mod.add_sequence(d, str(s.get("label") or ""), grid[0][0])]
+        struct.pack_into("<ii", rec.raw, mdl_mod.SEQ_GROUPSIZE, len(grid), len(grid[0]))
+        for x, row in enumerate(grid):
+            for y, a in enumerate(row):
+                struct.pack_into("<h", rec.raw, mdl_mod.SEQ_ANIM + x * 0x20 + y * 2, a)
+        activity = s.get("activity")
+        rec.extra["activity"] = None if activity is None else str(activity)
+    first = len(d.seqs) - len(plan)
+    # Off the plan and not the stash: an autolayer names a sequence by label, and one the
+    # export left out is not in the file to be named.
+    labels = {}
+    for k, (s, _grid) in enumerate(plan):
+        labels.setdefault(str(s.get("label") or ""), first + k)
+    bones = stash_bones(arm_obj, bone_index)
+    pp = [r.name or "" for r in d.poseparams]
+    for k, (s, _grid) in enumerate(plan):
+        rec = d.seqs[first + k]
+        tail = {key: s[key] for key in s.keys()}
+        kbs = list(s.get("knockbacks") or ())
+        raws = [kb.get("raw") for kb in kbs]
+        if kbs and all(raws):
+            for j, kb in enumerate(kbs):
+                if str(kb.get("bone") or "") not in bones:
+                    raise Refused("knockback %d of sequence %r drives bone %r, which the "
+                                  "armature has no bone imported as"
+                                  % (j, rec.name, str(kb.get("bone") or "")))
+            recs = []
+            for j, r in enumerate(raws):
+                raw = bytes.fromhex(str(r))
+                if len(raw) != mdl_mod.KNOCKBACK_STRIDE:
+                    raise Refused("knockback %d of sequence %r stashes %d bytes; the record "
+                                  "is %d" % (j, rec.name, len(raw), mdl_mod.KNOCKBACK_STRIDE))
+                recs.append(build_mod.Rec(build_mod._z(raw, *_KNOCKBACK_NAMES), None, None,
+                                          {"names": [None] * 16}))
+            rec.extra["knockbacks"] = recs
+        elif kbs:
+            out["knockbacks_dropped"].append(rec.name)
+            tail["knockbacks"] = []
+        export_mod._apply_events(rec, s.get("events"))
+        export_mod._apply_params(rec, s.get("params"), pp, rec.name)
+        export_mod._apply_seq_tail(rec, tail, labels, bones)
+    for k, acts in export_mod._first_citers(d, {a: act for act, a in written}).items():
+        export_mod._apply_seq_action(d.seqs[k], acts)
+    return out
 
 
 def scene_cdtextures(arm_obj):
@@ -1002,10 +1201,11 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
                                                        scale)
     d.cloth_volumes = (nvol, vmoved)
     add_springbones(d, arm_obj, bone_index)
-    _n, moved, unfitted, unkeepable = add_actions(context, arm_obj, d, actions, scale,
-                                                  use_range, activity, root_motion)
+    add_poseparams(d, arm_obj)
+    _n, moved, unfitted, unkeepable, seqs = add_actions(
+        context, arm_obj, d, actions, scale, use_range, activity, root_motion, bone_index)
     return (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-            stray, (nbox, nset, nfit))
+            stray, (nbox, nset, nfit), seqs)
 
 
 def _set_hull(d, lo, hi):
@@ -1098,8 +1298,8 @@ def write(d, faces, path, checksum):
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
     (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-     stray, hbox) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
-                          **kw)
+     stray, hbox, seqs) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
+                                **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "hull_inverted": export_mod.inverted_axes(d),
@@ -1112,6 +1312,12 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             # list drifting from what add_material actually put in the file.
             "material_names": [r.name for r in d.textures],
             "anims": len(d.anims), "seqs": len(d.seqs),
+            # Skipped: labels no written action reaches. Dropped: sequences written
+            # without the knockbacks an import older than `raw` could not carry.
+            "seqs_imported": seqs["imported"], "seqs_from_stash": seqs["written"],
+            "seqs_skipped": seqs["skipped"],
+            "knockbacks_dropped": seqs["knockbacks_dropped"],
+            "poseparams": len(d.poseparams),
             "includes": len(d.includes),
             "springs": len(d.springbones), "cloth_volumes": d.cloth_volumes,
             "cloth_two_bone": d.cloth_two_bone,

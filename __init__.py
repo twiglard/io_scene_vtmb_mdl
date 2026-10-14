@@ -1973,12 +1973,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 SCRATCH_DROPS = (
     "collision and ragdoll -- both live in the sibling .phy, not written",
     "flex descs, controllers, rules and every vertanim",
-    "eyeballs, mouths and pose parameters",
+    "eyeballs and mouths",
     ("procedural bones, IK chains and bone controllers -- a spring bone chain "
      "authored on a bone IS written"),
-    ("the imported sequence list -- one sequence per action is written in its place, named "
-     "after the action, so the imported labels, order, blend grids, events, autolayers and "
-     "tail fields are lost"),
     "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
     ("which hitbox set the engine selects at runtime -- the boxes and the sets "
      "themselves ARE written, whatever Fit hitboxes says"),
@@ -2013,19 +2010,22 @@ def _scratch_fit_hull(arm_obj):
 
 
 def _scratch_sequences(arm_obj, actions):
-    """(imported, written, blend grids imported) for the dialog, or None with no stash.
+    """(imported, written of them, labels left out, why it would be refused) for the
+    dialog, or None with no stash.
 
-    Reachable without a window for the reason `_scratch_cdtexture` is. A grid is a sequence
-    whose group spans more than one animation.
+    Reachable without a window for the reason `_scratch_cdtexture` is. Decided by
+    `plan_sequences` over the animation indices the export will hand out, which are the
+    actions' positions in `_ordered`, so the dialog and the write cannot disagree.
     """
     stash = arm_obj.get("vtmb_sequences")
     if not stash:
         return None
-    grids = 0
-    for s in stash:
-        g = list(s.get("groupsize") or (1, 1))
-        grids += g[0] * g[1] > 1
-    return len(stash), len(actions), grids
+    written = [(a, k) for k, a in enumerate(blender_scratch._ordered(actions))]
+    try:
+        plan, skipped = blender_scratch.plan_sequences(arm_obj, written)
+    except blender_scratch.Refused as exc:
+        return len(stash), 0, [], str(exc)
+    return len(stash), len(plan), skipped, None
 
 
 def _unresolved(context, arm_obj, filepath, includes, cdtextures):
@@ -2368,11 +2368,13 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         box = _section(lay, "vtmb_s_drops", "Not written", icon="LOCKED")
         if box is not None:
             seqs = _scratch_sequences(obj, actions)
-            if seqs is not None:
-                _pair(box, "sequences", "%d imported, %d written" % seqs[:2], icon="ERROR")
-                if seqs[2]:
-                    _pair(box, "blend grids", "%d imported, 0 written" % seqs[2],
-                          icon="ERROR")
+            if seqs is not None and seqs[3]:
+                _pair(box, "sequences", "refused: %s" % seqs[3], icon="ERROR")
+            elif seqs is not None and seqs[2]:
+                _pair(box, "sequences", "%d of %d imported, citing an animation no action "
+                      "being written carries: %s" % (len(seqs[2]), seqs[0],
+                                                     ", ".join(seqs[2][:4])),
+                      icon="ERROR")
             for line in SCRATCH_DROPS:
                 box.label(text=line)
 
@@ -2455,6 +2457,18 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "dropped %s"
                         % ", ".join("%s x%d" % (k, v)
                                     for k, v in sorted(r["dropped"].items())))
+        if r.get("seqs_skipped"):
+            self.report({"WARNING"}, "%d of the %d imported sequences cite an animation no "
+                                     "action being written carries and were left out: %s"
+                        % (len(r["seqs_skipped"]), r["seqs_imported"],
+                           ", ".join(r["seqs_skipped"][:6])))
+        if r.get("knockbacks_dropped"):
+            self.report({"WARNING"}, "%d sequence%s written with no knockbacks, the "
+                                     "armature having been imported before the import kept "
+                                     "their records -- re-import to carry them: %s"
+                        % (len(r["knockbacks_dropped"]),
+                           "" if len(r["knockbacks_dropped"]) == 1 else "s",
+                           ", ".join(r["knockbacks_dropped"][:6])))
         unresolved = _unresolved(
             context, obj, self.filepath,
             blender_scratch.scene_includes(obj) if self.chain else (),

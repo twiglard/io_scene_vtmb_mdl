@@ -269,6 +269,14 @@ def sequence_stash(m):
     stash is resolved through: position alone cannot say that two entries were swapped
     rather than that both were edited, and writing one entry's events and knockbacks onto
     the other's record is refused by `_apply_knockbacks` the moment their counts differ.
+
+    `blend_index` is the grid as the file's own animation indices, beside the names. A name
+    alone cannot say which of two animations it means where the file carries it twice --
+    three Walkie_Talkie names on `crooked_cop`, `rookied_cop` and `walkie_talkie`, each pair
+    cited by one grid -- and the no-donor export, which has no file to look the index up
+    in, reads it there. A knockback's `raw` is its whole 188-byte record, since all but the
+    bone, cycle end and activity grid have no scene field and a record written from no file
+    has nothing else to take them from.
     """
     labels = [x.label for x in m.seqs]
     return [{"src": s.index,
@@ -276,6 +284,7 @@ def sequence_stash(m):
              "groupsize": list(s.groupsize),
              "blends": [[m.anims[i].name if 0 <= i < len(m.anims) else ""
                          for i in col] for col in s.blends],
+             "blend_index": [list(col) for col in s.blends],
              "events": [{"cycle": e.cycle, "event": e.event, "type": e.type,
                          "options": e.options} for e in s.events],
              "params": [{"name": (m.poseparams[i].name
@@ -289,7 +298,8 @@ def sequence_stash(m):
              "knockbacks": [{"bone": (m.bones[k.bone].name
                                       if 0 <= k.bone < len(m.bones) else ""),
                              "cycleend": k.cycleend,
-                             "activities": [[x or "" for x in row] for row in k.activities]}
+                             "activities": [[x or "" for x in row] for row in k.activities],
+                             "raw": k.raw.hex()}
                             for k in s.knockbacks],
              "node": [s.entrynode, s.exitnode, s.nodeflags],
              "phase": [s.entryphase, s.exitphase],
