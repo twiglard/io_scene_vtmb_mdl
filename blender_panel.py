@@ -83,6 +83,59 @@ def _loops_set(action, value):
     action["vtmb_seq_flags"] = (flags | 1) if value else (flags & ~1)
 
 
+# The sequence-flag bits some game code reads, beside Loops. Autoplay, 0x0008, is read too and
+# stays in the leftover number: this engine plays it frozen at cycle 0.
+SEQ_FLAG_BITS = (
+    ("vtmb_seq_snap", 0x0002, "Snap",
+     "Bit 1 of the sequence flags. The blend-out timer, client.dll 1008de30, returns 0 when "
+     "the sequence being switched to carries it, so switching into this one cuts with no "
+     "blend. 3202 of 14012 shipped sequences set it"),
+    ("vtmb_seq_delta", 0x0004, "Delta",
+     "Bit 2: SlerpBones (client.dll 10088efc, engine.dll 20008670) adds this sequence's "
+     "rotations and positions to the pose under it, where without it the pose is blended "
+     "toward them. Only an animation authored as a difference from a base pose plays right "
+     "this way, and the export cannot tell one from the other. 118 shipped sequences set "
+     "it, all in the two move_and_ranged.mdl"),
+    ("vtmb_seq_post", 0x0010, "Post",
+     "Bit 4, read only when Delta is set: the added rotation goes on the right of the base "
+     "pose's (QuaternionMA, engine.dll 20008670), where clear puts it on the left "
+     "(QuaternionSM). Positions add the same either way. All 118 shipped Delta sequences "
+     "set it"),
+    ("vtmb_seq_not_player", 0x0100, "Not for the player",
+     "Bit 8: GetSequencesForActivity (vampire.dll 10427df0, client.dll 100797e0) leaves "
+     "the sequence out when the player's entity asks for one for an activity. No shipped "
+     "sequence sets it"),
+    ("vtmb_seq_not_npc", 0x0200, "Not for NPCs",
+     "Bit 9: the same lookup leaves the sequence out when an NPC asks. The 8 shipped "
+     "sequences carrying it are the knife attacks of the two knife.mdl, which only the "
+     "player plays"),
+    ("vtmb_seq_blend_min", 0x0400, "Blend in by the shorter time",
+     "Bit 10, read off the sequence being switched to at client.dll 1008df01: set, the "
+     "outgoing sequence blends out over the shorter of its own curve and this sequence's "
+     "first fade-out value; clear, the longer. Seen in game 2026-08-26. No shipped "
+     "sequence sets it"),
+)
+SEQ_FLAGS_DRAWN = 0x0001 | sum(bit for _a, bit, _n, _d in SEQ_FLAG_BITS)
+
+
+def _seq_bit_get(action, bit):
+    return bool(int(action.get("vtmb_seq_flags") or 0) & bit)
+
+
+def _seq_bit_set(action, bit, value):
+    flags = int(action.get("vtmb_seq_flags") or 0)
+    action["vtmb_seq_flags"] = (flags | bit) if value else (flags & ~bit)
+
+
+def _seq_other_get(action):
+    return int(action.get("vtmb_seq_flags") or 0) & ~SEQ_FLAGS_DRAWN
+
+
+def _seq_other_set(action, value):
+    flags = int(action.get("vtmb_seq_flags") or 0)
+    action["vtmb_seq_flags"] = (flags & SEQ_FLAGS_DRAWN) | (int(value) & ~SEQ_FLAGS_DRAWN)
+
+
 # What an absent key shows when no imported file can be read either, and what the no-donor
 # export writes for it.
 HDR_SHOWN = {"vtmb_eyeposition": (0.0, 0.0, 0.0),
@@ -1502,7 +1555,7 @@ class VTMB_PT_armature(bpy.types.Panel):
 
 
 def draw_action_fields(lay, act, arm_obj=None):
-    """The three per-action fields, wherever they are hosted.
+    """The per-action fields, wherever they are hosted.
 
     Two panels draw them -- the Action editor's sidebar, which is about the action on
     screen, and the Object Data tab's list, which is about the model's whole set -- and
@@ -1520,6 +1573,15 @@ def draw_action_fields(lay, act, arm_obj=None):
 
     col = lay.column(align=True)
     col.prop(act, "vtmb_loops")
+    delta = _seq_bit_get(act, 0x0004)
+    for attr, bit, _name, _desc in SEQ_FLAG_BITS:
+        row = col.row()
+        row.active = delta or bit != 0x0010
+        row.prop(act, attr)
+    col.prop(act, "vtmb_seq_flags_other")
+    if act.get("vtmb_flags"):
+        col.label(text="animation flags 0x%04x, carried as they are: no reachable game "
+                       "code reads them" % int(act["vtmb_flags"]))
     col.prop(act, "vtmb_activity_text")
     if act.get("vtmb_activity") is None:
         col.label(text="    → " + _activity_line(arm_obj, act))
@@ -2883,6 +2945,18 @@ def register_props():
                     "this animation round again rather than holding its last frame. "
                     "mstudioanimdesc_t has its own flags field and the engine does not "
                     "read looping from it")
+    for attr, bit, name, desc in SEQ_FLAG_BITS:
+        setattr(bpy.types.Action, attr, bpy.props.BoolProperty(
+            name=name, description=desc,
+            get=(lambda b: lambda self: _seq_bit_get(self, b))(bit),
+            set=(lambda b: lambda self, v: _seq_bit_set(self, b, v))(bit)))
+    bpy.types.Action.vtmb_seq_flags_other = bpy.props.IntProperty(
+        name="Other flag bits", get=_seq_other_get, set=_seq_other_set,
+        description="The sequence-flag bits with no checkbox, as one number, kept as they "
+                    "are unless changed here. Among them is Autoplay, 0x0008: engine.dll "
+                    "CalcAutoplaySequences (2000a180) plays such a sequence at cycle 0 for "
+                    "ever, and only on a model whose studiohdr_t flags carry 0x200, which "
+                    "no shipped model does. No shipped sequence sets any bit counted here")
     bpy.types.Action.vtmb_activity_text = bpy.props.StringProperty(
         name="Activity", get=_activity_get, set=_activity_set,
         search=_activity_search, search_options={"SORT", "SUGGESTION"},
@@ -2910,7 +2984,8 @@ def unregister_props():
     for attr in names:
         if hasattr(bpy.types.Object, attr):
             delattr(bpy.types.Object, attr)
-    for attr in ("vtmb_root_motion_choice", "vtmb_loops", "vtmb_activity_text"):
+    for attr in ("vtmb_root_motion_choice", "vtmb_loops", "vtmb_activity_text",
+                 "vtmb_seq_flags_other") + tuple(a for a, _b, _n, _d in SEQ_FLAG_BITS):
         if hasattr(bpy.types.Action, attr):
             delattr(bpy.types.Action, attr)
     if hasattr(bpy.types.PoseBone, "vtmb_from_root"):
