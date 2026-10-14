@@ -1260,6 +1260,72 @@ def off_bone0(obj, model, bone_index):
                       for g in v.groups))
 
 
+HDR_VECTORS = (("vtmb_eyeposition", mdl_mod.HDR_EYEPOSITION),
+               ("vtmb_hull_min", mdl_mod.HDR_HULL_MIN),
+               ("vtmb_hull_max", mdl_mod.HDR_HULL_MAX))
+
+
+_SOURCE_VECTORS = {}
+
+
+def source_vectors(path):
+    """{header offset: (x, y, z)} off the model at `path`, in file units, or {} when nothing
+    readable as a v2531 model is there. Cached on the path, its mtime and its size."""
+    try:
+        st = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return {}
+    stamp = (st.st_mtime_ns, st.st_size)
+    got = _SOURCE_VECTORS.get(path)
+    if got is not None and got[0] == stamp:
+        return got[1]
+    end = mdl_mod.HDR_HULL_MAX + 12
+    try:
+        with open(path, "rb") as f:
+            head = f.read(end)
+    except OSError:
+        return {}
+    out = {}
+    if (len(head) == end and head[:4] == mdl_mod.MAGIC
+            and struct.unpack_from("<i", head, 4)[0] == mdl_mod.VERSION):
+        out = {off: struct.unpack_from("<3f", head, off) for _key, off in HDR_VECTORS}
+    _SOURCE_VECTORS[path] = (stamp, out)
+    return out
+
+
+def header_vectors(arm_obj, scale=1.0):
+    """{header offset: (x, y, z)} in file units, for each of the three the armature carries.
+
+    A key is absent on a .blend saved before the import stamped them. It is then read off
+    the armature's `vtmb_source`, which is what the panel shows for it, so editing one
+    component of a vector keeps the file's other two. With no readable source either -- an
+    armature no import made -- it is left out, and the donor path keeps the file's and the
+    no-donor path `new`'s.
+    """
+    out, src = {}, None
+    for key, off in HDR_VECTORS:
+        v = arm_obj.get(key)
+        if v is None:
+            if src is None:
+                src = source_vectors(arm_obj.get("vtmb_source"))
+            if off in src:
+                out[off] = src[off]
+            continue
+        v = [float(c) for c in v]
+        if len(v) != 3:
+            raise build_mod.Refused("%s holds %d numbers where a position takes 3"
+                                    % (key, len(v)))
+        out[off] = tuple(c / scale for c in v)
+    return out
+
+
+def inverted_axes(d):
+    """The axes on which the written hull's min is above its max. 0 of 4445 shipped."""
+    lo = struct.unpack_from("<3f", d.hdr, mdl_mod.HDR_HULL_MIN)
+    hi = struct.unpack_from("<3f", d.hdr, mdl_mod.HDR_HULL_MAX)
+    return "".join("xyz"[c] for c in range(3) if lo[c] > hi[c])
+
+
 def rebased_box(model, place):
     """(offset, scale) of the quantisation box a quantised model moved by `placed` takes, or
     None where the move has no such box.
@@ -3946,6 +4012,20 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         struct.pack_into("<3f", d.hdr, 180, *hull[0])
         struct.pack_into("<3f", d.hdr, 192, *hull[1])
         d.refit_boxes = True
+    # Compared as the f32 bytes, so an unedited stamp writes nothing. A typed hull moves no
+    # vertex and leaves the sequence boxes alone; Fit hull, when ticked, wins over it.
+    typed = header_vectors(arm_obj, scale)
+    header = {}
+    for off, v in sorted(typed.items()):
+        if hull is not None and off != mdl_mod.HDR_EYEPOSITION:
+            continue
+        if struct.pack("<3f", *v) != bytes(d.hdr[off:off + 12]):
+            struct.pack_into("<3f", d.hdr, off, *v)
+            header[off] = v
+    typed_hull = hull is None and bool({mdl_mod.HDR_HULL_MIN, mdl_mod.HDR_HULL_MAX} & set(header))
+    if typed_hull:
+        hull = (struct.unpack_from("<3f", d.hdr, mdl_mod.HDR_HULL_MIN),
+                struct.unpack_from("<3f", d.hdr, mdl_mod.HDR_HULL_MAX))
 
     # Compared normalised and written only where the lists differ, because normalising is
     # not free: separators and repeats fold on 106 of 4445 models, which resolve the same
@@ -4310,7 +4390,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "vtx_more": [x for x in touched if x["flavour"] != "dx80"],
             "renamed": renamed,
             "model_name": model_name, "hull": hull, "cdtexture": cdtex,
-            "boxes": (d.refit_count, len(d.seqs)) if hull is not None else None,
+            "boxes": (d.refit_count, len(d.seqs)) if hull is not None and not typed_hull
+            else None,
+            "eyeposition": header.get(mdl_mod.HDR_EYEPOSITION),
+            "hull_inverted": inverted_axes(d),
             # One scale set serves every animation in the file and `fit_scales` never
             # narrows, so a pose this export authored can widen a bone for every animation
             # already in it. `emit` is what runs the fit, so this is read after it.

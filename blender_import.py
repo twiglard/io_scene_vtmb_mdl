@@ -223,6 +223,8 @@ def build_armature(context, m, name, scale, root_motion=True):
         {"name": pp.name, "flags": pp.flags, "start": pp.start, "end": pp.end,
          "loop": pp.loop} for pp in m.poseparams]
     arm_obj["vtmb_sequences"] = sequence_stash(m)
+    for (key, _off), v in zip(export_mod.HDR_VECTORS, (m.eyeposition,) + m.hull):
+        arm_obj[key] = [c * scale for c in v]
     # The user's answer to "was the travel applied to the keys". The count that goes with
     # it is stamped in import_mdl, once the imported actions are known.
     arm_obj["vtmb_root_motion"] = bool(root_motion)

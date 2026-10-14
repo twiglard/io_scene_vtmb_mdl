@@ -55,6 +55,12 @@ def _pair(box, key, value, icon="NONE"):
     row.label(text=value, icon=icon)
 
 
+def _report_inverted(op, axes):
+    if axes:
+        op.report({"WARNING"}, "the hull's min is above its max on %s, which 0 of 4445 "
+                               "shipped models do; it is written as set" % ", ".join(axes))
+
+
 def _two_bone_capsule(gi, k, bone0, bone1):
     """The warning for a capsule written with its ends on two bones."""
     return ("cloth capsule %d on model %d has end 0 on %r and end 1 on %r: written, and the "
@@ -1622,6 +1628,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         if r.get("hull") is not None:
             self.report({"INFO"}, "the hull is now %.0f %.0f %.0f .. %.0f %.0f %.0f"
                         % (r["hull"][0] + r["hull"][1]))
+        if r.get("eyeposition") is not None:
+            self.report({"INFO"}, "the eye position is now %.2f %.2f %.2f"
+                        % tuple(r["eyeposition"]))
+        _report_inverted(self, r.get("hull_inverted"))
         for name, (bi, mi) in r.get("remodelled") or []:
             self.report({"INFO"}, "model %d.%d is now named %r in the file"
                         % (bi, mi, name))
@@ -1994,6 +2004,12 @@ def _scratch_cdtexture(arm_obj):
     return ";".join(blender_scratch.scene_cdtextures(arm_obj)) or "models/"
 
 
+def _scratch_fit_hull(arm_obj):
+    """The dialog's Fit hull default: off where the armature carries a hull, which an import
+    stamps as the file's $bbox -- the movement box, which the mesh's extent is not."""
+    return blender_scratch.scene_hull(arm_obj) is None
+
+
 def _scratch_sequences(arm_obj, actions):
     """(imported, written, blend grids imported) for the dialog, or None with no stash.
 
@@ -2195,9 +2211,10 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
     fit_hull: bpy.props.BoolProperty(
         name="Fit hull to the mesh", default=True,
         description="Set the movement hull to the bounding box of the geometry. Off "
-                    "leaves the humanoid default of (-16,-16,0)..(16,16,72), which is "
-                    "wrong for anything that is not a person. Neither is the truth: this "
-                    "field is the hull the .qc's $hbox sets, not the mesh's extent")
+                    "writes the armature's Hull min and max from the VTMB panel, which an "
+                    "import sets to the file's, or without them the humanoid default of "
+                    "(-16,-16,0)..(16,16,72). Neither is the truth: this field is the hull "
+                    "the .qc's $bbox sets, not the mesh's extent")
     fit_hitboxes: bpy.props.BoolProperty(
         name="Fit hitboxes to the skin", default=True,
         description="Give every bone that owns geometry a hitbox enclosing it, so the "
@@ -2224,6 +2241,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         obj = context.active_object
         self.scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
         self.cdtexture = _scratch_cdtexture(obj)
+        self.fit_hull = _scratch_fit_hull(obj)
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -2325,11 +2343,25 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             box.prop(self, "fit_hitboxes")
             hull = (blender_scratch.fit_hull(meshes, self.scale, obj) if self.fit_hull
                     else None)
+            typed = blender_scratch.scene_hull(obj, self.scale)
             if hull is not None:
                 _pair(box, "hull", "%.0f %.0f %.0f .. %.0f %.0f %.0f"
                       % (hull[0] + hull[1]))
-            elif self.fit_hull:
-                _pair(box, "hull", "no vertices, so the default is kept", icon="INFO")
+                if typed is not None:
+                    _pair(box, "replacing", "%.0f %.0f %.0f .. %.0f %.0f %.0f, the armature's"
+                          % (typed[0] + typed[1]), icon="ERROR")
+            elif typed is not None:
+                _pair(box, "hull", "%.0f %.0f %.0f .. %.0f %.0f %.0f, the armature's"
+                      % (typed[0] + typed[1]),
+                      icon="INFO" if self.fit_hull else "NONE")
+            else:
+                _pair(box, "hull", "%sthe default %.0f %.0f %.0f .. %.0f %.0f %.0f"
+                      % (("no vertices, so " if self.fit_hull else "",)
+                         + blender_scratch.HULL_DEFAULT[0] + blender_scratch.HULL_DEFAULT[1]),
+                      icon="INFO")
+            eye = blender_scratch.scene_eyeposition(obj, self.scale)
+            _pair(box, "eye position", "%.1f %.1f %.1f, the armature's" % eye if eye
+                  else "0 0 0, the model's origin", icon="NONE" if eye else "INFO")
 
         box = _section(lay, "vtmb_s_drops", "Not written", icon="LOCKED")
         if box is not None:
@@ -2348,6 +2380,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         try:
             with blender_export.placed(meshes, obj) as moved:
                 hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
+                typed = blender_scratch.scene_hull(obj, self.scale)
                 r = blender_scratch.export_scene(
                     context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
                     scale=self.scale, surfaceprop=self.surfaceprop,
@@ -2441,6 +2474,11 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                said))
         for line in _cloth_bumps(context, obj, self.filepath):
             self.report({"WARNING"}, line)
+        _report_inverted(self, r.get("hull_inverted"))
+        if hull is not None and typed is not None:
+            self.report({"INFO"}, "the hull was fitted to the mesh, %.0f %.0f %.0f .. %.0f "
+                                  "%.0f %.0f, replacing the armature's %.0f %.0f %.0f .. "
+                                  "%.0f %.0f %.0f" % (hull[0] + hull[1] + typed[0] + typed[1]))
         self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
                               "%d materials, %d animations (%d with root motion), "
                               "%d sequences, %d chained, %d hitboxes, %d faces, "

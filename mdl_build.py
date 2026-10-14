@@ -98,6 +98,9 @@ BONECONTROLLER_STRIDE = 24
 # the object is regenerated, the user's decision 16. False draws every added vertex rigidly.
 CLOTH_ADD_PARTICLES = True
 
+# The hull @180/@192 `new` writes until a caller sets one; 37 of 4445 shipped models carry it.
+HULL_DEFAULT = ((-16.0, -16.0, 0.0), (16.0, 16.0, 72.0))
+
 # The scalars nothing has named, as the corpus states them.  A from-scratch caller starts
 # from these; a caller re-authoring a shipped model overwrites them with that model's own.
 DEFAULTS = {
@@ -1484,8 +1487,8 @@ def new(name, surfaceprop="flesh"):
     struct.pack_into("<i", h, 4, M.VERSION)
     struct.pack_into("<3f", h, 144, *DEFAULTS["hdr.unk144"])
     struct.pack_into("<2f", h, 232, *DEFAULTS["hdr.phonemefilter"])
-    struct.pack_into("<3f", h, 180, -16.0, -16.0, 0.0)
-    struct.pack_into("<3f", h, 192, 16.0, 16.0, 72.0)
+    struct.pack_into("<3f", h, 180, *HULL_DEFAULT[0])
+    struct.pack_into("<3f", h, 192, *HULL_DEFAULT[1])
     struct.pack_into("<3i", h, 412, *DEFAULTS["hdr.unhz"])
     d.surfaceprop = surfaceprop
     lab, nm = DEFAULTS["seqgroup"]

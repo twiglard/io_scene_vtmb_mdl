@@ -21,6 +21,11 @@ MAGIC = b"IDST"
 VERSION = 2531
 
 HDR_LENGTH = 140
+# Three model-space vectors. eyeposition is set on 326 of 4445 shipped models and read by
+# vampire.dll 10428310, GetEyePosition; the hull is the .qc's $bbox, 0 inverted of 4445.
+HDR_EYEPOSITION = 156
+HDR_HULL_MIN = 180
+HDR_HULL_MAX = 192
 HDR_NUMBONES = 240
 HDR_NUMANIM = 264
 HDR_NUMSEQ = 272
@@ -670,6 +675,9 @@ class Mdl:
             raise ValueError("header length %d exceeds file size %d"
                              % (self.length, len(d)))
         self.trailer = d[self.length:]
+        self.eyeposition = struct.unpack_from("<3f", d, HDR_EYEPOSITION)
+        self.hull = (struct.unpack_from("<3f", d, HDR_HULL_MIN),
+                     struct.unpack_from("<3f", d, HDR_HULL_MAX))
         # One animation's expanded RLE channels, dropped when the block moves.
         self._chan, self._chan_base, self._chan_table = {}, None, []
 

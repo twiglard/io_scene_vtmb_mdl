@@ -971,11 +971,17 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
           cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE",
           hitboxes=False, root_motion="extract", includes=()):
     """(Desc, faces) for the scene. `hull` is (min, max) and stays the caller's:
-    @180/@192 are the movement hull the .qc's $hbox sets, not the mesh's bounds."""
+    @180/@192 are the movement hull the .qc's $bbox sets, not the mesh's bounds. Without
+    one the armature's is written, and without that `new`'s."""
     d = build_mod.new(name, surfaceprop)
+    if hull is None:
+        hull = scene_hull(arm_obj, scale)
     if hull is not None:
         lo, hi = hull
         _set_hull(d, lo, hi)
+    eye = scene_eyeposition(arm_obj, scale)
+    if eye is not None:
+        struct.pack_into("<3f", d.hdr, mdl_mod.HDR_EYEPOSITION, *eye)
     for p in includes:
         build_mod.add_include(d, p)
     build_mod.set_cdtextures(d, paths_mod.cdtexture_list(cdtexture))
@@ -1010,10 +1016,29 @@ def _set_hull(d, lo, hi):
     struct.pack_into("<3f", d.hdr, 168, *[(a + b) * 0.5 for a, b in zip(lo, hi)])
 
 
+HULL_DEFAULT = build_mod.HULL_DEFAULT
+
+
+def scene_eyeposition(arm_obj, scale=1.0):
+    """@156 off the armature in file units, or None when it carries no key."""
+    return export_mod.header_vectors(arm_obj, scale).get(mdl_mod.HDR_EYEPOSITION)
+
+
+def scene_hull(arm_obj, scale=1.0):
+    """The hull the armature carries, in file units, or None when it carries neither key.
+    One key alone takes the other from `mdl_build.HULL_DEFAULT`, which is what the panel
+    shows for an absent one."""
+    typed = export_mod.header_vectors(arm_obj, scale)
+    if mdl_mod.HDR_HULL_MIN not in typed and mdl_mod.HDR_HULL_MAX not in typed:
+        return None
+    return (typed.get(mdl_mod.HDR_HULL_MIN, HULL_DEFAULT[0]),
+            typed.get(mdl_mod.HDR_HULL_MAX, HULL_DEFAULT[1]))
+
+
 def fit_hull(mesh_objs, scale=1.0, arm_obj=None):
     """(min, max) over every vertex handed in, in file units, or None when there are none.
 
-    A starting point and not a truth: @180/@192 is the movement hull the .qc's `$hbox`
+    A starting point and not a truth: @180/@192 is the movement hull the .qc's `$bbox`
     sets, which is why `build` takes it from the caller rather than deriving it. Without
     one `mdl_build.new` leaves (-16,-16,0)..(16,16,72), so a bat claims a humanoid volume.
     Mesh-local like `split_mesh`: both operators call it inside `placed`, which bakes the
@@ -1077,6 +1102,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
                           **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
+            "hull_inverted": export_mod.inverted_axes(d),
             "with_root_motion": moved, "unfitted": unfitted,
             "unkeepable": unkeepable,
             "bodyparts": len(d.bodyparts), "materials": len(d.textures),

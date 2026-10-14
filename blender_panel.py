@@ -83,6 +83,32 @@ def _loops_set(action, value):
     action["vtmb_seq_flags"] = (flags | 1) if value else (flags & ~1)
 
 
+# What an absent key shows when no imported file can be read either, and what the no-donor
+# export writes for it.
+HDR_SHOWN = {"vtmb_eyeposition": (0.0, 0.0, 0.0),
+             "vtmb_hull_min": blender_scratch.HULL_DEFAULT[0],
+             "vtmb_hull_max": blender_scratch.HULL_DEFAULT[1]}
+
+
+def _hdr_get(obj, key):
+    """The key, else the imported file's value, which is what the export writes for an
+    absent key, so Blender's set of all three after a one-component edit keeps the other
+    two."""
+    v = obj.get(key)
+    if v is not None:
+        return tuple(float(c) for c in v)
+    got = blender_export.source_vectors(obj.get("vtmb_source")).get(
+        dict(blender_export.HDR_VECTORS)[key])
+    if got is None:
+        return HDR_SHOWN[key]
+    scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
+    return tuple(c * scale for c in got)
+
+
+def _hdr_set(obj, key, value):
+    obj[key] = [float(c) for c in value]
+
+
 def _activity_get(action):
     return str(action.get("vtmb_activity") or "")
 
@@ -1461,6 +1487,19 @@ class VTMB_PT_armature(bpy.types.Panel):
 
         lay.operator(VTMB_OT_check_paths.bl_idname, icon="VIEWZOOM")
 
+        col = lay.column(align=True)
+        col.label(text="Model header, in the armature's space", icon="OBJECT_ORIGIN")
+        for key, _off in blender_export.HDR_VECTORS:
+            col.prop(obj, key + "_xyz")
+        if any(obj.get(key) is None for key, _off in blender_export.HDR_VECTORS):
+            if blender_export.source_vectors(obj.get("vtmb_source")):
+                col.label(text="an unset one is read off the imported file", icon="INFO")
+            else:
+                col.label(text="an unset one is not in any file this armature names: what "
+                               "is shown is what the no-donor export writes", icon="ERROR")
+                col.label(text="a donor export keeps the donor's, until one component is "
+                               "edited, which sets all three")
+
 
 def draw_action_fields(lay, act, arm_obj=None):
     """The three per-action fields, wherever they are hosted.
@@ -2745,6 +2784,20 @@ _PROPS = (
 )
 
 
+HDR_PROPS = (
+    ("vtmb_eyeposition", "Eye position",
+     "studiohdr_t eyeposition, relative to the model's origin. vampire.dll reads it in "
+     "GetEyePosition, 10428310; 326 of 4445 shipped models set it, and (0, 0, 0) is the "
+     "origin. Which game code asks for it is not established"),
+    ("vtmb_hull_min", "Hull min",
+     "studiohdr_t hull_min, the .qc's $bbox: the box the engine starts the model's bounds "
+     "from, which the playing sequence's box only widens. The export dialog's fit option "
+     "overrides it"),
+    ("vtmb_hull_max", "Hull max",
+     "studiohdr_t hull_max, the other corner of the same box"),
+)
+
+
 def register_props():
     for attr, key, name, desc in _PROPS:
         setattr(bpy.types.Object, attr, bpy.props.StringProperty(
@@ -2801,6 +2854,11 @@ def register_props():
                     "set because no shipped record is partly written -- all eight are "
                     "names on 392 records and all eight are absent on 210 -- and because "
                     "an index the file has not got is appended rather than refused")
+    for key, name, desc in HDR_PROPS:
+        setattr(bpy.types.Object, key + "_xyz", bpy.props.FloatVectorProperty(
+            name=name, description=desc, size=3, subtype="XYZ",
+            get=(lambda k: lambda self: _hdr_get(self, k))(key),
+            set=(lambda k: lambda self, v: _hdr_set(self, k, v))(key)))
     bpy.types.Object.vtmb_action_index = bpy.props.IntProperty(
         name="Action", default=0, min=0,
         description="Which of the blend's actions the VTMB animations list is on. It "
@@ -2842,6 +2900,9 @@ def unregister_props():
             delattr(bpy.types.Object, attr)
     if hasattr(bpy.types.Object, "vtmb_action_index"):
         del bpy.types.Object.vtmb_action_index
+    for key, _name, _desc in HDR_PROPS:
+        if hasattr(bpy.types.Object, key + "_xyz"):
+            delattr(bpy.types.Object, key + "_xyz")
     names = ["vtmb_cloth_on", "vtmb_cloth_flip_on", "vtmb_cloth_preset_name",
              "vtmb_cloth_pin_text", "vtmb_eyeball_lids"]
     for k, _l, _lo, _hi, _d in CLOTH_NUMBERS:
