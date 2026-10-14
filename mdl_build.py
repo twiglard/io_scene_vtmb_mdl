@@ -2144,6 +2144,9 @@ def add_material(d, name, cdtexture=None):
 MAX_VERTANIM1_DELTA = M.FLEX_POSITION_DELTA_SCALE
 # 32767, from the signed short the reader sign-extends at 0x2c0509a8 and 0x2c050af0.
 MAXSTUDIOFLEXVERTS = 32767
+# studiomdl.cpp:2649-2652, on 13 551 of 16 408 shipped rule-driven flexes. R_StudioFlexVerts
+# 0x2c050860 skips a flex unless target0 < w < target3, so all-zero is never drawn.
+FLEX_TARGET = (0.0, 1.0, 10.0, 11.0)
 
 
 def _flex_records(records, vertanimtype):
@@ -2184,8 +2187,10 @@ def flexdesc_index(d, name):
     return len(d.flexdescs) - 1
 
 
-def add_flex(d, bi, mi, k, name, records, target=(0.0, 0.0, 0.0, 0.0)):
+def add_flex(d, bi, mi, k, name, records, target=None):
     """One `mstudioflex_t` on mesh `k`, its payload encoded from `records`.
+
+    `target` is the four ramp points; None is `FLEX_TARGET`.
 
     `records` is [(mesh-local index, position delta, normal delta), ...], the deltas at
     flex weight 1 in the file's own units. The form is chosen by what the deltas need:
@@ -2218,12 +2223,44 @@ def add_flex(d, bi, mi, k, name, records, target=(0.0, 0.0, 0.0, 0.0)):
             break
     raw = bytearray(32)
     struct.pack_into("<i", raw, 0x00, flexdesc_index(d, name))
-    struct.pack_into("<4f", raw, 0x04, *target)
+    struct.pack_into("<4f", raw, 0x04, *(FLEX_TARGET if target is None else target))
     struct.pack_into("<i", raw, 0x14, len(records))
     struct.pack_into("<i", raw, 0x1c, vertanimtype)
     mesh.kids.append(Rec(raw, None, None,
                          {"payload": _flex_records(records, vertanimtype)}))
     return len(mesh.kids) - 1
+
+
+def driven_flexdescs(d):
+    """The flexdesc slots something weights: a flex rule's target, or an eyeball's eight.
+
+    16 408 shipped flexes sit on a rule's slot, 1 652 on an eyeball's, none elsewhere. All
+    eight at zero is an eyeball with no lid flexes, so it names no slot.
+    """
+    out = {struct.unpack_from("<i", r.raw, 0)[0] for r in d.flexrules}
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            for e in (mr.extra or {}).get("eyes") or ():
+                ids = (struct.unpack_from("<6i", e.raw, 0x44)
+                       + struct.unpack_from("<2i", e.raw, 0x74))
+                if any(ids):
+                    out.update(ids)
+    return out
+
+
+def undriven_flexes(d):
+    """The names of the flexes nothing weights, sorted, each once."""
+    driven = driven_flexdescs(d)
+    out = set()
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            for mesh in mr.kids:
+                for f in mesh.kids:
+                    fd = struct.unpack_from("<i", f.raw, 0)[0]
+                    if fd not in driven:
+                        out.add(d.flexdescs[fd].name if 0 <= fd < len(d.flexdescs)
+                                else "#%d" % fd)
+    return sorted(out)
 
 
 def clear_flexes(d, bi, mi):

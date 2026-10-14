@@ -1405,6 +1405,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name, why in mesh["flex_refused"]:
             self.report({"WARNING"},
                         "%s: no shape key could be written -- %s" % (name, why))
+        undriven = mesh.get("flex_undriven") or ()
+        if undriven:
+            self.report({"WARNING"},
+                        "%d flex%s written that no flex rule or eyeball names, so the "
+                        "game never draws %s: %s. Add a rule for each in VTMB flex "
+                        "controllers"
+                        % (len(undriven), "" if len(undriven) == 1 else "es",
+                           "it" if len(undriven) == 1 else "them", ", ".join(undriven)))
         vtx = r.get("vtx")
         if vtx is not None:
             self.report({"INFO"}, "%s rewritten, %d bytes over %d strip groups"

@@ -1538,8 +1538,8 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
             continue
         # The target the file carried, matched by the name the import assigned rather
         # than by position: a key renamed or reordered in Blender must not take another
-        # flex's numbers.
-        t = (0.0, 0.0, 0.0, 0.0)
+        # flex's numbers. A key the file did not carry gets studiomdl's default.
+        t = None
         if kb.name in names:
             at = names.index(kb.name)
             if at < len(targets):
@@ -4424,6 +4424,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             mesh["flex_skipped"] += skipped
             if why:
                 mesh["flex_refused"].append((obj.name, why))
+    # Whether or not the keys were written: a rule deleted in the panel leaves its flex
+    # undriven just the same.
+    mesh["flex_undriven"] = build_mod.undriven_flexes(d)
 
     # After the geometry: a rest length is refitted against where the vertex now sits, and
     # a rebuilt model has just moved them.
