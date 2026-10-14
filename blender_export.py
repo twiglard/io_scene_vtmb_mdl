@@ -3457,6 +3457,9 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     moves = {"added": [], "removed": [], "reordered": 0, "orphans": [],
              "autolayers_lost": [], "dangling": [], "missing": [], "twice": []}
     index = {n: k for k, n in enumerate(anim_names)}
+    seen, carried_twice = set(), set()
+    for name in anim_names:
+        (carried_twice if name in seen else seen).add(name)
     n = 0
 
     # Resolved to the record OBJECT before anything is dropped: a removal renumbers every
@@ -3545,6 +3548,7 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
             if rec.extra.get("activity") != activity:
                 rec.extra["activity"], n = activity, n + 1
         blends = [list(col) for col in s.get("blends") or []]
+        hint = [list(col) for col in s.get("blend_index") or []]
         gx, gy = len(blends), max((len(c) for c in blends), default=0)
         # The grid sits inside the 764-byte record at a 0x20 stride, so one that would run
         # past it is left alone rather than written over the fields behind it.
@@ -3567,6 +3571,22 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
                 if a < 0:
                     raise ValueError("sequence %r blends animation %r, which the file does "
                                      "not have" % (rec.name, name))
+                if name in carried_twice:
+                    # The name cannot say which copy, and `index` holds the last: the
+                    # stash's own index where it still names this animation, else the
+                    # word the record carries.
+                    h = hint[x][y] if x < len(hint) and y < len(hint[x]) else None
+                    w = struct.unpack_from("<h", rec.raw, at)[0]
+                    if (h is not None and 0 <= int(h) < len(anim_names)
+                            and anim_names[int(h)] == name):
+                        a = int(h)
+                    elif 0 <= w < len(anim_names) and anim_names[w] == name:
+                        a = w
+                    else:
+                        raise ValueError(
+                            "sequence %r blends animation %r, which the file carries %d "
+                            "times, and neither the stash nor the record says which"
+                            % (rec.name, name, anim_names.count(name)))
                 if struct.unpack_from("<h", rec.raw, at)[0] != a:
                     n += 1
                 struct.pack_into("<h", rec.raw, at, a)
