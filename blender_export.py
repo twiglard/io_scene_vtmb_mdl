@@ -832,6 +832,35 @@ def renamed_models(m, source):
     return out
 
 
+def renamed_bodyparts(m, source):
+    """{bodypart index: the name the scene now gives it} for the bodyparts renamed.
+
+    The import stamps `mstudiobodyparts_t`'s name as `vtmb_bodypart` on each object of the
+    bodypart, and the panel renames them together. Only an object carrying `vtmb_index` is
+    read: one an older version imported is matched by that name, so renaming it there makes
+    it a new model. Two objects of one bodypart giving it two new names cannot both be
+    written.
+    """
+    got = {}
+    for (bi, _mi), obj in mesh_objects(m, source).items():
+        name = obj.get("vtmb_bodypart")
+        if obj.get("vtmb_index") is None or name is None:
+            continue
+        if str(name) != m.bodyparts[bi].name:
+            got.setdefault(bi, {}).setdefault(str(name), []).append(obj.name)
+    out = {}
+    for bi, names in sorted(got.items()):
+        if len(names) > 1:
+            raise build_mod.Refused(
+                "bodypart %r is renamed %s; a bodypart has one name, and the Bodypart "
+                "field sets it on every object of the bodypart at once"
+                % (m.bodyparts[bi].name,
+                   " and ".join("%r by %s" % (n, ", ".join(sorted(objs)))
+                                for n, objs in sorted(names.items()))))
+        out[bi] = next(iter(names))
+    return out
+
+
 def _per_vertex(me, count, get, skip=None):
     """Every distinct per-loop value each vertex carries, as a list per vertex."""
     out = [[] for _ in range(count)]
@@ -4016,6 +4045,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     remodelled = renamed_models(m, source)
     for (bi, mi), name in sorted(remodelled.items()):
         build_mod.set_model_name(d, bi, mi, name)
+    # A bodypart's name is a string-table offset, and `mdl_build.emit` lays the table out.
+    rebodied = renamed_bodyparts(m, source)
+    for bi, name in sorted(rebodied.items()):
+        d.bodyparts[bi].name = name
     if model_name and model_name != d.name:
         d.name = model_name
     else:
@@ -4416,6 +4449,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             # already in it. `emit` is what runs the fit, so this is read after it.
             "requant_bones": d.requant_bones, "requant_carried": d.requant_carried,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
+            "rebodied": sorted((v, k) for k, v in rebodied.items()),
             "includes": [r.name for r in d.includes],
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
                       if (revised or removed or added_bones or cloth_removed) else []),

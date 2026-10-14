@@ -11,6 +11,7 @@ material.
 
 import os
 import re
+import struct
 
 import bpy
 import mathutils
@@ -1052,6 +1053,86 @@ class VTMB_PT_hitbox(bpy.types.Panel):
     def draw(self, context):
         self.layout.use_property_split = False
         draw_hitbox(self.layout, context.object)
+
+
+_MODEL_COUNTS = {}
+
+
+def _model_counts(path):
+    """[models per bodypart] off the file at `path`, cached on its mtime and size, since the
+    panel asks on every redraw."""
+    st = os.stat(path)
+    stamp = (st.st_mtime_ns, st.st_size)
+    got = _MODEL_COUNTS.get(path)
+    if got is None or got[0] != stamp:
+        got = stamp, [len(bp.models) for bp in mdl_mod.Mdl(path).bodyparts]
+        _MODEL_COUNTS[path] = got
+    return got[1]
+
+
+def bodypart_objects(obj):
+    """`obj` and every object of its bodypart, which the export reads one name off.
+
+    The bodypart is found off the parent's `vtmb_source`, whose model counts turn each
+    `vtmb_index` into a bodypart index; a name is no key, since two shipped files repeat
+    one. Where that file cannot be read, the siblings sharing `obj`'s current name.
+    """
+    par = obj.parent
+    kids = [o for o in (par.children if par is not None else (obj,))
+            if o.type == "MESH" and o.get("vtmb_index") is not None]
+    if obj not in kids:
+        return [obj]
+    try:
+        counts = _model_counts(par["vtmb_source"])
+    except (KeyError, OSError, TypeError, ValueError, struct.error):
+        name = obj.get("vtmb_bodypart")
+        return [o for o in kids if o.get("vtmb_bodypart") == name]
+
+    def part(gi):
+        for bi, n in enumerate(counts):
+            if gi < n:
+                return bi
+            gi -= n
+        return None
+    bi = part(int(obj["vtmb_index"]))
+    if bi is None:
+        return [obj]
+    return [o for o in kids if part(int(o["vtmb_index"])) == bi]
+
+
+def _bodypart_set(obj, value):
+    for o in bodypart_objects(obj):
+        o["vtmb_bodypart"] = value
+
+
+def draw_bodypart(layout, obj):
+    """The bodypart name, editable where the export finds the object by `vtmb_index`."""
+    if obj.get("vtmb_index") is None:
+        layout.label(text="bodypart %r: this import predates vtmb_index, so the export "
+                          "finds the mesh by this name -- import again to rename it"
+                          % str(obj["vtmb_bodypart"]), icon="INFO")
+        return
+    layout.prop(obj, "vtmb_bodypart_text")
+    n = len(bodypart_objects(obj))
+    if n > 1:
+        layout.label(text="renames the bodypart on all %d of its objects" % n)
+
+
+class VTMB_PT_bodypart(bpy.types.Panel):
+    bl_label = "VTMB bodypart"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None and context.object.type == "MESH"
+                and context.object.get("vtmb_bodypart") is not None)
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_bodypart(self.layout, context.object)
 
 
 class VTMB_PT_eyeball(bpy.types.Panel):
@@ -2824,7 +2905,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line,
-           VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_flex,
+           VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,
            VTMB_OT_move_sequence, VTMB_OT_set_blend, VTMB_OT_resize_blends,
@@ -2921,6 +3002,13 @@ def register_props():
             name=name, description=desc, size=3, subtype="XYZ",
             get=(lambda k: lambda self: _hdr_get(self, k))(key),
             set=(lambda k: lambda self, v: _hdr_set(self, k, v))(key)))
+    bpy.types.Object.vtmb_bodypart_text = bpy.props.StringProperty(
+        name="Bodypart",
+        description="mstudiobodyparts_t's name, which the export writes for this mesh's "
+                    "bodypart. Every object of the bodypart takes the edit. vampire.dll "
+                    "carries the string FindBodygroupByName, but no shipped script, map, "
+                    "config or animation event names a bodypart",
+        get=lambda self: str(self.get("vtmb_bodypart") or ""), set=_bodypart_set)
     bpy.types.Object.vtmb_action_index = bpy.props.IntProperty(
         name="Action", default=0, min=0,
         description="Which of the blend's actions the VTMB animations list is on. It "
@@ -2978,7 +3066,7 @@ def unregister_props():
         if hasattr(bpy.types.Object, key + "_xyz"):
             delattr(bpy.types.Object, key + "_xyz")
     names = ["vtmb_cloth_on", "vtmb_cloth_flip_on", "vtmb_cloth_preset_name",
-             "vtmb_cloth_pin_text", "vtmb_eyeball_lids"]
+             "vtmb_cloth_pin_text", "vtmb_eyeball_lids", "vtmb_bodypart_text"]
     for k, _l, _lo, _hi, _d in CLOTH_NUMBERS:
         names += ["vtmb_cloth_%s_on" % k, "vtmb_cloth_%s_num" % k]
     for attr in names:

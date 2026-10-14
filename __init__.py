@@ -1635,6 +1635,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name, (bi, mi) in r.get("remodelled") or []:
             self.report({"INFO"}, "model %d.%d is now named %r in the file"
                         % (bi, mi, name))
+        for name, bi in r.get("rebodied") or []:
+            self.report({"INFO"}, "bodypart %d is now named %r in the file" % (bi, name))
         if r.get("model_name"):
             self.report({"INFO"}, "the file now calls itself %r" % r["model_name"])
         if r.get("cdtexture"):
