@@ -3546,8 +3546,8 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
         n += _apply_seq_tail(rec, s, labels, bones)
     # After the grid, not inside the loop: which animation a sequence names is what picks
     # the action, and the stash has just rewritten it.
-    for k, act in _first_citers(d, actions).items():
-        n += _apply_seq_action(d.seqs[k], act)
+    for k, acts in _first_citers(d, actions).items():
+        n += _apply_seq_action(d.seqs[k], acts)
     # Last, off the grid the stash has just written. 0 of the 4445 shipped models carry an
     # animation two sequences cite, so an added sequence naming one another already plays
     # makes the first of them, and `_action_seq` reaches only the earlier of the two.
@@ -3561,12 +3561,14 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
 
 
 def _first_citers(d, actions):
-    """{sequence index: action}, one sequence per animation and the first that names it.
+    """{sequence index: [action, ...]}, each animation going to the first sequence naming it.
 
     The import stamps `vtmb_seq_flags` and `vtmb_activity` from the first sequence citing
     each animation, so that is the one sequence an action can be read back into. Handing
     the value to every citer instead would let one sequence's flags overwrite another's on
-    a plain re-export, which is the one thing this must not cost.
+    a plain re-export, which is the one thing this must not cost. A blend grid is the first
+    citer of every animation in it, so its sequence gets all of their actions -- eight on
+    andrei's `run`, 591 animations over 23 shipped models.
     """
     if not actions:
         return {}
@@ -3586,11 +3588,30 @@ def _first_citers(d, actions):
                     continue
                 taken.add(a)
                 if a in actions:
-                    out.setdefault(k, actions[a])
+                    out.setdefault(k, []).append(actions[a])
     return out
 
 
-def _apply_seq_action(rec, act):
+def _seq_action_value(rec, acts, key, have, conv):
+    """The one value `acts` set `key` to where it differs from `have`, else `have`.
+
+    Every action of one sequence was stamped with the same value, so the one that differs
+    is the edit. Two that differ from the file and from each other cannot both be written.
+    """
+    got = {}
+    for act in acts:
+        v = act.get(key)
+        if v is not None and conv(v) != have:
+            got.setdefault(conv(v), []).append(act.name)
+    if len(got) > 1:
+        raise build_mod.Refused(
+            "sequence %r is the first to cite %s, which set %s to %s; a sequence holds one"
+            % (rec.name, ", ".join(sorted(n for names in got.values() for n in names)),
+               key, " and ".join(repr(v) for v in got)))
+    return next(iter(got), have)
+
+
+def _apply_seq_action(rec, acts):
     """The two sequence fields the panel puts on an Action, after the stash has had its
     say. Returns what moved.
 
@@ -3598,20 +3619,16 @@ def _apply_seq_action(rec, act):
     present and empty is a sequence with no activity, which is the only way a donor's own
     comes off.
     """
-    if act is None:
-        return 0
     n = 0
-    flags = act.get("vtmb_seq_flags")
-    if flags is not None:
-        flags = int(flags)
-        if struct.unpack_from("<i", rec.raw, mdl_mod.SEQ_FLAGS)[0] != flags:
-            n += 1
+    have = struct.unpack_from("<i", rec.raw, mdl_mod.SEQ_FLAGS)[0]
+    flags = _seq_action_value(rec, acts, "vtmb_seq_flags", have, int)
+    if flags != have:
         struct.pack_into("<i", rec.raw, mdl_mod.SEQ_FLAGS, flags)
-    activity = act.get("vtmb_activity")
-    if activity is not None:
-        activity = str(activity)
-        if rec.extra.get("activity") != activity:
-            rec.extra["activity"], n = activity, n + 1
+        n += 1
+    have = rec.extra.get("activity")
+    activity = _seq_action_value(rec, acts, "vtmb_activity", have, str)
+    if activity != have:
+        rec.extra["activity"], n = activity, n + 1
     return n
 
 
