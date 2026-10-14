@@ -3,8 +3,9 @@
 `blender_export` rewrites a file that already exists: it opens with `Mdl(source)` and
 carries every record the scene does not supply. This does not open anything. The armature
 becomes `mstudiobone_t[]`, the mesh objects become bodyparts, the actions become animations
-and one sequence each, and everything the format holds that no scene expresses -- cloth,
-flex, eyeballs, spring bones, procedural bones, IK -- is emitted with a count of zero.
+and one sequence each. Attachments, hitboxes, the include chain, cloth and spring bone
+chains are written from the scene too. Everything else is emitted with a count of zero, and
+`SCRATCH_DROPS` in `__init__` is the list of it the export dialog prints.
 
 The rest pose is re-derived from the armature rather than carried. That costs `2.198e-04`
 units of bone translation and `6.386e-04` units of vertex displacement at r=8 worst over
