@@ -228,7 +228,7 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
     v = W.VtxFile(vtx_path)
     if fixed_function is None:
         fixed_function = os.path.basename(vtx_path).endswith(".dx7_2bone.vtx")
-    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0)
+    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0, boned=0)
     ri = 0
     for i, bp in enumerate(v.bodyparts):
         for j, model in enumerate(bp.models):
@@ -309,9 +309,32 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
     return v.to_bytes(), st
 
 
+def _binds_off_bone0(src_mesh, orig_ids, verts):
+    """Whether a vertex of these binds a bone other than 0 at a weight above zero."""
+    for orig in orig_ids:
+        i = src_mesh.vertexoffset + orig
+        if not 0 <= i < len(verts):
+            continue
+        vert = verts[i]
+        if any(vert.bones[q] != 0 and vert.weights[q] > 0.0
+               for q in range(min(4, vert.numbones))):
+            return True
+    return False
+
+
 def _fill(v, src_mesh, verts, cells, st):
-    """Each strip group of `cells` rebuilt from its (group, vertex ids, triangles)."""
+    """Each strip group of `cells` rebuilt from its (group, vertex ids, triangles).
+
+    A 2-byte group's strips carry no bone state change, and every shipped one binds bone 0
+    alone -- 6503 groups over the `.dx80.vtx` files, none binding another bone -- so a group
+    whose vertices now bind another bone becomes 12-byte boned, as all 773 shipped
+    multi-bone filetype-0 models store theirs. `st["boned"]` counts them.
+    """
     for grp, orig, tris in cells:
+        if (not grp.flags & W.SG_VERTS_ARE_BONED
+                and _binds_off_bone0(src_mesh, orig, verts)):
+            grp.flags = (grp.flags & ~W.SG_VERTS_ARE_PLAIN) | W.SG_VERTS_ARE_BONED
+            st["boned"] += 1
         vb = (vertex_bones(src_mesh, orig, verts)
               if grp.flags & W.SG_VERTS_ARE_BONED else None)
         W.rebuild_group(grp, orig, tris, vb, max_bones=v.maxbones_strip,

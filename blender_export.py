@@ -1242,6 +1242,24 @@ def outside_box(me, model, box=None):
                       for c in range(3)))
 
 
+def off_bone0(obj, model, bone_index):
+    """How many vertices of a quantised model are weighted to a bone other than bone 0.
+
+    A filetype 1 or 2 record has no bone or weight field and StudioRender `0x2c018720`
+    binds every such vertex to bone 0 at 255, so the import puts each one in bone 0's group
+    at 1.0 and any other weight past `WEIGHT_FLOOR` is an edit only filetype 0 can hold. A
+    group naming no bone is `stray_groups`' to report and counts nothing here.
+    """
+    if model.filetype not in mdl_mod.QUANT_MAX:
+        return 0
+    other = {g.index for g in obj.vertex_groups if bone_index.get(g.name) not in (None, 0)}
+    if not other:
+        return 0
+    return sum(1 for v in obj.data.vertices
+               if any(g.group in other and g.weight > mesh_mod.WEIGHT_FLOOR
+                      for g in v.groups))
+
+
 def rebased_box(model, place):
     """(offset, scale) of the quantisation box a quantised model moved by `placed` takes, or
     None where the move has no such box.
@@ -1536,8 +1554,9 @@ def read_meshes(m, source, fields, boxes=None):
         odd = stray_groups(obj, bone_index)
         if odd:
             stray.append((obj.name, odd))
-        if _must_rebuild(obj, mo, ok, donor_faces.get((bi, mi)),
-                         (boxes or {}).get((bi, mi))):
+        if (_must_rebuild(obj, mo, ok, donor_faces.get((bi, mi)),
+                          (boxes or {}).get((bi, mi)))
+                or ("weights" in fields and off_bone0(obj, mo, bone_index))):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.
             rebuild[(bi, mi)] = obj
@@ -4190,7 +4209,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         was = mo.numvertices
         if mo.filetype in mdl_mod.QUANT_MAX:
             mesh["dequantised"].append((obj.name, mo.filetype,
-                                        outside_box(obj.data, mo, boxes.get((bi, mi)))))
+                                        outside_box(obj.data, mo, boxes.get((bi, mi))),
+                                        off_bone0(obj, mo, bone_index)
+                                        if "weights" in mesh_fields else 0))
         tri = donor_faces.get((bi, mi))
         faces, unskinned, kept, edits = rebuild_cell(
             d, obj, bi, mi, bone_index, mesh_fields,

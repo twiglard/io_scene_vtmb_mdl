@@ -1252,12 +1252,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"INFO"}, "%s keeps filetype %d: it is only shifted or scaled "
                                   "evenly, so its quantisation box moves with it and no "
                                   "vertex record changes" % (name, ft))
-        for name, ft, out in mesh.get("dequantised") or ():
+        for name, ft, out, weighted in mesh.get("dequantised") or ():
+            why = []
             if out:
-                self.report({"WARNING"}, "%s has %d vertices outside the box its filetype %d "
-                                         "positions are quantised into, so it is written as "
-                                         "filetype 0, 44 bytes of floats per vertex"
-                            % (name, out, ft))
+                why.append("%d vertices outside the box its filetype %d positions are "
+                           "quantised into" % (out, ft))
+            if weighted:
+                why.append("%d vertices weighted to a bone other than bone 0, which a "
+                           "filetype %d record has no field for" % (weighted, ft))
+            if why:
+                self.report({"WARNING"}, "%s has %s, so it is written as filetype 0, 44 "
+                                         "bytes of floats per vertex"
+                            % (name, " and ".join(why)))
             else:
                 self.report({"INFO"}, "%s was filetype %d, quantised, and is written as "
                                       "filetype 0, 44 bytes of floats per vertex" % (name, ft))
@@ -1400,6 +1406,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for x in r.get("vtx_more") or ():
             self.report({"INFO"}, "%s rewritten too, %d bytes over %d strip groups"
                         % (os.path.basename(x["path"]), x["bytes"], x["groups"]))
+        for x in ([vtx] if vtx is not None else []) + list(r.get("vtx_more") or ()):
+            if x.get("boned"):
+                self.report({"INFO"}, "%s: %d strip group%s now 12 bytes a vertex, since "
+                                      "a 2-byte one binds bone 0 alone and %s vertices "
+                                      "bind another bone"
+                            % (os.path.basename(x["path"]), x["boned"],
+                               "" if x["boned"] == 1 else "s",
+                               "its" if x["boned"] == 1 else "their"))
         for name in r["stale"]:
             self.report({"WARNING"}, "%s beside the model still describes the old "
                                      "geometry and was not rewritten" % name)
