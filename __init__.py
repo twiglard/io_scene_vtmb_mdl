@@ -1950,7 +1950,9 @@ SCRATCH_DROPS = (
     "eyeballs, mouths and pose parameters",
     ("procedural bones, IK chains and bone controllers -- a spring bone chain "
      "authored on a bone IS written"),
-    "sequence events and autolayers",
+    ("the imported sequence list -- one sequence per action is written in its place, named "
+     "after the action, so the imported labels, order, blend grids, events, autolayers and "
+     "tail fields are lost"),
     "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
     ("which hitbox set the engine selects at runtime -- the boxes and the sets "
      "themselves ARE written, whatever Fit hitboxes says"),
@@ -1976,6 +1978,22 @@ def _scratch_cdtexture(arm_obj):
     would otherwise be the one part of the dialog no check can see.
     """
     return ";".join(blender_scratch.scene_cdtextures(arm_obj)) or "models/"
+
+
+def _scratch_sequences(arm_obj, actions):
+    """(imported, written, blend grids imported) for the dialog, or None with no stash.
+
+    Reachable without a window for the reason `_scratch_cdtexture` is. A grid is a sequence
+    whose group spans more than one animation.
+    """
+    stash = arm_obj.get("vtmb_sequences")
+    if not stash:
+        return None
+    grids = 0
+    for s in stash:
+        g = list(s.get("groupsize") or (1, 1))
+        grids += g[0] * g[1] > 1
+    return len(stash), len(actions), grids
 
 
 def _unresolved(context, arm_obj, filepath, includes, cdtextures):
@@ -2301,6 +2319,12 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
 
         box = _section(lay, "vtmb_s_drops", "Not written", icon="LOCKED")
         if box is not None:
+            seqs = _scratch_sequences(obj, actions)
+            if seqs is not None:
+                _pair(box, "sequences", "%d imported, %d written" % seqs[:2], icon="ERROR")
+                if seqs[2]:
+                    _pair(box, "blend grids", "%d imported, 0 written" % seqs[2],
+                          icon="ERROR")
             for line in SCRATCH_DROPS:
                 box.label(text=line)
 
