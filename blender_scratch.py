@@ -595,18 +595,17 @@ def add_cloth(d, obj, verts, faces, npin, flip=False, origins=None):
     return c, blob
 
 
-def refuse_empty(d):
-    """A model with no bodypart is refused rather than written.
+def meshless_model(d):
+    """Where the scene wrote no bodypart, one holding one model of no mesh, as `null.mdl`
+    and 11 more shipped files carry. True when it wrote one.
 
-    Named so a check can restore the pre-fix form, which reached `vtx_write.to_bytes` and
-    died on `at["bodyparts"]` -- `_layout` assigns no offset to a zero-sized array, and
-    that one read has no default where `at.get("matrepl", 0)` beside it does. 0 of the
-    4445 shipped models carry `numbodyparts` 0.
+    0 of the 4445 shipped models carry `numbodyparts` 0, and zero bodyparts reach
+    `vtx_write.to_bytes` and die on `at["bodyparts"]`, which is BUGS 135.
     """
-    if not d.bodyparts:
-        raise Refused("the scene has no mesh, so there is no bodypart to write and the "
-                      "engine would draw nothing of the model. Parent a mesh to the "
-                      "armature, or give one an armature modifier naming it")
+    if d.bodyparts:
+        return False
+    build_mod.add_model(d, [], model="null")
+    return True
 
 
 def add_mesh_flexes(d, obj, bi, origins, scale=1.0):
@@ -1364,7 +1363,9 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     face = {"flexes": 0, "flex_records": 0, "eye_meshes": []}
     faces, unskinned, kept, crowded, cloths, stray = add_meshes(
         d, mesh_objs, bone_index, scale, owners, face)
-    refuse_empty(d)
+    face["meshless"] = meshless_model(d)
+    if face["meshless"]:
+        faces = list(d.faces)
     # Keys first, then rules, then lids and the mouth: each appends the flexdescs it names
     # and the file lacks, and only the last two are reported, since nothing weights them.
     face["controllers"], face["rules"], face["rule_flexdescs"] = export_mod.apply_flex(
@@ -1515,4 +1516,4 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "unskinned": unskinned, "dropped": dict(d.dropped),
             "cloths": cloths, "stray_groups": stray,
             "scene_hitboxes": hbox[0:2], "refit_hitboxes": hbox[2],
-            "lods": st["lods"]}
+            "lods": st["lods"], "meshless": face["meshless"]}

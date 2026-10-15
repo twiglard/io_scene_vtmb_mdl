@@ -2309,9 +2309,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                                   "" if len(meshes) == 1 else "s"),
                   icon="NONE" if meshes else "ERROR")
             if not meshes:
-                box.label(text="an export is refused: a model with no bodypart is "
-                               "one the engine draws nothing of",
-                          icon="ERROR")
+                box.label(text="one model of no mesh is written, as null.mdl ships, and "
+                               "the engine draws nothing of it",
+                          icon="INFO")
             no_uv = [o.name for o in meshes
                      if blender_export.uv_layer_of(o)[0] is None]
             if no_uv:
@@ -2440,6 +2440,10 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
         _report_placed(self, moved, None, set())
+        if r.get("meshless"):
+            self.report({"WARNING"}, "the scene has no mesh, so one bodypart holding one "
+                                     "model of no mesh was written, as null.mdl ships: "
+                                     "the engine draws nothing of it")
         if r["unskinned"]:
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "
                                      "bone 0, which drags them wherever it goes"
