@@ -1424,6 +1424,25 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "the model to edit each step on its own"
                         % (len(merged), "" if len(merged) == 1 else "s",
                            "it" if len(merged) == 1 else "them", ", ".join(merged)))
+        gone = mesh.get("flex_gone") or ()
+        if gone:
+            said = ["%s: %s%s" % (obj, key, "" if (key, n) == (fd, 1) else
+                                  " (flexdesc %s, step %d of %d)" % (fd, k, n) if n > 1
+                                  else " (flexdesc %s)" % fd)
+                    for obj, key, fd, k, n in gone]
+            self.report({"WARNING"},
+                        "%d of the file's flex steps not written, because no shape key "
+                        "is named for %s any more -- deleted or renamed: %s%s. A renamed "
+                        "key is written as a new flex under its new name; rename it back "
+                        "to keep the file's"
+                        % (len(gone), "it" if len(gone) == 1 else "them",
+                           ", ".join(said[:8]),
+                           " and %d more" % (len(said) - 8) if len(said) > 8 else ""))
+        for obj, n in mesh.get("flex_unkeyed") or ():
+            self.report({"INFO"},
+                        "%s has no shape key, so its %d flex record%s written as the file "
+                        "had them: deleting every key does not remove a flex"
+                        % (obj, n, " is" if n == 1 else "s are"))
         undriven = mesh.get("flex_undriven") or ()
         if undriven:
             self.report({"WARNING"},

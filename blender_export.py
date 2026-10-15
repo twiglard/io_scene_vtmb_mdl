@@ -1495,13 +1495,17 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
 
     `two` names the keys carried whole, and the edited ones an import older than
     `vtmb_flex_descs` made by summing a flexdesc's two records -- those are written as one
-    record, which the game draws as one step.
+    record, which the game draws as one step. `gone` names each of the file's (flexdesc,
+    target) records no key claims any more, which go unwritten, and `unkeyed` is how many
+    records a model with no shape key at all keeps as the file had them.
     """
     from . import blender_scratch as scratch_mod
     me = obj.data
     keys = me.shape_keys
-    two = {"carried": [], "merged": []}
+    two = {"carried": [], "merged": [], "gone": [], "unkeyed": 0}
     if keys is None or len(keys.key_blocks) < 2:
+        # No key is read as no edit, so deleting every key cannot remove a flex.
+        two["unkeyed"] = sum(len(x.kids) for x in d.bodyparts[bi].kids[mi].kids)
         return 0, 0, 0, None, two
     runs = scratch_mod.original_runs(obj, me)
     if runs is None:
@@ -1527,6 +1531,7 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     # had it. Key order differs from the file's on 71 of the 195 flexed models.
     place = {id(rec): j for mesh in meshes for j, rec in enumerate(mesh.kids)}
     rank = {}
+    claimed = set()
     build_mod.clear_flexes(d, bi, mi)
     nkeys = nrec = skipped = nnew = 0
     for kb in blocks[1:]:
@@ -1554,6 +1559,7 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
         # a key holding their sum then moves nothing.
         slot, summed = {}, False
         if group is not None:
+            claimed.add((fd, None) if descs is None else (fd, build_mod.flex_target_key(t)))
             recs, total = group
             for k, rec in recs:
                 slot.setdefault(k, place[id(rec)])
@@ -1595,7 +1601,32 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
             rank[id(meshes[k].kids[-1])] = (0, slot[k]) if k in slot else (1, nnew)
             nrec += len(recs)
     _file_order(meshes, rank)
+    two["gone"] = _unclaimed(held, claimed, names, descs, targets)
     return nkeys, nrec, skipped, None, two
+
+
+def _unclaimed(held, claimed, names, descs, targets):
+    """Each file record group no key claimed, as the key name the import gave it, its
+    flexdesc, and which of that flexdesc's steps it is: [(key, flexdesc, k, n)].
+
+    A deleted key and a renamed one both land here: the stamps pair a key by its name.
+    """
+    steps = {}
+    for fd, t in held:
+        steps.setdefault(fd, []).append(t)
+    out = []
+    for fd, t in held:
+        if (fd, t) in claimed:
+            continue
+        key = fd
+        for at, name in enumerate(names if descs is not None else ()):
+            if (at < len(descs) and str(descs[at]) == fd and at < len(targets)
+                    and build_mod.flex_target_key(
+                        tuple(float(c) for c in targets[at])) == t):
+                key = name
+                break
+        out.append((key, fd, steps[fd].index(t) + 1, len(steps[fd])))
+    return out
 
 
 def _file_order(meshes, rank):
@@ -4391,7 +4422,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_rebuilt": [], "cloth_renumbered": [], "cloth_carried": [],
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
-            "flex_carried": [], "flex_merged": [],
+            "flex_carried": [], "flex_merged": [], "flex_gone": [], "flex_unkeyed": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source), "dequantised": [], "rebased": []}
     revised = {}
@@ -4509,6 +4540,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             k, r, skipped, why, two = shape_key_flexes(d, obj, bi, mi, scale)
             mesh["flex_carried"].extend(two["carried"])
             mesh["flex_merged"].extend(two["merged"])
+            mesh["flex_gone"].extend((obj.name,) + g for g in two["gone"])
+            if two["unkeyed"]:
+                mesh["flex_unkeyed"].append((obj.name, two["unkeyed"]))
             mesh["flexes"] += k
             mesh["flex_records"] += r
             mesh["flex_skipped"] += skipped
