@@ -387,7 +387,7 @@ def _cloth_set(obj, key, value):
 
 def _cloth_on_set(obj, value):
     """Stores 0 rather than deleting the key: absent is a scene imported before the import
-    stamped it, which keeps the file's cloth, and 0 is the box unticked, which removes it."""
+    stamped it, which the export refuses, and 0 is the box unticked, which removes it."""
     obj[CLOTH] = 1 if value else 0
 
 
@@ -1108,9 +1108,9 @@ def _bodypart_set(obj, value):
 def draw_bodypart(layout, obj):
     """The bodypart name, editable where the export finds the object by `vtmb_index`."""
     if obj.get("vtmb_index") is None:
-        layout.label(text="bodypart %r: this import predates vtmb_index, so the export "
-                          "finds the mesh by this name -- import again to rename it"
-                          % str(obj["vtmb_bodypart"]), icon="INFO")
+        layout.label(text="bodypart %r: this import predates vtmb_index, and the export "
+                          "refuses it -- import the model again"
+                          % str(obj["vtmb_bodypart"]), icon="ERROR")
         return
     layout.prop(obj, "vtmb_bodypart_text")
     n = len(bodypart_objects(obj))

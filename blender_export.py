@@ -557,9 +557,6 @@ def _model_claims(m, source):
     than by object name, which the user is free to change.
     """
     flat = mesh_mod.models_of(m)
-    # Model names repeat across bodyparts, so the name pair is only a fallback for objects
-    # an older version imported without `vtmb_index`.
-    want = {(bp.name, mo.name): (bi, mi) for bi, mi, bp, mo in flat}
     out = {}
     for obj in bpy.data.objects:
         if obj.type != "MESH":
@@ -569,11 +566,7 @@ def _model_claims(m, source):
             continue
         gi = obj.get("vtmb_index")
         if gi is not None and 0 <= gi < len(flat):
-            key = flat[gi][0], flat[gi][1]
-        else:
-            key = want.get((obj.get("vtmb_bodypart"), obj.get("vtmb_model")))
-        if key is not None:
-            out.setdefault(key, []).append(obj)
+            out.setdefault((flat[gi][0], flat[gi][1]), []).append(obj)
     return out
 
 
@@ -820,8 +813,8 @@ def renamed_models(m, source):
     said and what Blender actually assigned, because Blender caps a datablock name at 63
     bytes and suffixes a duplicate: 3 of the corpus's 4567 model names are over 63 and 14
     repeat inside one file. Comparing against what was assigned is therefore the only way
-    to tell a rename from Blender's own bookkeeping, and a datablock with no stash -- an
-    older scene, or a mesh the user built -- is left alone rather than guessed at.
+    to tell a rename from Blender's own bookkeeping, and a datablock with no stash, which
+    is a mesh the user put on the object, is left alone rather than guessed at.
     """
     out = {}
     for key, obj in mesh_objects(m, source).items():
@@ -836,15 +829,13 @@ def renamed_bodyparts(m, source):
     """{bodypart index: the name the scene now gives it} for the bodyparts renamed.
 
     The import stamps `mstudiobodyparts_t`'s name as `vtmb_bodypart` on each object of the
-    bodypart, and the panel renames them together. Only an object carrying `vtmb_index` is
-    read: one an older version imported is matched by that name, so renaming it there makes
-    it a new model. Two objects of one bodypart giving it two new names cannot both be
-    written.
+    bodypart, and the panel renames them together. Two objects of one bodypart giving it two
+    new names cannot both be written.
     """
     got = {}
     for (bi, _mi), obj in mesh_objects(m, source).items():
         name = obj.get("vtmb_bodypart")
-        if obj.get("vtmb_index") is None or name is None:
+        if name is None:
             continue
         if str(name) != m.bodyparts[bi].name:
             got.setdefault(bi, {}).setdefault(str(name), []).append(obj.name)
@@ -1683,62 +1674,79 @@ def _is_sum(co, base, local, total, scale, tol=1e-3):
 STALE_DECODE = {2: (0, 2, 0)}
 
 
-def stale_stash(m, source):
-    """[(object, filetype, stamped version or None)] for scene objects an old import made.
-
-    An unstamped object counts as stale: every `.blend` that exists today is unstamped, and
-    the versions that wrote no stamp are exactly the ones the decode fix post-dates.
-    """
-    found = mesh_objects(m, source)
-    out = []
-    for bi, mi, _bp, mo in mesh_mod.models_of(m):
-        want = STALE_DECODE.get(mo.filetype)
-        obj = found.get((bi, mi))
-        if want is None or obj is None:
-            continue
-        got = obj.get("vtmb_addon_version")
-        got = tuple(int(x) for x in got) if got is not None else None
-        if got is None or got < want:
-            out.append((obj.name, mo.filetype, got))
-    return out
-
-
-# Four stamps landed while `bl_info` still read 0.2.49, so `vtmb_addon_version` cannot tell a
-# `.blend` written before one from a scene imported in that window: both stamp 0.2.49. What a
-# stamp's ABSENCE does say is that the import predates it, which is the test here, and it needs
-# no version. The cloth pin group is the one of the four absence cannot reach -- `vtmb_pinned`
-# existed before its meaning changed on 2026-09-12 -- and 0.2.51 is what separates it from here
-# on, at or past it the group being pv[:numfixed]. No entry below does that yet.
-STALE_STAMPS = (
-    ("vtmb_slot_mats", "object",
-     "which material sat in each slot, so a slot reordered or deleted since the import is "
-     "resolved by index and a rename can reach the wrong texture record"),
-    ("vtmb_uv_layer", "object",
-     "which UV layer is the file's, so a renamed first layer cannot be told from a deleted "
-     "one and neither is reported"),
-    ("vtmb_model_label", "mesh",
-     "which object owns the model, so two objects claiming one are refused rather than "
-     "resolved to the one still named after it"),
+# Both landed while `bl_info` read 0.2.49, so only their absence dates an import. A datablock
+# with no `vtmb_model_label` under an object carrying both is one the user put there.
+OLD_STAMPS = (
+    ("vtmb_slot_mats", "which material sat in each slot, so a slot reordered or deleted "
+                       "since cannot be told from one that was not"),
+    ("vtmb_uv_layer", "which UV layer is the file's, so a renamed first layer cannot be told "
+                      "from a deleted one"),
 )
 
 
-def stale_stamps(m, source):
-    """[(object, [(stamp, what it costs)])] for scene objects an import older than a stamp made.
+def _version(obj):
+    got = obj.get("vtmb_addon_version")
+    return tuple(int(x) for x in got) if got is not None else None
 
-    Reported and never refused: every one of the three falls back to the behaviour that stood
-    before its stamp, so the export is correct for a scene that made no such edit and wrong
-    only for one that did, which is a thing to say rather than a thing to stop.
-    """
-    out, seen = [], set()
-    for obj in mesh_objects(m, source).values():
+
+def old_imports(m, source, arm_obj):
+    """[(name, what it lacks)] for each part of the scene an import older than a stamp the
+    export reads made. Nothing tells an edit there from what that import left, so
+    `export_actions` raises Refused on any of it."""
+    flat = mesh_mod.models_of(m)
+    want = {(bp.name, mo.name) for _bi, _mi, bp, mo in flat}
+    out = []
+    for obj in bpy.data.objects:
+        par = obj.parent
+        if (obj.type == "MESH" and obj.get("vtmb_index") is None
+                and (par is None or same_file(par.get("vtmb_source"), source))
+                and (obj.get("vtmb_bodypart"), obj.get("vtmb_model")) in want):
+            out.append((obj.name, "carries vtmb_bodypart and vtmb_model and no vtmb_index"))
+    models = {(bi, mi): mo for bi, mi, _bp, mo in flat}
+    seen = set()
+    for key, obj in sorted(mesh_objects(m, source).items()):
         if obj.name in seen:
             continue
         seen.add(obj.name)
-        miss = [(k, why) for k, dom, why in STALE_STAMPS
-                if (obj if dom == "object" else obj.data).get(k) is None]
-        if miss:
-            out.append((obj.name, miss))
+        mo, got = models[key], _version(obj)
+        floor = STALE_DECODE.get(mo.filetype)
+        if floor is not None and (got is None or got < floor):
+            out.append((obj.name, "holds a filetype-%d model and was imported before the "
+                                  "packed-position fix of 2026-08-20, which left it and its "
+                                  "stash 255x oversized" % mo.filetype))
+        for k, why in OLD_STAMPS:
+            if obj.get(k) is None:
+                out.append((obj.name, "has no %s, which says %s" % (k, why)))
+        if mo.cloths and "vtmb_cloth" not in obj:
+            out.append((obj.name, "has no vtmb_cloth, which says whether its Cloth box is "
+                                  "ticked"))
+        if mo.cloths and (got is None or got < CLOTH_PIN_VERSION):
+            out.append((obj.name, "was imported by addon %s, whose cloth pin group came from "
+                                  "the mesh binding and pins fewer particles than the file"
+                                  % (".".join(str(x) for x in got) if got
+                                     else "0.2.49 or older")))
+    names = [a.name for a in m.anims]
+    for i, act in sorted(match_indices(names, source, arm_obj)[0].items()):
+        if act.name != names[i] and act.get("vtmb_anim_name") is None:
+            out.append((act.name, "writes animation %r and has no vtmb_anim_name, which tells "
+                                  "a rename from Blender's duplicate suffix" % names[i]))
+    if arm_obj is not None:
+        bare = [x for x in arm_obj.get("vtmb_sequences") or ()
+                if not x.get("new") and x.get("src") is None]
+        if bare:
+            out.append((arm_obj.name, "stashes %d sequence%s with no src, which says which "
+                                      "file sequence each is"
+                        % (len(bare), "" if len(bare) == 1 else "s")))
     return out
+
+
+def _old_import_text(old):
+    said = "; ".join("%s %s" % x for x in old[:6])
+    if len(old) > 6:
+        said += "; and %d more" % (len(old) - 6)
+    return ("an import older than what this export reads made part of this scene: %s. "
+            "Nothing tells an edit there from what that import left. Re-import the model"
+            % said)
 
 
 def read_meshes(m, source, fields, boxes=None):
@@ -1913,7 +1921,7 @@ def match_actions(m, source, arm_obj=None):
 
 
 def renamed_anims(anim_names, source, arm_obj=None):
-    """({index: the name Blender now gives it}, the candidates no stamp can confirm).
+    """{index: the name Blender now gives it}.
 
     The index comes off `match_indices`, which is already what decides which action writes
     which animation, so this adds no second rule -- it reads that map and reports the slots
@@ -1925,22 +1933,16 @@ def renamed_anims(anim_names, source, arm_obj=None):
     4445 shipped models carry import as `walk` and `walk.001`, and the second differs from
     the record's name on a plain re-export that renamed nothing.  The stamp also has to
     still agree with the file, or it describes an animation some earlier export already
-    renamed and the scene is not the authority any more.
-
-    An action from an import older than the stamp reaches the second return instead, so a
-    scene that cannot express a rename says so rather than taking one silently either way.
+    renamed and the scene is not the authority any more. An action with no stamp is one an
+    import before it made, which `old_imports` refuses.
     """
     found = match_indices(anim_names, source, arm_obj)[0]
-    out, unstamped = {}, []
+    out = {}
     for i, act in sorted(found.items()):
-        if act.name == anim_names[i]:
-            continue
         was = act.get("vtmb_anim_name")
-        if was is None:
-            unstamped.append((anim_names[i], act.name))
-        elif str(was) == anim_names[i]:
+        if act.name != anim_names[i] and was is not None and str(was) == anim_names[i]:
             out[i] = act.name
-    return out, unstamped
+    return out
 
 
 def split_unwritten(unwritten, adding):
@@ -2721,15 +2723,8 @@ def cloth_pin_set(obj, pv, npart):
 
 
 def cloth_pin_why(obj, cl, pinned, npart):
-    """Why this object's pin edit cannot be written, or None where it can."""
-    got = obj.get("vtmb_addon_version")
-    got = tuple(int(x) for x in got) if got is not None else None
-    if got is None or got < CLOTH_PIN_VERSION:
-        return ("this scene was imported by addon %s, which built the pin group from the mesh "
-                "binding rather than from pv[:numfixed] -- it pins fewer particles than the "
-                "file does, so writing it would regenerate the cloth around the wrong pins. "
-                "Re-import the file to edit its pins"
-                % (".".join(str(x) for x in got) if got else "0.2.49 or older"))
+    """Why this object's pin edit cannot be written, or None where it can. A scene older
+    than `CLOTH_PIN_VERSION` never reaches it: `old_imports` refuses it."""
     if cl["cols"] != 1:
         return ("this model's cloth table is %d columns wide and a regeneration emits one"
                 % cl["cols"])
@@ -2778,9 +2773,9 @@ def cloth_scene(m, mo, me, cmap=None):
 def remove_cloth(d, m, source):
     """Takes the cloth object off every model whose scene object has the Cloth box unticked.
 
-    Absent and 0 are different states: the import stamps `vtmb_cloth` 1 on a model carrying
-    cloth, the box writes 0 rather than deleting the key, and a scene imported before the
-    stamp carries no key and keeps the file's cloth. Only the cloth object goes -- the
+    The import stamps `vtmb_cloth` 1 on a model carrying cloth and the box writes 0, and a
+    scene imported before the stamp carries no key, which `old_imports` refuses. Only the
+    cloth object goes -- the
     collision capsules and spheres name bones and no vertex, and the gather at
     `StudioRender 0x2c014a00` collides them with every cloth object of the model, so they
     stay where the file has them. With no cloth left the mesh binding arrays at
@@ -2794,7 +2789,7 @@ def remove_cloth(d, m, source):
         rec = d.bodyparts[bi].kids[mi]
         cl = rec.extra.get("cloth")
         obj = found.get((bi, mi))
-        if not cl or obj is None or "vtmb_cloth" not in obj or obj["vtmb_cloth"]:
+        if not cl or obj is None or obj.get("vtmb_cloth", 1):
             continue
         rec.extra["cloth"] = None
         out.append((obj.name, mo.name, len(cl["slots"]), cl["rows"], len(cl["meshes"])))
@@ -2879,12 +2874,7 @@ def cloth_edits(m, source, d, rebuilt=None):
         if slot is None:
             e["why"] = "the file's cloth table names no object in row 0"
             continue
-        if "vtmb_cloth" not in obj:
-            e["why"] = ("the object carries no Cloth setting -- a scene imported before the "
-                        "import stamped one -- so the file's cloth object stays; tick or "
-                        "untick the Cloth box to say which")
-            continue
-        if not obj["vtmb_cloth"]:
+        if not obj.get("vtmb_cloth", 1):
             # `remove_cloth` takes it out where Cloth from the scene is on, so this is
             # reached only with that option off.
             e["why"] = ("the Cloth box is off and Cloth from the scene is off, so the "
@@ -3640,9 +3630,9 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     tombstoned, `src` on an entry is the file ordinal it came from and is what a reorder is
     resolved through, and a trailing entry marked `new` is one the scene authored, which
     `add_sequence` appends. All three are positive marks rather than absences, the
-    spring-chain rule: a stash with no `src` on it is an older `.blend` and is matched by
-    position exactly as it was, and one shorter than the file with nothing tombstoned still
-    leaves the trailing records alone.
+    spring-chain rule: a stash shorter than the file with nothing tombstoned leaves the
+    trailing records alone. A stash with no `src` is one an import before it made, which
+    `old_imports` refuses, so a `src` past the file's list is what matches by position.
 
     Returns (what moved, those cells, what the list edits did).
     """
@@ -4214,6 +4204,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         if bad:
             raise ValueError("the writer does not reproduce %s, so nothing was written: %s"
                              % (os.path.basename(source), "; ".join(bad)))
+    old = old_imports(m, source, arm_obj)
+    if old:
+        raise build_mod.Refused(_old_import_text(old))
     # Before anything is read off the scene: Shift+D copies the stamps, so two objects can
     # claim one model and the file has one mesh per model to put them in. A copy the export
     # can tell apart is dropped and reported; one it cannot is refused, since taking either
@@ -4387,7 +4380,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
              "added_materials": [],
              "slots_moved": 0, "slots_gone": [],
-             "renamed_anims": [], "unstamped_renames": [],
+             "renamed_anims": [],
              "seqlist": {},
              "dup_models": dup_models, "dup_bones": dup_bones,
              "blind_bones": []}
@@ -4455,7 +4448,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # the stash by animation NAME, so renaming first makes it refuse the file it is about
     # to write. The records are held by object rather than by index because a drop below
     # renumbers the list.
-    renames, scene["unstamped_renames"] = renamed_anims(anim_names, source, arm_obj)
+    renames = renamed_anims(anim_names, source, arm_obj)
     pending_renames = [(d.anims[i], anim_names[i], n) for i, n in sorted(renames.items())]
     scene["sequences"], scene["blends_out_of_range"], scene["seqlist"] = apply_sequences(
         d, m, arm_obj, anim_names,
@@ -4500,8 +4493,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "flex_carried": [], "flex_gone": [], "flex_unkeyed": [],
-            "stray_groups": [], "stale_stash": stale_stash(m, source),
-            "stale_stamps": stale_stamps(m, source), "dequantised": [], "rebased": []}
+            "stray_groups": [], "dequantised": [], "rebased": []}
     revised = {}
     placed = placed or {}
     scene_objs = mesh_objects(m, source)

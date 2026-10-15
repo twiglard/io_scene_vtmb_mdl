@@ -1538,31 +1538,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "edit to reach the file"
                         % (blind, "" if blind == 1 else "s",
                            "was" if blind == 1 else "were"))
-        stale = r["mesh"].get("stale_stash") or []
-        if stale:
-            self.report({"WARNING"},
-                        "%d filetype-2 mesh%s -- %s -- came from an import older than the "
-                        "packed-position fix of 2026-08-20, or from one that stamped no "
-                        "version. Those scenes hold the model 255x oversized and the "
-                        "stash the export compares against is wrong by the same factor, "
-                        "so nothing here can measure it. Re-import to be sure"
-                        % (len(stale), "" if len(stale) == 1 else "es",
-                           ", ".join("%s (%s)" % (n, "unstamped" if v is None
-                                                  else ".".join(str(x) for x in v))
-                                     for n, _ft, v in stale[:3])
-                           + ("" if len(stale) <= 3 else " and %d more" % (len(stale) - 3))))
-        stamps = r["mesh"].get("stale_stamps") or []
-        if stamps:
-            for name, miss in stamps[:3]:
-                self.report({"WARNING"},
-                            "%s came from an import that stamped no %s, so this export "
-                            "cannot see %s. Re-import to edit that"
-                            % (name, " and no ".join(k for k, _w in miss),
-                               "; nor ".join(w for _k, w in miss)))
-            if len(stamps) > 3:
-                self.report({"WARNING"},
-                            "%d more object%s came from an import older than one of those "
-                            "stamps" % (len(stamps) - 3, "" if len(stamps) == 4 else "s"))
         gaps = r["scene"].get("blind_bones") or []
         if gaps:
             self.report({"WARNING"},
@@ -1846,21 +1821,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             self.report({"INFO"}, "renamed %d animation%s: %s"
                         % (len(ren), "" if len(ren) == 1 else "s", what))
             _restamp_renamed_anims(obj, self.filepath, src, ren)
-        uns = r["scene"].get("unstamped_renames") or []
-        if uns:
-            # Reported rather than guessed at: Blender deduplicates an action name, so the
-            # second of two animations called the same thing imports as `walk.001` and
-            # differs from the record on an export that renamed nothing.
-            self.report({"WARNING"},
-                        "%d action%s named differently from the animation it writes and "
-                        "carr%s no vtmb_anim_name, so the file keeps the name it has: %s. "
-                        "That stamp is what tells a rename from Blender's own duplicate "
-                        "suffix -- import the file again to get it"
-                        % (len(uns), "" if len(uns) == 1 else "s",
-                           "ies" if len(uns) == 1 else "y",
-                           ", ".join("%s is called %s" % (a, b) for a, b in uns[:4])
-                           + ("" if len(uns) <= 4 else
-                              " and %d more" % (len(uns) - 4))))
         # The stamp is what makes the next export replace this animation rather than
         # append it a second time. `vtmb_source` is left alone when the action already
         # has one: the name match comes first anyway, and repointing it would move the
@@ -2539,13 +2499,6 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                      "action being written carries and were left out: %s"
                         % (len(r["seqs_skipped"]), r["seqs_imported"],
                            ", ".join(r["seqs_skipped"][:6])))
-        if r.get("knockbacks_dropped"):
-            self.report({"WARNING"}, "%d sequence%s written with no knockbacks, the "
-                                     "armature having been imported before the import kept "
-                                     "their records -- re-import to carry them: %s"
-                        % (len(r["knockbacks_dropped"]),
-                           "" if len(r["knockbacks_dropped"]) == 1 else "s",
-                           ", ".join(r["knockbacks_dropped"][:6])))
         unresolved = _unresolved(
             context, obj, self.filepath,
             blender_scratch.scene_includes(obj) if self.chain else (),

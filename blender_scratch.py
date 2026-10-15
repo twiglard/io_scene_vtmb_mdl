@@ -1262,15 +1262,14 @@ def scene_sequences(d, arm_obj, written, bone_index):
     pose parameters, autolayers, tail fields and knockbacks come off the stash through the
     donor path's own writers, and then each action's Loops and Activity off the action,
     as `apply_sequences` has it. A knockback is rebuilt from the raw record the import
-    stashed; a sequence any of whose records lacks one -- a `.blend` imported before the
-    stash carried it -- is written with none, and named.
+    stashed. A record with none is one an import before 2026-10-15 stashed, and raises
+    Refused: its 170 bytes with no scene field are not in the scene.
 
-    Returns {"imported", "written", "skipped", "knockbacks_dropped"}.
+    Returns {"imported", "written", "skipped"}.
     """
     stash = list(arm_obj.get("vtmb_sequences") or ())
     plan, skipped = plan_sequences(arm_obj, written)
-    out = {"imported": len(stash), "written": len(plan), "skipped": skipped,
-           "knockbacks_dropped": []}
+    out = {"imported": len(stash), "written": len(plan), "skipped": skipped}
     if not plan:
         return out
     for s, grid in plan:
@@ -1294,7 +1293,11 @@ def scene_sequences(d, arm_obj, written, bone_index):
         tail = {key: s[key] for key in s.keys()}
         kbs = list(s.get("knockbacks") or ())
         raws = [kb.get("raw") for kb in kbs]
-        if kbs and all(raws):
+        if not all(raws):
+            raise Refused("sequence %r of %s stashes knockbacks with no raw record, which "
+                          "an import before 2026-10-15 left. Re-import the model"
+                          % (rec.name, arm_obj.name))
+        if kbs:
             for j, kb in enumerate(kbs):
                 if str(kb.get("bone") or "") not in bones:
                     raise Refused("knockback %d of sequence %r drives bone %r, which the "
@@ -1309,9 +1312,6 @@ def scene_sequences(d, arm_obj, written, bone_index):
                 recs.append(build_mod.Rec(build_mod._z(raw, *_KNOCKBACK_NAMES), None, None,
                                           {"names": [None] * 16}))
             rec.extra["knockbacks"] = recs
-        elif kbs:
-            out["knockbacks_dropped"].append(rec.name)
-            tail["knockbacks"] = []
         export_mod._apply_events(rec, s.get("events"))
         export_mod._apply_params(rec, s.get("params"), pp, rec.name)
         export_mod._apply_seq_tail(rec, tail, labels, bones)
@@ -1500,11 +1500,9 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "eye_radius_keys": face["radius_keys"], "eye_lid_targets": face["lid_targets"],
             "face_flexdescs": face["flexdescs"],
             "anims": len(d.anims), "seqs": len(d.seqs),
-            # Skipped: labels no written action reaches. Dropped: sequences written
-            # without the knockbacks an import older than `raw` could not carry.
+            # Skipped: labels no written action reaches.
             "seqs_imported": seqs["imported"], "seqs_from_stash": seqs["written"],
             "seqs_skipped": seqs["skipped"],
-            "knockbacks_dropped": seqs["knockbacks_dropped"],
             "poseparams": len(d.poseparams),
             "includes": len(d.includes),
             "springs": len(d.springbones), "cloth_volumes": d.cloth_volumes,
