@@ -3180,9 +3180,11 @@ def apply_face(d, m, arm_obj, scale):
     zoffset (+0x14) and pitch/yaw (+0x7c, +0x84) are left at whatever the donor holds:
     they are 0 on 602 of 602 shipped records and the QC `eyeball` command has no token
     that sets them, so the scene draws neither.
+
+    Raises Refused naming every lid target component at or past its eyeball's radius.
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
-           "flexdescs": [], "eye_empties": [], "eye_records": []}
+           "flexdescs": [], "eye_empties": [], "eye_records": [], "lid_past_radius": []}
     eyes = eyeball_objects(arm_obj)
     used = set()
     # A model record carries no name of its own in the description, so the name comes off
@@ -3199,11 +3201,22 @@ def apply_face(d, m, arm_obj, scale):
                     continue
                 used.add(obj.name)
                 out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
+    _lid_targets_refused(out["lid_past_radius"])
     out["eye_empties"] = [(obj.name, model, int(obj["vtmb_eyeball"]))
                           for model, objs in sorted(eyes.items()) for obj in objs
                           if obj.name not in used]
     out["changed"] += _apply_mouth(d, m, arm_obj, out)
     return out
+
+
+def _lid_targets_refused(bad):
+    """Refused over [(eyeball empty, target component, value, radius)], if any."""
+    if bad:
+        raise build_mod.Refused(
+            "a lid target has to lie inside its eyeball's radius, since the game takes "
+            "asin(target / radius) and past the radius that has no value and Blender "
+            "disables the lid driver: %s. Move the target inside or enlarge the sphere"
+            % "; ".join("%s %s is %g, radius %g" % x for x in bad))
 
 
 def _eye_pairs(recs, want):
@@ -3269,6 +3282,11 @@ def _apply_eyeball(d, rec, obj, scale, out):
     upt = [float(c) for c in (obj.get("vtmb_eyeball_uppertarget") or (0.0, 0.0, 0.0))]
     lot = [float(c) for c in (obj.get("vtmb_eyeball_lowertarget") or (0.0, 0.0, 0.0))]
     lids = [str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ())]
+    # Compared as the float32 the record stores, which is what the game divides.
+    out["lid_past_radius"] += [
+        (obj.name, "%s[%d]" % (nm, k), t, radius)
+        for nm, v in (("uppertarget", upt), ("lowertarget", lot)) for k, t in enumerate(v)
+        if abs(write_mod.f32(t)) >= write_mod.f32(radius)]
     # A shipped record says "no lid flexes" by holding zero in all eight, never -1, so an
     # empty scene list writes eight zeros and not a sentinel.
     ids = ([_flexdesc_index(d, x, out["flexdescs"]) if x else 0 for x in lids]
