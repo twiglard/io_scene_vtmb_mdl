@@ -2000,15 +2000,15 @@ SCRATCH_DROPS = (
 
 
 def _scratch_meshes(context, arm_obj):
-    """The meshes the armature owns, else every mesh in the scene.
+    """The meshes the armature owns: parented to it, or bound by an Armature modifier
+    naming it. A mesh it does not own, such as the factory Cube, is never written.
 
     Not filtered on `vtmb_model`: that marker comes from the importer, and a hand-built
     scene -- the case this operator exists for -- is exactly the one with none.
     """
-    own = [o for o in context.scene.objects if o.type == "MESH"
-           and (o.parent is arm_obj
-                or any(getattr(mo, "object", None) is arm_obj for mo in o.modifiers))]
-    return own or [o for o in context.scene.objects if o.type == "MESH"]
+    return [o for o in context.scene.objects if o.type == "MESH"
+            and (o.parent is arm_obj
+                 or any(getattr(mo, "object", None) is arm_obj for mo in o.modifiers))]
 
 
 def _scratch_face(arm_obj, meshes):
@@ -2253,6 +2253,15 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     "falls back to the movement hull, which is one box for the whole "
                     "body. The hit group each box reports is a guess off the bone name "
                     "unless the pose bone carries a vtmb_hitgroup")
+    no_mesh: bpy.props.BoolProperty(
+        name="Skeleton without mesh", default=False, options={"SKIP_SAVE"},
+        description="Enabled only when the armature owns no mesh. Writes the bones, "
+                    "animations and sequences with one model of no mesh, as null.mdl and "
+                    "9 of Troika's cinematic files are: an animation-only file, such as "
+                    "the one a logic_choreographed_scene names as its Base Animation. The "
+                    "engine draws nothing of it. Unticked, the export stops. If a mesh "
+                    "should have been written, parent it to the armature or give it an "
+                    "Armature modifier naming the armature")
     checksum: bpy.props.IntProperty(
         name="Checksum", default=0x5A534E31, subtype="UNSIGNED",
         description="Scripting only. Written into both files; any value is legal as long "
@@ -2308,10 +2317,21 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             _pair(box, "meshes", "%d object%s" % (len(meshes),
                                                   "" if len(meshes) == 1 else "s"),
                   icon="NONE" if meshes else "ERROR")
-            if not meshes:
-                box.label(text="one model of no mesh is written, as null.mdl ships, and "
-                               "the engine draws nothing of it",
+            row = box.row()
+            row.enabled = not meshes
+            row.prop(self, "no_mesh")
+            if not meshes and not self.no_mesh:
+                box.label(text="the armature owns no mesh: parent one to it or bind one "
+                               "with an Armature modifier, or tick Skeleton without mesh",
+                          icon="ERROR")
+                stray = [o.name for o in context.scene.objects if o.type == "MESH"]
+                if stray:
+                    _pair(box, "not the armature's", ", ".join(stray[:3])
+                          + (" and %d more" % (len(stray) - 3) if len(stray) > 3 else ""),
                           icon="INFO")
+            elif not meshes:
+                box.label(text="one model of no mesh is written, and the engine draws "
+                               "nothing of it", icon="INFO")
             no_uv = [o.name for o in meshes
                      if blender_export.uv_layer_of(o)[0] is None]
             if no_uv:
@@ -2427,7 +2447,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     scale=self.scale, surfaceprop=self.surfaceprop,
                     cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
                     activity=self.activity, hitboxes=self.fit_hitboxes,
-                    root_motion=self.root_motion,
+                    root_motion=self.root_motion, no_mesh=self.no_mesh,
                     includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
@@ -2441,8 +2461,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         _report_unkeepable(self, r.get("unkeepable"))
         _report_placed(self, moved, None, set())
         if r.get("meshless"):
-            self.report({"WARNING"}, "the scene has no mesh, so one bodypart holding one "
-                                     "model of no mesh was written, as null.mdl ships: "
+            self.report({"WARNING"}, "the armature owns no mesh, so one bodypart holding "
+                                     "one model of no mesh was written, as null.mdl ships: "
                                      "the engine draws nothing of it")
         if r["unskinned"]:
             self.report({"WARNING"}, "%d vertices belong to no bone and were pinned to "

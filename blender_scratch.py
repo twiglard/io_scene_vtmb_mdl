@@ -595,15 +595,19 @@ def add_cloth(d, obj, verts, faces, npin, flip=False, origins=None):
     return c, blob
 
 
-def meshless_model(d):
+def meshless_model(d, allowed):
     """Where the scene wrote no bodypart, one holding one model of no mesh, as `null.mdl`
-    and 11 more shipped files carry. True when it wrote one.
+    and 11 more shipped files carry, or Refused unless `allowed`. True when it wrote one.
 
     0 of the 4445 shipped models carry `numbodyparts` 0, and zero bodyparts reach
     `vtx_write.to_bytes` and die on `at["bodyparts"]`, which is BUGS 135.
     """
     if d.bodyparts:
         return False
+    if not allowed:
+        raise Refused("the armature owns no mesh. Parent a mesh to it or bind one with "
+                      "an Armature modifier naming it, or tick Skeleton without mesh for "
+                      "an animation-only file")
     build_mod.add_model(d, [], model="null")
     return True
 
@@ -1350,7 +1354,7 @@ def scene_includes(arm_obj):
 
 def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="flesh",
           cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE",
-          hitboxes=False, root_motion="extract", includes=()):
+          hitboxes=False, root_motion="extract", includes=(), no_mesh=False):
     """(Desc, faces, ..., face) for the scene. `hull` is (min, max) and stays the caller's:
     @180/@192 are the movement hull the .qc's $bbox sets, not the mesh's bounds. Without
     one the armature's is written, and without that `new`'s."""
@@ -1373,7 +1377,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     face = {"flexes": 0, "flex_records": 0, "eye_meshes": []}
     faces, unskinned, kept, crowded, cloths, stray, face["seams"] = add_meshes(
         d, mesh_objs, bone_index, scale, owners, face)
-    face["meshless"] = meshless_model(d)
+    face["meshless"] = meshless_model(d, no_mesh)
     if face["meshless"]:
         faces = list(d.faces)
     # Keys first, then rules, then lids and the mouth: each appends the flexdescs it names
