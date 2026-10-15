@@ -29,6 +29,9 @@ MATREPL_STRIDE = 8
 # 0x2c0138fc and 0x2c01390f.  Not 4, and not Valve's aligned 8.
 MATREPL_ENTRY_STRIDE = 6
 
+MESH_IS_TEETH = 0x01
+MESH_IS_EYES = 0x02
+
 SG_IS_FLEXED = 0x01
 SG_IS_HW_SKINNED = 0x02
 # Troika's, absent from the 2003 tree. The shipped files set it only on cloth carriers and

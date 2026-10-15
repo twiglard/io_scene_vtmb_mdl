@@ -1478,6 +1478,45 @@ FLEX_POS_STEP = build_mod.M.FLEX_POSITION_DELTA_SCALE / 255.0
 FLEX_NRM_STEP = build_mod.M.FLEX_NORMAL_DELTA_SCALE / 255.0
 
 
+def key_flex(name, names, descs, targets):
+    """(flexdesc, target or None) for the shape key called `name`, off the import's stamps.
+
+    Matched by the name the import assigned rather than by position: a key renamed or
+    reordered in Blender must not take another flex's numbers. A key the file did not carry
+    gets studiomdl's default target and a flexdesc of its own name.
+    """
+    fd, t = name, None
+    if name in names:
+        at = names.index(name)
+        if at < len(targets):
+            t = tuple(float(c) for c in targets[at])
+        if descs is not None and at < len(descs):
+            fd = str(descs[at])
+    return fd, t
+
+
+def moved_vertices(co, base):
+    return [i for i in range(len(co))
+            if max(abs(co[i][c] - base[i][c]) for c in range(3)) > 1e-6]
+
+
+def key_deltas(me, co, base, base_n, moved, scale=1.0):
+    """[(Blender vertex, position delta, normal delta)] over `moved`, in file units.
+
+    A vertex under half a step of both bytes is left out: its record would say nothing.
+    """
+    morph_n = _vertex_normals(me, co)
+    out = []
+    for vi in moved:
+        delta = tuple((co[vi][c] - base[vi][c]) / scale for c in range(3))
+        ndelta = tuple(morph_n[vi][c] - base_n[vi][c] for c in range(3))
+        if (sum(c * c for c in delta) ** 0.5 < FLEX_POS_STEP / 2.0
+                and sum(c * c for c in ndelta) ** 0.5 < FLEX_NRM_STEP / 2.0):
+            continue
+        out.append((vi, delta, ndelta))
+    return out
+
+
 def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     """Rebuild one model's flexes from its shape keys. (keys, records, skipped, why, two).
 
@@ -1493,20 +1532,21 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     file said: a shape key holds coordinates only, so the normal delta is recomputed from
     the morphed geometry and the file's own is gone.
 
-    `two` names the keys carried whole, and the edited ones an import older than
-    `vtmb_flex_descs` made by summing a flexdesc's two records -- those are written as one
-    record, which the game draws as one step. `gone` names each of the file's (flexdesc,
+    `two` names the keys carried whole. `gone` names each of the file's (flexdesc,
     target) records no key claims any more, which go unwritten, and `unkeyed` is how many
-    records a model with no shape key at all keeps as the file had them.
+    records a model with no shape key at all keeps as the file had them. Keys an import
+    before 2026-10-15 made raise Refused (`prestamp_flexes`).
     """
     from . import blender_scratch as scratch_mod
     me = obj.data
     keys = me.shape_keys
-    two = {"carried": [], "merged": [], "gone": [], "unkeyed": 0}
+    two = {"carried": [], "gone": [], "unkeyed": 0}
     if keys is None or len(keys.key_blocks) < 2:
         # No key is read as no edit, so deleting every key cannot remove a flex.
         two["unkeyed"] = sum(len(x.kids) for x in d.bodyparts[bi].kids[mi].kids)
         return 0, 0, 0, None, two
+    if prestamp_flexes(obj):
+        raise build_mod.Refused(_summed_keys(obj.name))
     runs = scratch_mod.original_runs(obj, me)
     if runs is None:
         why = []
@@ -1525,7 +1565,7 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     names = list(obj.get("vtmb_flex_names") or [])
     descs = obj.get("vtmb_flex_descs")
     # Read before the clear: the file's records are already on the written numbering.
-    held = build_mod.flex_groups(d, bi, mi, by_target=descs is not None)
+    held = build_mod.flex_groups(d, bi, mi)
     meshes = d.bodyparts[bi].kids[mi].kids
     # Each record's place in its mesh, so a key the file carried goes back where the file
     # had it. Key order differs from the file's on 71 of the 195 flexed models.
@@ -1536,30 +1576,16 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     nkeys = nrec = skipped = nnew = 0
     for kb in blocks[1:]:
         co = [tuple(v.co) for v in kb.data]
-        moved = [i for i in range(len(co))
-                 if max(abs(co[i][c] - base[i][c]) for c in range(3)) > 1e-6]
-        # The flexdesc and target the file carried, matched by the name the import
-        # assigned rather than by position: a key renamed or reordered in Blender must not
-        # take another flex's numbers. A key the file did not carry gets studiomdl's
-        # default target and a flexdesc of its own name.
-        fd, t = kb.name, None
-        if kb.name in names:
-            at = names.index(kb.name)
-            if at < len(targets):
-                t = tuple(float(c) for c in targets[at])
-            if descs is not None and at < len(descs):
-                fd = str(descs[at])
-        if descs is None:
-            group = held.get((fd, None))
-        elif t is not None:
-            group = held.get((fd, build_mod.flex_target_key(t)))
-        else:
-            group = None
+        moved = moved_vertices(co, base)
+        fd, t = key_flex(kb.name, names, descs, targets)
+        # A key with no stamp claims no file record: it is one the user made.
+        group = (held.get((fd, build_mod.flex_target_key(t)))
+                 if descs is not None and t is not None else None)
         # Before the no-move test: the two eyelid records of a pair can cancel exactly, and
         # a key holding their sum then moves nothing.
-        slot, summed = {}, False
+        slot = {}
         if group is not None:
-            claimed.add((fd, None) if descs is None else (fd, build_mod.flex_target_key(t)))
+            claimed.add((fd, build_mod.flex_target_key(t)))
             recs, total = group
             for k, rec in recs:
                 slot.setdefault(k, place[id(rec)])
@@ -1572,17 +1598,10 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
                             for _k, rec in recs)
                 two["carried"].append(kb.name)
                 continue
-            summed = len({k for k, _rec in recs}) < len(recs)
         if not moved:
             continue
-        morph_n = _vertex_normals(me, co)
         per_mesh = {}
-        for vi in moved:
-            delta = tuple((co[vi][c] - base[vi][c]) / scale for c in range(3))
-            ndelta = tuple(morph_n[vi][c] - base_n[vi][c] for c in range(3))
-            if (sum(c * c for c in delta) ** 0.5 < FLEX_POS_STEP / 2.0
-                    and sum(c * c for c in ndelta) ** 0.5 < FLEX_NRM_STEP / 2.0):
-                continue
+        for vi, delta, ndelta in key_deltas(me, co, base, base_n, moved, scale):
             at = local.get(vi)
             if at is None:
                 skipped += 1
@@ -1591,8 +1610,6 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
             per_mesh.setdefault(k, []).append((j, delta, ndelta))
         if not per_mesh:
             continue
-        if summed:
-            two["merged"].append(kb.name)
         nkeys += 1
         nnew += not slot
         for k in sorted(per_mesh):
@@ -1603,6 +1620,19 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     _file_order(meshes, rank)
     two["gone"] = _unclaimed(held, claimed, names, descs, targets)
     return nkeys, nrec, skipped, None, two
+
+
+def prestamp_flexes(obj):
+    """Whether an import before `vtmb_flex_descs` (2026-10-15) made this object's keys. Every
+    other import writes both, `vtmb_flex_names` having arrived with the flex import (007bc19)."""
+    return obj.get("vtmb_flex_names") is not None and obj.get("vtmb_flex_descs") is None
+
+
+def _summed_keys(name):
+    return ("%s was imported before 2026-10-15, when a morph the file draws in steps, each "
+            "over its own flex weight range, was summed into one shape key, and nothing in "
+            "the scene says which keys those are. Written as one record the game would draw "
+            "each in one step. Re-import the model, which makes one key per step" % name)
 
 
 def _unclaimed(held, claimed, names, descs, targets):
@@ -2467,6 +2497,23 @@ def _flexdesc_index(d, name, added=None):
     if added is not None and len(d.flexdescs) > was:
         added.append(name)
     return i
+
+
+def flexdesc_roles(arm_obj, names):
+    """{name: "morph", "input", "mouth" or None} for flexdescs a face record appended.
+
+    `vtmb_eyeball_lidflexes` 0-5 are the lid inputs `r_studioflex.cpp:118-124` reads and 6-7
+    the lid morphs it writes at :139/:144; only a rule writes an input or the mouth's.
+    """
+    role = {}
+    mouth = arm_obj.get("vtmb_mouth")
+    if mouth and mouth.get("flex"):
+        role[str(mouth["flex"])] = "mouth"
+    for o in (o for objs in eyeball_objects(arm_obj).values() for o in objs):
+        for k, x in enumerate(o.get("vtmb_eyeball_lidflexes") or ()):
+            if x:
+                role.setdefault(str(x), "morph" if k >= 6 else "input")
+    return {n: role.get(n) for n in names}
 
 
 # The three lid-flex name sets the corpus carries, and there is no fourth: over the 602
@@ -4452,7 +4499,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_rebuilt": [], "cloth_renumbered": [], "cloth_carried": [],
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
-            "flex_carried": [], "flex_merged": [], "flex_gone": [], "flex_unkeyed": [],
+            "flex_carried": [], "flex_gone": [], "flex_unkeyed": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source), "dequantised": [], "rebased": []}
     revised = {}
@@ -4569,7 +4616,6 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                 continue
             k, r, skipped, why, two = shape_key_flexes(d, obj, bi, mi, scale)
             mesh["flex_carried"].extend(two["carried"])
-            mesh["flex_merged"].extend(two["merged"])
             mesh["flex_gone"].extend((obj.name,) + g for g in two["gone"])
             if two["unkeyed"]:
                 mesh["flex_unkeyed"].append((obj.name, two["unkeyed"]))

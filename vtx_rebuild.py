@@ -356,7 +356,8 @@ def seed(mdl, checksum, boned=True):
     import struct as _s
     parts = []
     for bp in mdl.bodyparts:
-        parts.append([[getattr(e, "cloth", False) for e in m.meshes] for m in bp.models])
+        parts.append([[(getattr(e, "cloth", False), getattr(e, "materialtype", 0))
+                       for e in m.meshes] for m in bp.models])
 
     out = bytearray()
     flags = W.SG_VERTS_ARE_BONED if boned else W.SG_VERTS_ARE_PLAIN
@@ -371,8 +372,8 @@ def seed(mdl, checksum, boned=True):
         _s.pack_into("<2i", out, bpo + i * W.BODYPART_STRIDE,
                      len(models), mo - (bpo + i * W.BODYPART_STRIDE))
         out += b"\0" * (len(models) * W.MODEL_STRIDE)
-        for j, meshcloth in enumerate(models):
-            nmesh = len(meshcloth)
+        for j, kinds in enumerate(models):
+            nmesh = len(kinds)
             lo = len(out)
             _s.pack_into("<2i", out, mo + j * W.MODEL_STRIDE, 1,
                          lo - (mo + j * W.MODEL_STRIDE))
@@ -382,7 +383,10 @@ def seed(mdl, checksum, boned=True):
             out += b"\0" * (nmesh * W.MESH_STRIDE)
             for k in range(nmesh):
                 go = len(out)
-                _s.pack_into("<hhi", out, eo + k * W.MESH_STRIDE, 1, 0,
+                # Every shipped materialtype-1 mesh carries 2, every LOD, both flavours.
+                # TEETH is unreachable: no texture written without a donor has flags.
+                _s.pack_into("<hhi", out, eo + k * W.MESH_STRIDE, 1,
+                             W.MESH_IS_EYES if kinds[k][1] else 0,
                              go - (eo + k * W.MESH_STRIDE))
                 # A cloth mesh is drawn by the ProcessMesh*_Cloth_* half of
                 # g_SoftwareProcessFunc, and StudioRender picks that half only when bit
@@ -392,7 +396,7 @@ def seed(mdl, checksum, boned=True):
                 # It also cannot be hardware-skinned -- no shipped group carries 0x02 and
                 # 0x04 together, over 38 707 groups.
                 f = flags
-                if meshcloth[k]:
+                if kinds[k][0]:
                     f = (f | W.SG_IS_CLOTH) & ~W.SG_IS_HW_SKINNED
                 out += _s.pack("<3hBB3i", 0, 0, 0, f, 0,
                                W.GROUP_STRIDE, W.GROUP_STRIDE, W.GROUP_STRIDE)
@@ -407,11 +411,13 @@ def scratch(mdl, faces, checksum=None):
     """Emit a .vtx from nothing for a model that has none.
 
     `faces[bodypart][model][mesh]` is triangles as indices into that mesh's own vertices.
+    A mesh no flex moves keeps the one group `seed` gave it; a mesh a flex moves is dealt
+    out by `_repartition`, since the engine morphs only a group flagged `SG_IS_FLEXED`
+    (`r_studiodraw.cpp:1437`). `st["flexed"]` counts those groups.
     """
     v = seed(mdl, mdl.checksum if checksum is None else checksum)
-    st = dict(groups=0, tris_out=0, verts_out=0, strips=0)
+    st = dict(groups=0, tris_out=0, verts_out=0, strips=0, boned=0, flexed=0)
     for i, bp in enumerate(v.bodyparts):
-        verts = mdl.vertices(mdl.bodyparts[i].models[0]) if mdl.bodyparts[i].models else []
         for j, model in enumerate(bp.models):
             src_model = mdl.bodyparts[i].models[j]
             verts = mdl.vertices(src_model)
@@ -419,17 +425,19 @@ def scratch(mdl, faces, checksum=None):
                 for k, mesh in enumerate(lod.meshes):
                     src_mesh = src_model.meshes[k]
                     tris = [tuple(t) for t in faces[i][j][k]]
-                    orig = sorted(set(x for t in tris for x in t))
-                    local = dict((o, n) for n, o in enumerate(orig))
-                    grp = mesh.groups[0]
-                    vb = vertex_bones(src_mesh, orig, verts)
-                    W.rebuild_group(grp, orig, [tuple(local[x] for x in t) for t in tris],
-                                    vb, max_bones=v.maxbones_strip,
-                                    max_per_vert=v.maxbones_vert)
-                    st["tris_out"] += len(grp.indices) // 3
-                    st["verts_out"] += grp.numverts
-                    st["strips"] += len(grp.strips)
-                    st["groups"] += 1
+                    dealt = [(mesh.groups[0], tris)]
+                    if src_mesh.flexes and tris:
+                        dealt = _repartition(mesh, src_mesh, tris, verts, v, lod, False,
+                                             False, i, j, k)
+                        mesh.groups[:] = [g for g, _t in dealt]
+                        st["flexed"] += sum(1 for g, _t in dealt
+                                            if g.flags & W.SG_IS_FLEXED)
+                    cells = []
+                    for g, mine in dealt:
+                        orig = sorted(set(x for t in mine for x in t))
+                        local = dict((o, n) for n, o in enumerate(orig))
+                        cells.append((g, orig, [tuple(local[x] for x in t) for t in mine]))
+                    _fill(v, src_mesh, verts, cells, st)
     return v.to_bytes(), st
 
 

@@ -988,6 +988,12 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # The mesh partition of the vertex array, which Blender's per-face material slot
         # cannot express: two meshes may share a material, and a loose vertex has no face.
         obj["vtmb_meshes"] = [[slots[x.material], x.numvertices] for x in model.meshes]
+        # [slot, eyeball index] per eye mesh: the slot's material is the iris's on only 156
+        # of 598, so neither the material nor its name says which mesh is an eye.
+        eye = [[slots[x.material], x.materialparam] for x in model.meshes
+               if x.materialtype == 1]
+        if eye:
+            obj["vtmb_eye_slots"] = eye
         # The skinref each slot was built from, in slot order. vtmb.set_skin_family needs
         # the inverse of `slots` and cannot rebuild it: that would take the .mdl back.
         obj["vtmb_skinrefs"] = [r for r, _ in sorted(slots.items(), key=lambda kv: kv[1])]

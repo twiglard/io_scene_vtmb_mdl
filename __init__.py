@@ -95,6 +95,26 @@ def _mode_tally(actions):
             for k in blender_export.ROOT_MOTION_MODES if k in got]
 
 
+FACE_FLEXDESC_WHY = (
+    ("morph", "lid flexes added: %s. The eyeball code weights them every frame, and no shape "
+              "key carries them, so the lids do not move"),
+    ("input", "lid inputs added: %s. No rule writes them, so their weight stays 0 and they "
+              "add nothing to the lid's travel"),
+    ("mouth", "mouth flex added: %s. No rule writes it, so its weight stays 0, and the game "
+              "scales the light on the mouth by that weight"),
+    (None, "flex names added: %s, named by a face record and nothing else"),
+)
+
+
+def _report_face_flexdescs(op, arm_obj, added):
+    """One warning per role the lid and mouth flexdescs an export appended play."""
+    roles = blender_export.flexdesc_roles(arm_obj, added)
+    for role, text in FACE_FLEXDESC_WHY:
+        names = [n for n in added if roles[n] == role]
+        if names:
+            op.report({"WARNING"}, text % ", ".join(names))
+
+
 def _write_vmts(context, dirs, dest, names, enabled):
     """The `.vmt` for each material the export just added, and what to say about it.
 
@@ -1414,16 +1434,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "%d shape key%s unedited and written as the file had %s, normal "
                         "deltas included" % (n, "" if n == 1 else "s",
                                              "it" if n == 1 else "them"))
-        merged = mesh.get("flex_merged") or ()
-        if merged:
-            self.report({"WARNING"},
-                        "%d edited morph%s the file held as two records, each drawn over "
-                        "its own weight range, now written as one, so the game draws "
-                        "%s as one step: %s. This scene was imported before each record "
-                        "got its own shape key, so one key holds both summed; re-import "
-                        "the model to edit each step on its own"
-                        % (len(merged), "" if len(merged) == 1 else "s",
-                           "it" if len(merged) == 1 else "them", ", ".join(merged)))
         gone = mesh.get("flex_gone") or ()
         if gone:
             said = ["%s: %s%s" % (obj, key, "" if (key, n) == (fd, 1) else
@@ -1973,14 +1983,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "vtmb_eyeball %d, so it is written as the donor had "
                                      "it. A donor export removes no eyeball"
                         % (i, model, i))
-        added_fd = scene.get("face_flexdescs") or ()
-        if added_fd:
-            self.report({"WARNING"}, "%d flex name%s the file has not got, added to it so "
-                                     "the record can name %s: %s. Nothing weights a "
-                                     "descriptor no flex controller drives"
-                        % (len(added_fd), "" if len(added_fd) == 1 else "s",
-                           "it" if len(added_fd) == 1 else "them",
-                           ", ".join(added_fd)))
+        _report_face_flexdescs(self, obj, scene.get("face_flexdescs") or ())
         for name, has_lids in scene.get("eye_lid_targets") or ():
             self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
                                      "neither, so this one is written as the scene has it "
@@ -2028,8 +2031,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 # The chain is the worst on a character: its animations live in the included files.
 SCRATCH_DROPS = (
     "collision and ragdoll -- both live in the sibling .phy, not written",
-    "flex descs, controllers, rules and every vertanim",
-    "eyeballs and mouths",
     ("procedural bones, IK chains and bone controllers -- a spring bone chain "
      "authored on a bone IS written"),
     "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
@@ -2048,6 +2049,16 @@ def _scratch_meshes(context, arm_obj):
            and (o.parent is arm_obj
                 or any(getattr(mo, "object", None) is arm_obj for mo in o.modifiers))]
     return own or [o for o in context.scene.objects if o.type == "MESH"]
+
+
+def _scratch_face(arm_obj, meshes):
+    """(shape keys, objects imported before vtmb_flex_descs, eyeball empties, mouth) for
+    the dialog, reachable without a window as `_scratch_cdtexture` is."""
+    keyed = [o for o in meshes if o.data.shape_keys]
+    keys = sum(len(o.data.shape_keys.key_blocks) - 1 for o in keyed)
+    old = [o.name for o in keyed if blender_export.prestamp_flexes(o)]
+    eyes = sum(len(v) for v in blender_export.eyeball_objects(arm_obj).values())
+    return keys, old, eyes, bool(arm_obj.get("vtmb_mouth"))
 
 
 def _scratch_cdtexture(arm_obj):
@@ -2353,6 +2364,16 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             if lost:
                 _pair(box, "UV layer gone", ", ".join(lost[:3]), icon="ERROR")
 
+            keys, old, eyes, mouth = _scratch_face(obj, meshes)
+            if keys:
+                _pair(box, "shape keys", "%d, written as flexes" % keys)
+            if old:
+                _pair(box, "imported before 2026-10-15", "refused, a key may sum two "
+                      "steps: %s" % ", ".join(old[:3]), icon="ERROR")
+            if eyes or mouth:
+                _pair(box, "face", "%d eyeball empt%s%s"
+                      % (eyes, "y" if eyes == 1 else "ies", ", a mouth" if mouth else ""))
+
         box = _section(lay, "vtmb_s_anims", "Animations", icon="ACTION")
         if box is not None:
             _pair(box, "actions", str(len(actions)),
@@ -2532,7 +2553,42 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         for kind, bad in sorted(unresolved.items()):
             self.report({"WARNING"}, "%d %s resolve against nothing and will not draw: %s"
                         % (len(bad), kind, ", ".join(bad[:4])))
-        mats = r.get("material_names") or []
+        nf = r.get("flexes") or 0
+        if nf or r.get("flex_controllers") or r.get("eyeballs") or r.get("mouths"):
+            self.report({"INFO"}, "%d flex%s over %d vertex record%s from the shape keys, "
+                                  "%d controller%s, %d rule%s, %d eyeball%s, %d mouth"
+                        % (nf, "" if nf == 1 else "es", r["flex_records"],
+                           "" if r["flex_records"] == 1 else "s",
+                           r["flex_controllers"], "" if r["flex_controllers"] == 1 else "s",
+                           r["flex_rules"], "" if r["flex_rules"] == 1 else "s",
+                           r["eyeballs"], "" if r["eyeballs"] == 1 else "s", r["mouths"]))
+        for model, i in r.get("eye_unmeshed") or ():
+            self.report({"WARNING"}, "eyeball %d of model %r is the eye of no mesh, so the "
+                                     "engine draws no eye for it. walkie_talki1 and "
+                                     "sabbat_hand ship that way" % (i, model))
+        for name, model, i in r.get("eye_empties") or ():
+            self.report({"WARNING"}, "%r claims eyeball %d of model %r, which no written "
+                                     "model is or an empty sorting first by name already "
+                                     "claims, so nothing of it was written" % (name, i, model))
+        for name, key, live in r.get("eye_radius_keys") or ():
+            self.report({"WARNING"}, "%r carries vtmb_eyeball_radius %.4f, which is not "
+                                     "the sphere's %.4f. The sphere is what was written and "
+                                     "the key has been corrected to it" % (name, key, live))
+        for name, has_lids in r.get("eye_lid_targets") or ():
+            self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
+                                     "neither, so no shipped file looks like this one"
+                        % (name, "lid flexes and no aim points" if has_lids
+                           else "aim points and no lid flexes"))
+        _report_face_flexdescs(self, obj, r.get("face_flexdescs") or ())
+        eye_mats = r.get("eye_materials") or []
+        if eye_mats:
+            self.report({"WARNING"}, "no .vmt or .tth written for %d eye material%s: %s. A "
+                                     "shipped eye mesh uses the Eyes shader, whose $iris is "
+                                     "a texture the record does not name, and a glint "
+                                     "UnlitGeneric"
+                        % (len(eye_mats), "" if len(eye_mats) == 1 else "s",
+                           ", ".join(eye_mats[:4])))
+        mats = [n for n in r.get("material_names") or [] if n not in eye_mats]
         if mats:
             dirs = paths.cdtexture_list(self.cdtexture)
             said = _write_vmts(context, dirs, self.filepath, mats, self.write_vmt)

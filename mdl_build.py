@@ -2289,14 +2289,12 @@ def flex_target_key(t):
     return struct.unpack("<4f", struct.pack("<4f", *t))
 
 
-def flex_groups(d, bi, mi, by_target=True):
+def flex_groups(d, bi, mi):
     """{(flexdesc name, target): (records, summed deltas)} over one model's flexes, grouped
     the way the import makes shape keys of them.
 
     `records` is [(mesh, Rec)] in file order and the sum is {(mesh, mesh-local index):
-    delta}, what the import puts in the one key. `by_target=False` groups by flexdesc alone,
-    with None for the target, which is how an import older than `vtmb_flex_descs` summed a
-    two-record flexdesc into one key.
+    delta}, what the import puts in the one key.
     """
     groups = {}
     for k, mesh in enumerate(d.bodyparts[bi].kids[mi].kids):
@@ -2304,7 +2302,7 @@ def flex_groups(d, bi, mi, by_target=True):
             fd = struct.unpack_from("<i", rec.raw, 0)[0]
             if not 0 <= fd < len(d.flexdescs):
                 continue
-            t = struct.unpack_from("<4f", rec.raw, 4) if by_target else None
+            t = struct.unpack_from("<4f", rec.raw, 4)
             groups.setdefault((d.flexdescs[fd].name, t), []).append((k, rec))
     out = {}
     for key, recs in groups.items():

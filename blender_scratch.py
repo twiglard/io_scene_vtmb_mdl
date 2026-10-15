@@ -5,7 +5,8 @@ carries every record the scene does not supply. This does not open anything. The
 becomes `mstudiobone_t[]`, the mesh objects become bodyparts, the actions become animations.
 The sequences are the imported list where the armature carries one, `vtmb_sequences` with its
 pose parameters, and one per action for every action that list does not cite. Attachments,
-hitboxes, the include chain, cloth and spring bone chains are written from the scene too.
+hitboxes, the include chain, cloth, spring bone chains, shape keys as flexes with the flex
+controllers and rules, eyeballs and the mouth are written from the scene too.
 Everything else is emitted with a count of zero, and `SCRATCH_DROPS` in `__init__` is the list
 of it the export dialog prints.
 
@@ -608,12 +609,72 @@ def refuse_empty(d):
                       "armature, or give one an armature modifier naming it")
 
 
-def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None):
+def add_mesh_flexes(d, obj, bi, origins, scale=1.0):
+    """One mstudioflex_t per shape key per written mesh it moves. (keys, records).
+
+    Every key is encoded, none carried: the written numbering is Blender's and not the
+    file's. A vertex a seam split takes the key's delta on every copy. An object imported
+    before `vtmb_flex_descs` raises Refused, since some of its keys sum two steps.
+    """
+    me = obj.data
+    keys = me.shape_keys
+    if keys is None or len(keys.key_blocks) < 2:
+        return 0, 0
+    if export_mod.prestamp_flexes(obj):
+        raise Refused(export_mod._summed_keys(obj.name))
+    copies = {}
+    for k, run in enumerate(origins):
+        for j, vi in enumerate(run):
+            copies.setdefault(vi, []).append((k, j))
+    me.calc_loop_triangles()
+    blocks = list(keys.key_blocks)
+    base = [tuple(v.co) for v in blocks[0].data]
+    base_n = export_mod._vertex_normals(me, base)
+    names = list(obj.get("vtmb_flex_names") or [])
+    descs = obj.get("vtmb_flex_descs")
+    targets = obj.get("vtmb_flex_targets") or []
+    nkeys = nrec = 0
+    for kb in blocks[1:]:
+        co = [tuple(v.co) for v in kb.data]
+        moved = export_mod.moved_vertices(co, base)
+        per_mesh = {}
+        for vi, delta, ndelta in export_mod.key_deltas(me, co, base, base_n, moved, scale):
+            for k, j in copies.get(vi, ()):
+                per_mesh.setdefault(k, []).append((j, delta, ndelta))
+        if not per_mesh:
+            continue
+        fd, t = export_mod.key_flex(kb.name, names, descs, targets)
+        nkeys += 1
+        for k in sorted(per_mesh):
+            recs = sorted(per_mesh[k])
+            build_mod.add_flex(d, bi, 0, k, fd, recs, t)
+            nrec += len(recs)
+    return nkeys, nrec
+
+
+def eye_slots(obj, bi, slots):
+    """[(bodypart, mesh, eyeball index, object, material)] per slot the import stamped as an
+    eye and the export wrote. `slots` is the material slot of each written mesh, in order."""
+    moves = export_mod.slot_moves(obj)[0]
+    mats = obj.data.materials
+    out = []
+    for slot, param in obj.get("vtmb_eye_slots") or ():
+        here = int(slot) if moves is None else moves.get(int(slot))
+        if here in slots:
+            mat = mats[here].name if here < len(mats) and mats[here] else obj.name
+            out.append((bi, slots.index(here), int(param), obj.name, mat))
+    return out
+
+
+def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None, face=None):
     """One bodypart per object, holding one model whose meshes are its material slots.
 
     A bodypart is a variant selector -- the engine draws one of its models, chosen by
     `m_nBody` -- so a bodypart per material would declare that many bodygroups. 4381 of
     the 4464 shipped files carry exactly one bodypart; the material unit is the mesh.
+
+    `face`, where given, collects `flexes` and `flex_records` from the shape keys and
+    `eye_meshes` from `eye_slots`, for `scene_face` to point at its records.
     """
     slot_of = {}
     total_unskinned = total_kept = 0
@@ -653,6 +714,12 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None):
                                      model=obj.get("vtmb_model") or obj.name + ".smd")
             if owners is not None:
                 owners.append((bi, obj))
+            if face is not None:
+                nk, nr = add_mesh_flexes(d, obj, bi, origins if cloth is None else [corig],
+                                         scale)
+                face["flexes"] += nk
+                face["flex_records"] += nr
+                face["eye_meshes"] += eye_slots(obj, bi, [s for s, _v, _f in runs])
             if cloth is not None:
                 add_cloth(d, obj, cverts, cfaces, npin, cflip, corig)
                 cloths.append((obj.name, npin, len(cverts)))
@@ -840,6 +907,112 @@ def add_attachments(d, arm_obj, bone_index, scale=1.0):
                                  int(obj.get("vtmb_attachment_type") or 0))
         n += 1
     return n
+
+
+def _model_name(mr):
+    return bytes(mr.raw[:128]).split(b"\0")[0].decode("latin1")
+
+
+def scene_face(d, arm_obj, eye_meshes, bone_index, scale=1.0):
+    """The eyeball records and the mouth, written from the scene onto the models written.
+
+    Answers `apply_face`'s keys, its `eye_empties` naming an empty no record took -- a
+    copy sharing an index, or one whose model is not written -- plus `eyeballs`, `mouth`,
+    and `unmeshed`, the (model, record) no mesh is the eye of, which walkie_talki1 and
+    sabbat_hand ship. Records go in index order, the first empty by name taking an index;
+    a record's written position is what an eye mesh's `materialparam` names.
+    """
+    out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
+           "flexdescs": [], "eye_empties": [], "eye_records": [], "lid_past_radius": [],
+           "eyeballs": 0, "unmeshed": [], "mouth": 0}
+    models = {}
+    for bi, bp in enumerate(d.bodyparts):
+        models.setdefault(_model_name(bp.kids[0]), bi)
+    per = {}
+    for model, objs in export_mod.eyeball_objects(arm_obj).items():
+        bi = models.get(model) if model else 0
+        if bi is None:
+            out["eye_empties"] += [(o.name, model, int(o["vtmb_eyeball"])) for o in objs]
+            continue
+        per.setdefault(bi, []).extend((int(o["vtmb_eyeball"]), not model, o.name, o)
+                                      for o in objs)
+    at = {}
+    for bi in sorted(per):
+        mr = d.bodyparts[bi].kids[0]
+        pos = at[bi] = {}
+        for i, _added, _name, obj in sorted(per[bi], key=lambda x: x[:3]):
+            if i in pos:
+                out["eye_empties"].append((obj.name, _model_name(mr), i))
+                continue
+            want = obj.parent_bone if obj.parent_type == "BONE" else ""
+            if want not in bone_index:
+                raise Refused("eyeball %r is on bone %r, which is not being written -- "
+                              "parent it to a bone of the armature"
+                              % (obj.name, want or "<none>"))
+            rec = build_mod.Rec(bytearray(140))
+            struct.pack_into("<i", rec.raw, 0x04, bone_index[want])
+            export_mod._apply_eyeball(d, rec, obj, scale, out)
+            pos[i] = len(mr.extra["eyes"])
+            mr.extra["eyes"].append(rec)
+            out["eyeballs"] += 1
+    export_mod._lid_targets_refused(out["lid_past_radius"])
+    eyed = set()
+    for bi, k, param, name, mat in eye_meshes:
+        j = at.get(bi, {}).get(param)
+        if j is None:
+            raise Refused("%s: material %r is the eye of eyeball %d, and no eyeball empty "
+                          "on its model carries vtmb_eyeball %d. Restore the empty, or "
+                          "delete vtmb_eye_slots from the object's custom properties to "
+                          "write the mesh as an ordinary one" % (name, mat, param, param))
+        struct.pack_into("<2i", d.bodyparts[bi].kids[0].kids[k].raw, 0x18, 1, j)
+        eyed.add((bi, j))
+    out["unmeshed"] = [(_model_name(d.bodyparts[bi].kids[0]), j) for bi in sorted(at)
+                       for j in range(len(at[bi])) if (bi, j) not in eyed]
+    out["mouth"] = scene_mouth(d, arm_obj, bone_index, out)
+    return out
+
+
+def eye_materials(d, appended):
+    """The texture names an eyeball appended, then each eye mesh's own, once each."""
+    out = list(dict.fromkeys(appended))
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            for mesh in mr.kids:
+                if struct.unpack_from("<i", mesh.raw, 0x18)[0]:
+                    name = d.textures[struct.unpack_from("<i", mesh.raw, 0)[0]].name
+                    if name not in out:
+                        out.append(name)
+    return out
+
+
+def scene_mouth(d, arm_obj, bone_index, out):
+    """The one mstudiomouth_t off `vtmb_mouth`, or nothing where the armature has none.
+
+    The bone is a Blender name where the panel's picker set it and the file's where the
+    import did, so both are tried. With no file to keep a value from, a field the stash
+    lacks raises Refused rather than being guessed.
+    """
+    mouth = arm_obj.get("vtmb_mouth")
+    if not mouth:
+        return 0
+    bone = str(mouth.get("bone") or "")
+    flex = str(mouth.get("flex") or "")
+    fwd = mouth.get("forward")
+    lack = [k for k, v in (("bone", bone), ("forward", fwd), ("flex", flex))
+            if v is None or v == ""]
+    if lack:
+        raise Refused("the armature's mouth carries no %s, and with no donor there is no "
+                      "value to keep -- set it in the Face panel" % " and no ".join(lack))
+    bi = bone_index.get(bone)
+    if bi is None:
+        bi = stash_bones(arm_obj, bone_index).get(bone)
+    if bi is None:
+        raise Refused("the mouth is on bone %r, which is not being written" % bone)
+    raw = bytearray(20)
+    struct.pack_into("<i3fi", raw, 0, bi, *[float(c) for c in fwd],
+                     export_mod._flexdesc_index(d, flex, out["flexdescs"]))
+    d.mouths.append(build_mod.Rec(raw))
+    return 1
 
 
 def add_springbones(d, arm_obj, bone_index):
@@ -1169,7 +1342,7 @@ def scene_includes(arm_obj):
 def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="flesh",
           cdtexture="models/", hull=None, use_range=False, activity="ACT_IDLE",
           hitboxes=False, root_motion="extract", includes=()):
-    """(Desc, faces) for the scene. `hull` is (min, max) and stays the caller's:
+    """(Desc, faces, ..., face) for the scene. `hull` is (min, max) and stays the caller's:
     @180/@192 are the movement hull the .qc's $bbox sets, not the mesh's bounds. Without
     one the armature's is written, and without that `new`'s."""
     d = build_mod.new(name, surfaceprop)
@@ -1188,9 +1361,15 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     if not bone_index:
         raise Refused("the armature has no bones")
     owners = []
+    face = {"flexes": 0, "flex_records": 0, "eye_meshes": []}
     faces, unskinned, kept, crowded, cloths, stray = add_meshes(
-        d, mesh_objs, bone_index, scale, owners)
+        d, mesh_objs, bone_index, scale, owners, face)
     refuse_empty(d)
+    # Keys first, then rules, then lids and the mouth: each appends the flexdescs it names
+    # and the file lacks, and only the last two are reported, since nothing weights them.
+    face["controllers"], face["rules"], face["rule_flexdescs"] = export_mod.apply_flex(
+        d, None, arm_obj)
+    face.update(scene_face(d, arm_obj, face.pop("eye_meshes"), bone_index, scale))
     # The scene is the authority: a box or a set the user placed is written whatever the
     # option says, and the refit fills in only a scene that carries neither.
     nbox, nset = scene_hitboxes(d, arm_obj, bone_index, scale)
@@ -1205,7 +1384,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     _n, moved, unfitted, unkeepable, seqs = add_actions(
         context, arm_obj, d, actions, scale, use_range, activity, root_motion, bone_index)
     return (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-            stray, (nbox, nset, nfit), seqs)
+            stray, (nbox, nset, nfit), seqs, face)
 
 
 def _set_hull(d, lo, hi):
@@ -1298,8 +1477,8 @@ def write(d, faces, path, checksum):
 
 def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
     (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
-     stray, hbox, seqs) = build(context, arm_obj, mesh_objs, actions, embedded_name(path),
-                                **kw)
+     stray, hbox, seqs, face) = build(context, arm_obj, mesh_objs, actions,
+                                      embedded_name(path), **kw)
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "hull_inverted": export_mod.inverted_axes(d),
@@ -1311,6 +1490,15 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             # and not only the count, and taking them off d.textures is what stops the
             # list drifting from what add_material actually put in the file.
             "material_names": [r.name for r in d.textures],
+            # Not given a .vmt: a shipped eye mesh is `Eyes` on 588 of 598 and a glint
+            # `UnlitGeneric`, and an `Eyes` `$iris` is not derivable from the record.
+            "eye_materials": eye_materials(d, face["materials"]),
+            "flexes": face["flexes"], "flex_records": face["flex_records"],
+            "flex_controllers": face["controllers"], "flex_rules": face["rules"],
+            "eyeballs": face["eyeballs"], "mouths": face["mouth"],
+            "eye_unmeshed": face["unmeshed"], "eye_empties": face["eye_empties"],
+            "eye_radius_keys": face["radius_keys"], "eye_lid_targets": face["lid_targets"],
+            "face_flexdescs": face["flexdescs"],
             "anims": len(d.anims), "seqs": len(d.seqs),
             # Skipped: labels no written action reaches. Dropped: sequences written
             # without the knockbacks an import older than `raw` could not carry.
