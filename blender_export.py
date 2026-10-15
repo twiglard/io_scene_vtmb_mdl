@@ -1479,7 +1479,7 @@ FLEX_NRM_STEP = build_mod.M.FLEX_NORMAL_DELTA_SCALE / 255.0
 
 
 def shape_key_flexes(d, obj, bi, mi, scale=1.0):
-    """Rebuild one model's flexes from its shape keys. (keys, records, skipped, why).
+    """Rebuild one model's flexes from its shape keys. (keys, records, skipped, why, two).
 
     The vertanim key is mesh-local and the reader adds it to the mesh's own first vertex,
     so the file's partition has to be recoverable before a key can be written at all --
@@ -1487,20 +1487,27 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     run r being mesh r's vertex k. A vertex the edit added is in no run and its delta is
     counted as skipped rather than guessed at.
 
-    The file's own flexes go first. A shape key holds coordinates only, so what is
-    written is the scene's morph entire and not a patch on what the file said -- the
-    normal delta is recomputed from the morphed geometry, and the file's own is gone.
+    The file's own flexes go first. A key that still moves every vertex by what its
+    records say is unedited, and those records go back byte for byte, normal deltas and
+    all. Any other key is written as the scene's morph entire and not a patch on what the
+    file said: a shape key holds coordinates only, so the normal delta is recomputed from
+    the morphed geometry and the file's own is gone.
+
+    `two` names the keys carried whole, and the edited ones an import older than
+    `vtmb_flex_descs` made by summing a flexdesc's two records -- those are written as one
+    record, which the game draws as one step.
     """
     from . import blender_scratch as scratch_mod
     me = obj.data
     keys = me.shape_keys
+    two = {"carried": [], "merged": []}
     if keys is None or len(keys.key_blocks) < 2:
-        return 0, 0, 0, None
+        return 0, 0, 0, None, two
     runs = scratch_mod.original_runs(obj, me)
     if runs is None:
         why = []
         scratch_mod.original_runs(obj, me, why)
-        return 0, 0, 0, (why[0] if why else "the file's partition was not recoverable")
+        return 0, 0, 0, (why[0] if why else "the file's partition was not recoverable"), two
     me.calc_loop_triangles()
     local = {}
     for k, (_slot, members) in enumerate(runs):
@@ -1510,14 +1517,56 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
     blocks = list(keys.key_blocks)
     base = [tuple(v.co) for v in blocks[0].data]
     base_n = _vertex_normals(me, base)
-    build_mod.clear_flexes(d, bi, mi)
     targets = obj.get("vtmb_flex_targets") or []
     names = list(obj.get("vtmb_flex_names") or [])
-    nkeys = nrec = skipped = 0
-    for bk, kb in enumerate(blocks[1:]):
+    descs = obj.get("vtmb_flex_descs")
+    # Read before the clear: the file's records are already on the written numbering.
+    held = build_mod.flex_groups(d, bi, mi, by_target=descs is not None)
+    meshes = d.bodyparts[bi].kids[mi].kids
+    # Each record's place in its mesh, so a key the file carried goes back where the file
+    # had it. Key order differs from the file's on 71 of the 195 flexed models.
+    place = {id(rec): j for mesh in meshes for j, rec in enumerate(mesh.kids)}
+    rank = {}
+    build_mod.clear_flexes(d, bi, mi)
+    nkeys = nrec = skipped = nnew = 0
+    for kb in blocks[1:]:
         co = [tuple(v.co) for v in kb.data]
         moved = [i for i in range(len(co))
                  if max(abs(co[i][c] - base[i][c]) for c in range(3)) > 1e-6]
+        # The flexdesc and target the file carried, matched by the name the import
+        # assigned rather than by position: a key renamed or reordered in Blender must not
+        # take another flex's numbers. A key the file did not carry gets studiomdl's
+        # default target and a flexdesc of its own name.
+        fd, t = kb.name, None
+        if kb.name in names:
+            at = names.index(kb.name)
+            if at < len(targets):
+                t = tuple(float(c) for c in targets[at])
+            if descs is not None and at < len(descs):
+                fd = str(descs[at])
+        if descs is None:
+            group = held.get((fd, None))
+        elif t is not None:
+            group = held.get((fd, build_mod.flex_target_key(t)))
+        else:
+            group = None
+        # Before the no-move test: the two eyelid records of a pair can cancel exactly, and
+        # a key holding their sum then moves nothing.
+        slot, summed = {}, False
+        if group is not None:
+            recs, total = group
+            for k, rec in recs:
+                slot.setdefault(k, place[id(rec)])
+            if _is_sum(co, base, local, total, scale):
+                for k, rec in recs:
+                    meshes[k].kids.append(rec)
+                    rank[id(rec)] = (0, place[id(rec)])
+                nkeys += 1
+                nrec += sum(struct.unpack_from("<i", rec.raw, 0x14)[0] & 0xFFFF
+                            for _k, rec in recs)
+                two["carried"].append(kb.name)
+                continue
+            summed = len({k for k, _rec in recs}) < len(recs)
         if not moved:
             continue
         morph_n = _vertex_normals(me, co)
@@ -1536,20 +1585,34 @@ def shape_key_flexes(d, obj, bi, mi, scale=1.0):
             per_mesh.setdefault(k, []).append((j, delta, ndelta))
         if not per_mesh:
             continue
-        # The target the file carried, matched by the name the import assigned rather
-        # than by position: a key renamed or reordered in Blender must not take another
-        # flex's numbers. A key the file did not carry gets studiomdl's default.
-        t = None
-        if kb.name in names:
-            at = names.index(kb.name)
-            if at < len(targets):
-                t = tuple(float(c) for c in targets[at])
+        if summed:
+            two["merged"].append(kb.name)
         nkeys += 1
+        nnew += not slot
         for k in sorted(per_mesh):
             recs = sorted(per_mesh[k])
-            build_mod.add_flex(d, bi, mi, k, kb.name, recs, t)
+            build_mod.add_flex(d, bi, mi, k, fd, recs, t)
+            rank[id(meshes[k].kids[-1])] = (0, slot[k]) if k in slot else (1, nnew)
             nrec += len(recs)
-    return nkeys, nrec, skipped, None
+    _file_order(meshes, rank)
+    return nkeys, nrec, skipped, None, two
+
+
+def _file_order(meshes, rank):
+    """Each mesh's flexes back in the file's order, a key the file did not carry last."""
+    for mesh in meshes:
+        mesh.kids.sort(key=lambda rec: rank[id(rec)])
+
+
+def _is_sum(co, base, local, total, scale, tol=1e-3):
+    """Whether a shape key still moves every vertex by `total`, the summed records the
+    import built it from. A vertex the edit added has no entry and must not move."""
+    for vi in range(len(co)):
+        want = total.get(local.get(vi), (0.0, 0.0, 0.0))
+        for c in range(3):
+            if abs((co[vi][c] - base[vi][c]) / scale - want[c]) > tol:
+                return False
+    return True
 
 
 # PR #2 corrected the packed position on 2026-08-20. A `.blend` saved by an import older
@@ -4304,6 +4367,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_rebuilt": [], "cloth_renumbered": [], "cloth_carried": [],
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
+            "flex_carried": [], "flex_merged": [],
             "stray_groups": [], "stale_stash": stale_stash(m, source),
             "stale_stamps": stale_stamps(m, source), "dequantised": [], "rebased": []}
     revised = {}
@@ -4418,7 +4482,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             obj = found.get((bi, mi))
             if obj is None:
                 continue
-            k, r, skipped, why = shape_key_flexes(d, obj, bi, mi, scale)
+            k, r, skipped, why, two = shape_key_flexes(d, obj, bi, mi, scale)
+            mesh["flex_carried"].extend(two["carried"])
+            mesh["flex_merged"].extend(two["merged"])
             mesh["flexes"] += k
             mesh["flex_records"] += r
             mesh["flex_skipped"] += skipped

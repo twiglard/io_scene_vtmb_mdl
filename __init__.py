@@ -672,7 +672,9 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
     with_flexes: bpy.props.BoolProperty(
         name="Flexes as shape keys", default=True,
         description="Build one shape key per flex the model names -- the facial morphs "
-                    "195 of the shipped models carry. Position deltas only: a shape key "
+                    "195 of the shipped models carry. A morph the file holds as two "
+                    "records, each drawn over its own weight range, is two keys, the "
+                    "second named with Blender's .001. Position deltas only: a shape key "
                     "holds coordinates, so the normal delta each flex record also "
                     "carries stays in the file and out of the scene. Off leaves the "
                     "mesh with no shape keys at all")
@@ -829,8 +831,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         description="Rewrite each model's flexes from its shape keys -- the way to get a "
                     "facial morph authored in Blender into the file. Off carries the "
                     "file's own flex records through untouched, which is what makes an "
-                    "unedited face model come back byte for byte. On, the scene's morph "
-                    "is written entire and not as a patch: a shape key holds coordinates, "
+                    "unedited face model come back byte for byte. On, an unedited key "
+                    "is written as the file had it, and an edited one is the scene's "
+                    "morph entire and not a patch: a shape key holds coordinates, "
                     "so the normal delta each flex record also carries is recomputed from "
                     "the morphed geometry and whatever the file said is gone. A model "
                     "whose vertex numbering the scene cannot reproduce is named in the "
@@ -1405,6 +1408,22 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name, why in mesh["flex_refused"]:
             self.report({"WARNING"},
                         "%s: no shape key could be written -- %s" % (name, why))
+        if mesh.get("flex_carried"):
+            n = len(mesh["flex_carried"])
+            self.report({"INFO"},
+                        "%d shape key%s unedited and written as the file had %s, normal "
+                        "deltas included" % (n, "" if n == 1 else "s",
+                                             "it" if n == 1 else "them"))
+        merged = mesh.get("flex_merged") or ()
+        if merged:
+            self.report({"WARNING"},
+                        "%d edited morph%s the file held as two records, each drawn over "
+                        "its own weight range, now written as one, so the game draws "
+                        "%s as one step: %s. This scene was imported before each record "
+                        "got its own shape key, so one key holds both summed; re-import "
+                        "the model to edit each step on its own"
+                        % (len(merged), "" if len(merged) == 1 else "s",
+                           "it" if len(merged) == 1 else "them", ", ".join(merged)))
         undriven = mesh.get("flex_undriven") or ()
         if undriven:
             self.report({"WARNING"},

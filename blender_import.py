@@ -549,13 +549,26 @@ def _material(m, index, content, family=0):
     return mat
 
 
+def _flex_key(f):
+    """The shape key a flex record lands in: its flexdesc and its four targets.
+
+    `R_StudioFlexVerts` weights each record by its own targets, and 2 135 of 15 925 shipped
+    (mesh, flexdesc) pairs, over 191 models, are two records with different ones -- two
+    morphs drawn over two weight ranges, whose sum no weight draws. No (flexdesc, target)
+    occurs twice on one mesh anywhere in the corpus, so a key holds one record per mesh.
+    """
+    return f.flexdesc, tuple(f.target)
+
+
 def build_shape_keys(obj, model, scale):
-    """One shape key per flexdesc the model's meshes name. (keys, records, dropped).
+    """One shape key per flexdesc and target the model's meshes name. (keys, records, dropped).
 
     `mstudioflex_t` is per mesh and the vertanim key is mesh-local, so a morph that
     crosses two meshes of one model is two flex records naming one flexdesc, and both
     land in the same key here -- the Blender vertex is `mesh.vertexoffset + index`,
-    which is exactly what `R_StudioFlexVerts` indexes.
+    which is exactly what `R_StudioFlexVerts` indexes. A flexdesc whose records carry two
+    targets is two keys, the second under Blender's own duplicate name (`AU12L.001`), and
+    `vtmb_flex_descs` says which flexdesc each key is.
 
     Position deltas only. A shape key holds coordinates and nothing else, so the normal
     delta each record also carries has nowhere to go; the count is stashed on the object
@@ -564,28 +577,25 @@ def build_shape_keys(obj, model, scale):
     flexes = [(mesh, f) for mesh in model.meshes for f in mesh.flexes]
     if not flexes:
         return 0, 0, 0
-    order, targets = [], {}
+    order, names, targets = [], {}, {}
     for _mesh, f in flexes:
-        if f.flexdesc not in targets:
-            order.append(f.flexdesc)
-            targets[f.flexdesc] = f.target
+        key = _flex_key(f)
+        if key not in names:
+            order.append(key)
+            names[key] = f.name or "flex_%d" % f.flexdesc
+            targets[key] = f.target
     nverts = len(obj.data.vertices)
     # Blender 5.2's shape_key_add hands back a key at value 1.0, so without this every
     # flex arrives fully applied and the face is the sum of all of them at once.
     obj.shape_key_add(name="Basis", from_mix=False).value = 0.0
     nrec = dropped = 0
-    for fd in order:
-        nm = None
-        for _mesh, f in flexes:
-            if f.flexdesc == fd:
-                nm = f.name
-                break
-        kb = obj.shape_key_add(name=nm or "flex_%d" % fd, from_mix=False)
+    for key in order:
+        kb = obj.shape_key_add(name=names[key], from_mix=False)
         kb.value = 0.0
         kb.slider_min, kb.slider_max = 0.0, 1.0
         data = kb.data
         for mesh, f in flexes:
-            if f.flexdesc != fd:
+            if _flex_key(f) != key:
                 continue
             for v in f.verts:
                 nrec += 1
@@ -600,9 +610,10 @@ def build_shape_keys(obj, model, scale):
                 co[2] += d[0][2] * scale
     # -11.0 .. 11.0 over the corpus, read by nothing this addon writes, and there is no
     # Blender field for it -- kept so a rebuild can put back what the file said.
-    obj["vtmb_flex_targets"] = [[float(c) for c in targets[fd]] for fd in order]
+    obj["vtmb_flex_targets"] = [[float(c) for c in targets[key]] for key in order]
     obj["vtmb_flex_names"] = [obj.data.shape_keys.key_blocks[i + 1].name
                               for i in range(len(order))]
+    obj["vtmb_flex_descs"] = [names[key] for key in order]
     return len(order), nrec, dropped
 
 

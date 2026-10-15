@@ -2263,6 +2263,63 @@ def undriven_flexes(d):
     return sorted(out)
 
 
+def flex_record_deltas(rec):
+    """[(mesh-local index, position delta or None)] off one `mstudioflex_t` of the tree."""
+    n = struct.unpack_from("<i", rec.raw, 0x14)[0] & 0xFFFF
+    vt = 1 if struct.unpack_from("<i", rec.raw, 0x1c)[0] & 0xFFFF else 0
+    blob = rec.extra["payload"]
+    out = []
+    for k in range(n):
+        v = M.VertAnim()
+        if vt:
+            (v.index, v.delta_offset, v.ndelta_offset,
+             v.delta_scale, v.ndelta_scale) = M._VERTANIM1.unpack_from(blob, k * 8)
+            v.delta = None
+        else:
+            (v.index, _pad, dx, dy, dz, v.ndelta_offset,
+             v.ndelta_scale, _pad2) = M._VERTANIM0.unpack_from(blob, k * 20)
+            v.delta = (dx, dy, dz)
+        dd = M.flex_delta(v, vt)
+        out.append((v.index, None if dd is None else dd[0]))
+    return out
+
+
+def flex_target_key(t):
+    """Four targets as the file stores them, float32, so a stamp compares exactly."""
+    return struct.unpack("<4f", struct.pack("<4f", *t))
+
+
+def flex_groups(d, bi, mi, by_target=True):
+    """{(flexdesc name, target): (records, summed deltas)} over one model's flexes, grouped
+    the way the import makes shape keys of them.
+
+    `records` is [(mesh, Rec)] in file order and the sum is {(mesh, mesh-local index):
+    delta}, what the import puts in the one key. `by_target=False` groups by flexdesc alone,
+    with None for the target, which is how an import older than `vtmb_flex_descs` summed a
+    two-record flexdesc into one key.
+    """
+    groups = {}
+    for k, mesh in enumerate(d.bodyparts[bi].kids[mi].kids):
+        for rec in mesh.kids:
+            fd = struct.unpack_from("<i", rec.raw, 0)[0]
+            if not 0 <= fd < len(d.flexdescs):
+                continue
+            t = struct.unpack_from("<4f", rec.raw, 4) if by_target else None
+            groups.setdefault((d.flexdescs[fd].name, t), []).append((k, rec))
+    out = {}
+    for key, recs in groups.items():
+        total = {}
+        for k, rec in recs:
+            for j, delta in flex_record_deltas(rec):
+                if delta is None:
+                    continue
+                t = total.setdefault((k, j), [0.0, 0.0, 0.0])
+                for c in range(3):
+                    t[c] += delta[c]
+        out[key] = (recs, total)
+    return out
+
+
 def clear_flexes(d, bi, mi):
     """Drop every flex of one model. Returns how many went."""
     n = 0
