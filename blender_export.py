@@ -3269,6 +3269,18 @@ def _apply_mouth(d, m, arm_obj, out):
     return 0
 
 
+def _eye_material(d, raw, off, name, added):
+    """The iris or glint index at `off`, resolved by name, or the record's own if none.
+
+    The import stamps "" where the index names no texture: walkie_talki1 and sabbat_hand
+    hold iris 8 and 10, glint 9, on 4 textures. Resolving "" appended a texture named "".
+    """
+    name = str(name or "")
+    if not name:
+        return struct.unpack_from("<i", raw, off)[0]
+    return _material_index(d, name, added)
+
+
 def _apply_eyeball(d, rec, obj, scale, out):
     raw = rec.raw
     local = obj.matrix_basis
@@ -3276,8 +3288,8 @@ def _apply_eyeball(d, rec, obj, scale, out):
     up = tuple(local.col[1][:3])
     fw = tuple(local.col[2][:3])
     radius = eyeball_radius(obj, scale)
-    iris = _material_index(d, str(obj.get("vtmb_eyeball_iris") or ""), out["materials"])
-    glint = _material_index(d, str(obj.get("vtmb_eyeball_glint") or ""), out["materials"])
+    iris = _eye_material(d, raw, 0x38, obj.get("vtmb_eyeball_iris"), out["materials"])
+    glint = _eye_material(d, raw, 0x40, obj.get("vtmb_eyeball_glint"), out["materials"])
     iscale = float(obj.get("vtmb_eyeball_iris_scale") or 0.0)
     upt = [float(c) for c in (obj.get("vtmb_eyeball_uppertarget") or (0.0, 0.0, 0.0))]
     lot = [float(c) for c in (obj.get("vtmb_eyeball_lowertarget") or (0.0, 0.0, 0.0))]
