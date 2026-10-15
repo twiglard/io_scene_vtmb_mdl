@@ -1944,6 +1944,16 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "neither the sphere's %.4f nor what the file holds. "
                                      "The sphere is what was written and the key has been "
                                      "corrected to it" % (name, key, live))
+        for name, model, i in scene.get("eye_empties") or ():
+            self.report({"WARNING"}, "%r claims eyeball %d of model %r, which the donor has "
+                                     "not got or an empty sorting first by name already "
+                                     "claims, so nothing of it was written. A donor "
+                                     "export adds no eyeball" % (name, i, model))
+        for model, i in scene.get("eye_records") or ():
+            self.report({"WARNING"}, "eyeball %d of model %r has no empty stamped "
+                                     "vtmb_eyeball %d, so it is written as the donor had "
+                                     "it. A donor export removes no eyeball"
+                        % (i, model, i))
         added_fd = scene.get("face_flexdescs") or ()
         if added_fd:
             self.report({"WARNING"}, "%d flex name%s the file has not got, added to it so "

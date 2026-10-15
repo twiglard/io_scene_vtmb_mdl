@@ -3131,11 +3131,13 @@ class _Named(object):
 def apply_face(d, m, arm_obj, scale):
     """The eyeball records and the one mouth record, written only where they differ.
 
-    Answers `{changed, materials, radius_keys, lid_targets, flexdescs}` -- the record
-    count, the material names an eyeball put in the file, the eyeballs whose
-    `vtmb_eyeball_radius` says something neither the sphere nor the file says, the
-    eyeballs holding lid flexes without aim points or the other way round, and the flex
-    names a lid or the mouth appended to the file's mstudioflexdesc_t array.
+    Answers `{changed, materials, radius_keys, lid_targets, flexdescs, eye_empties,
+    eye_records}` -- the record count, the material names an eyeball put in the file, the
+    eyeballs whose `vtmb_eyeball_radius` says something neither the sphere nor the file
+    says, the eyeballs holding lid flexes without aim points or the other way round, the
+    flex names a lid or the mouth appended to the file's mstudioflexdesc_t array, the
+    empties no record took as (name, model, index), and the records no empty claimed as
+    (model, index), which keep the donor's bytes.
 
     Every index a scene holds is a NAME here and is resolved against this file: the two
     materials against mstudiotexture_t, the eight lid flexes and the mouth's flex against
@@ -3149,20 +3151,40 @@ def apply_face(d, m, arm_obj, scale):
     that sets them, so the scene draws neither.
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
-           "flexdescs": []}
+           "flexdescs": [], "eye_empties": [], "eye_records": []}
     eyes = eyeball_objects(arm_obj)
+    used = set()
     # A model record carries no name of its own in the description, so the name comes off
     # the parsed file walked beside it -- same file, same order.
     for bp, dbp in zip(m.bodyparts, d.bodyparts):
         for model, mr in zip(bp.models, dbp.kids):
             recs = (mr.extra or {}).get("eyes") or []
-            want = eyes.get(model.name) or eyes.get("")
-            if not recs or not want:
+            if not recs:
                 continue
-            for rec, obj in zip(recs, want):
+            want = eyes.get(model.name) or eyes.get("") or []
+            for i, rec, obj in _eye_pairs(recs, want):
+                if obj is None:
+                    out["eye_records"].append((model.name, i))
+                    continue
+                used.add(obj.name)
                 out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
+    out["eye_empties"] = [(obj.name, model, int(obj["vtmb_eyeball"]))
+                          for model, objs in sorted(eyes.items()) for obj in objs
+                          if obj.name not in used]
     out["changed"] += _apply_mouth(d, m, arm_obj, out)
     return out
+
+
+def _eye_pairs(recs, want):
+    """[(index, record, empty or None)] over one model's eyeball records.
+
+    Record i is the empty stamped `vtmb_eyeball` i, the first by name when a copy claims
+    the same index; `want` comes sorted that way from `eyeball_objects`.
+    """
+    claim = {}
+    for obj in want:
+        claim.setdefault(int(obj["vtmb_eyeball"]), obj)
+    return [(i, rec, claim.get(i)) for i, rec in enumerate(recs)]
 
 
 def _apply_mouth(d, m, arm_obj, out):
@@ -4309,6 +4331,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["face"] = face["changed"]
     scene["eye_radius_keys"] = face["radius_keys"]
     scene["eye_lid_targets"] = face["lid_targets"]
+    scene["eye_empties"] = face["eye_empties"]
+    scene["eye_records"] = face["eye_records"]
     scene["face_flexdescs"] = face["flexdescs"]
     # After the mesh pass above rather than beside it: an eyeball is the one thing that
     # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
