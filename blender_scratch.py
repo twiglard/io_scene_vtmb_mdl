@@ -677,7 +677,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None, face=None):
     """
     slot_of = {}
     total_unskinned = total_kept = 0
-    crowded, cloths, stray = [], [], []
+    crowded, cloths, stray, seams = [], [], [], []
     for obj in mesh_objs:
         runs, unskinned, kept, _why, _edits, origins = split_mesh(obj, bone_index,
                                                                   scale)
@@ -697,6 +697,16 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None, face=None):
                 slot_of[name] = build_mod.add_material(d, name)
             meshes.append((slot_of[name], verts, faces))
         cloth = cloth_params(obj)
+        # A cloth mesh keeps one vertex per particle, so it is never split.
+        if cloth is None:
+            copies = 0
+            for k, (mi, verts, faces) in enumerate(meshes):
+                verts, faces, src = build_mod.split_handedness(verts, faces)
+                meshes[k] = (mi, verts, faces)
+                origins[k].extend(origins[k][i] for i in src)
+                copies += len(src)
+            if copies:
+                seams.append((obj.name, copies))
         if cloth is not None:
             if len(meshes) != 1:
                 raise Refused("%s is marked as cloth and uses %d materials -- a cloth "
@@ -722,7 +732,7 @@ def add_meshes(d, mesh_objs, bone_index, scale=1.0, owners=None, face=None):
             if cloth is not None:
                 add_cloth(d, obj, cverts, cfaces, npin, cflip, corig)
                 cloths.append((obj.name, npin, len(cverts)))
-    return list(d.faces), total_unskinned, total_kept, crowded, cloths, stray
+    return list(d.faces), total_unskinned, total_kept, crowded, cloths, stray, seams
 
 
 _ARM = ("upperarm", "forearm", "hand", "finger", "thumb")
@@ -1361,7 +1371,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
         raise Refused("the armature has no bones")
     owners = []
     face = {"flexes": 0, "flex_records": 0, "eye_meshes": []}
-    faces, unskinned, kept, crowded, cloths, stray = add_meshes(
+    faces, unskinned, kept, crowded, cloths, stray, face["seams"] = add_meshes(
         d, mesh_objs, bone_index, scale, owners, face)
     face["meshless"] = meshless_model(d)
     if face["meshless"]:
@@ -1516,4 +1526,4 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "unskinned": unskinned, "dropped": dict(d.dropped),
             "cloths": cloths, "stray_groups": stray,
             "scene_hitboxes": hbox[0:2], "refit_hitboxes": hbox[2],
-            "lods": st["lods"], "meshless": face["meshless"]}
+            "lods": st["lods"], "meshless": face["meshless"], "seams": face["seams"]}

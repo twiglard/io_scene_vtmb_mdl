@@ -2470,6 +2470,10 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         for name, npin, nvert in r.get("cloths") or ():
             self.report({"INFO"}, "%s: cloth over %d particles, %d of them pinned"
                         % (name, nvert, npin))
+        for name, copies in r.get("seams") or ():
+            self.report({"INFO"}, "%s: %d vertices on a UV mirror seam written twice, one "
+                                  "per tangent handedness, so both sides light their bump "
+                                  "map the right way" % (name, copies))
         nvol, vmoved = r.get("cloth_volumes") or (0, 0)
         if nvol:
             self.report({"INFO"}, "%d cloth collision capsule or sphere record%s written from "

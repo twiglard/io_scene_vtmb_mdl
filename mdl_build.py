@@ -2389,6 +2389,50 @@ def _tangents(verts, tris):
             for v, b in zip(verts, _tangent_basis(verts, tris))]
 
 
+def corner_handedness(verts, tris):
+    """{(triangle, corner): True where left-handed}, by studiomdl's per-vertex rule
+    `dot(cross(s, t), n) < 0` applied to one triangle's s and t; a zero UV area gives none."""
+    out = {}
+    for ti, tri in enumerate(tris):
+        a, b, c = (verts[i] for i in tri)
+        e1 = [b[0][k] - a[0][k] for k in range(3)]
+        e2 = [c[0][k] - a[0][k] for k in range(3)]
+        du1, dv1 = b[2][0] - a[2][0], b[2][1] - a[2][1]
+        du2, dv2 = c[2][0] - a[2][0], c[2][1] - a[2][1]
+        det = du1 * dv2 - du2 * dv1
+        if not det:
+            continue
+        s = [(e1[k] * dv2 - e2[k] * dv1) / det for k in range(3)]
+        t = [(e2[k] * du1 - e1[k] * du2) / det for k in range(3)]
+        st = (s[1] * t[2] - s[2] * t[1], s[2] * t[0] - s[0] * t[2], s[0] * t[1] - s[1] * t[0])
+        for corner, i in enumerate(tri):
+            n = verts[i][1]
+            out[(ti, corner)] = st[0] * n[0] + st[1] * n[1] + st[2] * n[2] < 0.0
+    return out
+
+
+def split_handedness(verts, tris):
+    """(verts, tris, sources): each vertex whose triangles disagree in handedness gains a
+    copy holding its left-handed triangles; `sources[k]` is the vertex copy k came from.
+
+    One `w` per vertex draws one side of a UV mirror seam with its bump lighting inverted.
+    Troika's files split such a vertex at 11 539 points over 519 of 3027 filetype-0 models.
+    """
+    sides = corner_handedness(verts, tris)
+    seen = {}
+    for (ti, corner), left in sides.items():
+        seen.setdefault(tris[ti][corner], set()).add(left)
+    copy, sources = {}, []
+    for i in sorted(i for i, got in seen.items() if len(got) == 2):
+        copy[i] = len(verts) + len(sources)
+        sources.append(i)
+    out = []
+    for ti, tri in enumerate(tris):
+        out.append(tuple(copy[i] if i in copy and sides.get((ti, corner)) else i
+                         for corner, i in enumerate(tri)))
+    return list(verts) + [verts[i] for i in sources], out, sources
+
+
 # Which bytes of a vertex record a tangent is computed from. filetype 0 keeps its skinning
 # in the first twelve; 1 and 2 carry nothing but position, normal and UV.
 _GEOM_SPAN = {0: (12, 44), 1: (0, 12), 2: (0, 8)}
