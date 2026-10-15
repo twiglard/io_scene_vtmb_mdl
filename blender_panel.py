@@ -1620,6 +1620,8 @@ class VTMB_PT_armature(bpy.types.Panel):
             col.label(text="    " + p)
 
         lay.operator(VTMB_OT_check_paths.bl_idname, icon="VIEWZOOM")
+        lay.operator("object.vtmb_merge_skeleton", text="Add bones from a .mdl",
+                     icon="ARMATURE_DATA")
 
         col = lay.column(align=True)
         col.label(text="Model header, in the armature's space", icon="OBJECT_ORIGIN")

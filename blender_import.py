@@ -195,6 +195,38 @@ def _display_lengths(m, rest, scale):
     return out
 
 
+def place_bone(eb, matrix, length):
+    """Head, tail direction and roll off `matrix`, armature space, then the drawn length."""
+    # A zero-length bone is silently dropped, so give it a tail before the matrix
+    # assignment, which then overwrites head, tail direction and roll together.
+    eb.head = (0.0, 0.0, 0.0)
+    eb.tail = (0.0, length, 0.0)
+    eb.matrix = matrix
+    eb.length = length
+
+
+def stamp_bone(pb, b, dbs, parent):
+    """The keys a file bone `b` carries on its pose bone, springs aside. `parent` is the
+    name of the scene bone it hangs from, or None."""
+    pb.rotation_mode = "QUATERNION"
+    # Blender keeps no record of a rename, and the export resolves every file bone by
+    # name, so without this a renamed bone reads as one deleted and one added.
+    pb["vtmb_bone_name"] = b.name
+    # Bit 1 is BONE_ROTATION_FROM_ROOT, which decides what a pose's local rotation even
+    # means, so a scene-authored rewrite has to know it before it samples a frame.
+    pb["vtmb_bone_flags"] = b.flags
+    # rotscale bounds what can ever be written back to this bone.
+    pb["vtmb_rotscale"] = list(b.rotscale)
+    pb["vtmb_posscale"] = list(b.posscale)
+    pb["vtmb_rot_limit"] = [32767.0 * s for s in b.rotscale]
+    # The export path's did-this-move baseline. The file's own record cannot serve:
+    # head/tail/roll storage loses up to 1.4e-3 per quaternion entry on a short bone.
+    local = dbs[pb.name].matrix_local
+    if parent is not None:
+        local = dbs[parent].matrix_local.inverted() @ local
+    pb["vtmb_rest_local"] = [f for row in local for f in row]
+
+
 def build_armature(context, m, name, scale, root_motion=True):
     arm_data = bpy.data.armatures.new(name)
     arm_obj = bpy.data.objects.new(name, arm_data)
@@ -208,12 +240,7 @@ def build_armature(context, m, name, scale, root_motion=True):
     edit_bones = []
     for b, w, ln in zip(m.bones, rest, lengths):
         eb = arm_data.edit_bones.new(b.name)
-        # A zero-length bone is silently dropped, so give it a tail before the matrix
-        # assignment, which then overwrites head, tail direction and roll together.
-        eb.head = (0.0, 0.0, 0.0)
-        eb.tail = (0.0, ln, 0.0)
-        eb.matrix = _scaled(w, scale)
-        eb.length = ln
+        place_bone(eb, _scaled(w, scale), ln)
         edit_bones.append(eb)
     for b, eb in zip(m.bones, edit_bones):
         if b.parent >= 0:
@@ -235,23 +262,7 @@ def build_armature(context, m, name, scale, root_motion=True):
         springs.setdefault(s.bone, s)
     for b in m.bones:
         pb = arm_obj.pose.bones[b.name]
-        pb.rotation_mode = "QUATERNION"
-        # rotscale bounds what can ever be written back to this bone.
-        # Bit 1 is BONE_ROTATION_FROM_ROOT, which decides what a pose's local rotation even
-        # means, so a scene-authored rewrite has to know it before it samples a frame.
-        # Blender keeps no record of a rename, and the export resolves every file bone by
-        # name, so without this a renamed bone reads as one deleted and one added.
-        pb["vtmb_bone_name"] = b.name
-        pb["vtmb_bone_flags"] = b.flags
-        pb["vtmb_rotscale"] = list(b.rotscale)
-        pb["vtmb_posscale"] = list(b.posscale)
-        pb["vtmb_rot_limit"] = [32767.0 * s for s in b.rotscale]
-        # The export path's did-this-move baseline. The file's own record cannot serve:
-        # head/tail/roll storage loses up to 1.4e-3 per quaternion entry on a short bone.
-        local = dbs[b.name].matrix_local
-        if b.parent >= 0:
-            local = dbs[m.bones[b.parent].name].matrix_local.inverted() @ local
-        pb["vtmb_rest_local"] = [f for row in local for f in row]
+        stamp_bone(pb, b, dbs, m.bones[b.parent].name if b.parent >= 0 else None)
         sb = springs.get(b.index)
         if sb is not None:
             # The five floats are what the eight bc_* ConVars override at runtime; writing

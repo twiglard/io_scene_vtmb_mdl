@@ -4,9 +4,14 @@
 bones and the `vtmb_*` properties the scratch exporter reads back.
 """
 
-import bpy
+import os
 
+import bpy
+from bpy_extras.io_utils import ImportHelper
+
+from . import blender_import as import_mod
 from . import bone_templates as tpl_mod
+from . import mdl as mdl_mod
 
 # Blender keeps no reference to the strings an EnumProperty callback returns, so a
 # freshly-built list is garbage-collected out from under the UI. Cache it.
@@ -249,6 +254,142 @@ class OBJECT_OT_vtmb_add_skeleton(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _case_twins(names):
+    folded = {}
+    for n in names:
+        folded.setdefault(n.lower(), []).append(n)
+    return [v for v in folded.values() if len(v) > 1]
+
+
+def match_bones(m, arm_name, have):
+    """{file bone index: scene bone name} by exact name, else ignoring case, and the
+    (file, scene) pairs that only ignoring case joined."""
+    folded = {}
+    for n in have:
+        folded.setdefault(n.lower(), []).append(n)
+    target, loose = {}, []
+    for b in m.bones:
+        if b.name in have:
+            target[b.index] = b.name
+            continue
+        got = folded.get(b.name.lower(), [])
+        if len(got) > 1:
+            raise tpl_mod.Refused("%s's bone %r matches %s of %s ignoring case, so which "
+                                  "one it is cannot be told" % (
+                                      os.path.basename(m.path), b.name,
+                                      " and ".join(got), arm_name))
+        if got:
+            target[b.index] = got[0]
+            loose.append((b.name, got[0]))
+    return target, loose
+
+
+def merge_skeleton(context, arm_obj, m):
+    """Add the bones of `m` that `arm_obj` lacks, each at its file rest relative to its
+    parent. A matched bone keeps its rest and its parent; the result names each kind."""
+    twins = _case_twins(b.name for b in m.bones)
+    if twins:
+        raise tpl_mod.Refused("%s has bones named alike but for case: %s" % (
+            os.path.basename(m.path), "; ".join(" and ".join(t) for t in twins[:3])))
+    context.view_layer.objects.active = arm_obj
+    arm_obj.select_set(True)
+    # An armature left in Edit mode has bones its data does not hold yet.
+    bpy.ops.object.mode_set(mode="OBJECT")
+    have = {db.name: (db.parent.name if db.parent else None) for db in arm_obj.data.bones}
+    target, loose = match_bones(m, arm_obj.name, have)
+    matched = [b for b in m.bones if b.index in target]
+
+    def file_parent(b):
+        if b.parent < 0:
+            return None
+        return target.get(b.parent, m.bones[b.parent].name)
+    reparented = [(target[b.index], have[target[b.index]], file_parent(b))
+                  for b in matched if have[target[b.index]] != file_parent(b)]
+
+    scale = float(arm_obj.get("vtmb_scale", 1.0) or 1.0)
+    rest = [import_mod._scaled(w, scale) for w in m.rest_world_matrices()]
+    lengths = import_mod._display_lengths(m, m.rest_world_matrices(), scale)
+    added = []
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        ebs = arm_obj.data.edit_bones
+        # The file orders parents first, so a parent's scene placement is always known.
+        world = {}
+        for b in m.bones:
+            if b.index in target:
+                world[b.index] = ebs[target[b.index]].matrix.copy()
+                continue
+            place = rest[b.index]
+            if b.parent >= 0:
+                place = world[b.parent] @ rest[b.parent].inverted() @ place
+            eb = ebs.new(b.name)
+            import_mod.place_bone(eb, place, lengths[b.index])
+            if b.parent >= 0:
+                eb.parent = ebs[target[b.parent]]
+            target[b.index] = eb.name
+            world[b.index] = eb.matrix.copy()
+            added.append(b)
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    dbs = arm_obj.data.bones
+    groups = {}
+    for s in m.hitboxsets[:1]:
+        for x in s.boxes:
+            groups.setdefault(x.bone, x.group)
+    for b in added:
+        pb = arm_obj.pose.bones[target[b.index]]
+        import_mod.stamp_bone(pb, b, dbs, target[b.parent] if b.parent >= 0 else None)
+        if b.index in groups:
+            pb["vtmb_hitgroup"] = int(groups[b.index])
+    new = {b.index for b in added}
+    return {"added": [target[b.index] for b in added], "matched": len(matched),
+            "loose": loose, "reparented": reparented,
+            "springs": sum(1 for s in m.springbones if s.bone in new)}
+
+
+class OBJECT_OT_vtmb_merge_skeleton(bpy.types.Operator, ImportHelper):
+    """Add the bones of a .mdl the active armature lacks"""
+    bl_idname = "object.vtmb_merge_skeleton"
+    bl_label = "Add bones from a .mdl"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".mdl"
+    filter_glob: bpy.props.StringProperty(default="*.mdl", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return _armature_of(context) is not None
+
+    def execute(self, context):
+        arm = _armature_of(context)
+        try:
+            m = mdl_mod.Mdl(self.filepath)
+            r = merge_skeleton(context, arm, m)
+        except tpl_mod.Refused as exc:
+            self.report({"ERROR"}, "refused: %s" % exc)
+            return {"CANCELLED"}
+        name = os.path.basename(self.filepath)
+        self.report({"INFO"}, "%s: %d bones added to %s, %d matched by name, %d of them "
+                              "only ignoring case" % (name, len(r["added"]), arm.name,
+                                                      r["matched"], len(r["loose"])))
+        for got, was in r["loose"][:6]:
+            self.report({"INFO"}, "%s is %s's %s" % (got, arm.name, was))
+        for bone, was, file in r["reparented"][:6]:
+            self.report({"WARNING"}, "%s keeps its parent %s, where %s hangs it from %s"
+                        % (bone, was or "(none)", name, file or "(none)"))
+        if len(r["reparented"]) > 6:
+            self.report({"WARNING"}, "and %d more bones keep a parent %s does not give "
+                                     "them" % (len(r["reparented"]) - 6, name))
+        if m.includes:
+            self.report({"WARNING"}, "%s chains %d model(s), which are not added to %s's "
+                                     "chain" % (name, len(m.includes), arm.name))
+        if r["springs"]:
+            self.report({"WARNING"}, "%d spring bone chain(s) of %s start on an added "
+                                     "bone and are not added" % (r["springs"], name))
+        return {"FINISHED"}
+
+
 class VIEW3D_MT_vtmb_add(bpy.types.Menu):
     bl_idname = "VIEW3D_MT_vtmb_add"
     bl_label = "VTMB"
@@ -256,9 +397,11 @@ class VIEW3D_MT_vtmb_add(bpy.types.Menu):
     def draw(self, context):
         self.layout.operator(OBJECT_OT_vtmb_add_skeleton.bl_idname,
                              text="Bone set...", icon="ARMATURE_DATA")
+        self.layout.operator(OBJECT_OT_vtmb_merge_skeleton.bl_idname,
+                             text="Bones from a .mdl...", icon="ARMATURE_DATA")
 
 
-CLASSES = (OBJECT_OT_vtmb_add_skeleton, VIEW3D_MT_vtmb_add)
+CLASSES = (OBJECT_OT_vtmb_add_skeleton, OBJECT_OT_vtmb_merge_skeleton, VIEW3D_MT_vtmb_add)
 
 
 def menu(self, context):
