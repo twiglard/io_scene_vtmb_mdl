@@ -96,6 +96,60 @@ class Content:
                     return path, blob
         return None, None
 
+    def same_checksum(self, m):
+        """Each .vtx beside the .mdl or in a sibling directory, loose or packed, whose
+        checksum is the .mdl's: named from the parent directory, the .mdl's own first.
+
+        For a message only. 7 of the 4445 shipped .mdl have no .vtx under their own name
+        and one of the same checksum within this reach.
+        """
+        want = m.checksum & 0xffffffff
+        rel = getattr(m, "rel", None) or paths_mod.relative(m.path, self.roots)
+        parts = rel.replace("\\", "/").split("/") if rel else []
+        if len(parts) >= 2:
+            parent, mine = "/".join(parts[:-2]), parts[-2]
+            places = [(os.path.join(r, *parent.split("/")) if parent else r, v)
+                      for r, v in zip(self.roots, self.packs)]
+        else:
+            d = os.path.dirname(os.path.abspath(m.path))
+            parent, mine = None, os.path.basename(d)
+            places = [(os.path.dirname(d), None)]
+        found = {}
+        for base, v in places:
+            try:
+                subs = [x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x))]
+            except OSError:
+                subs = []
+            for sub in subs:
+                try:
+                    names = os.listdir(os.path.join(base, sub))
+                except OSError:
+                    continue
+                for f in names:
+                    if f.lower().endswith(".vtx"):
+                        key = "%s/%s" % (sub, f)
+                        found.setdefault(key.lower(), (key, os.path.join(base, sub, f), None))
+            if v is None or parent is None:
+                continue
+            pre = (parent + "/").lower() if parent else ""
+            for k in v.index:
+                tail = k[len(pre):]
+                if k.startswith(pre) and k.endswith(".vtx") and tail.count("/") == 1:
+                    found.setdefault(tail, (tail, None, (v, k)))
+        out = []
+        for key, path, hit in found.values():
+            try:
+                if path is None:
+                    head = hit[0].read(hit[1], 0x14)
+                else:
+                    with open(path, "rb") as f:
+                        head = f.read(0x14)
+            except OSError:
+                continue
+            if len(head) == 0x14 and struct.unpack_from("<I", head, 0x10)[0] == want:
+                out.append(key)
+        return sorted(out, key=lambda x: (x.split("/")[0].lower() != mine.lower(), x.lower()))
+
 
 def _addon_version():
     mod = sys.modules.get(__package__)
@@ -813,7 +867,20 @@ def _eyeball_empty(m, e, model, arm_obj, name, scale, dbs):
 def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
     path, blob = content.companion(m, vtx_mod.SUFFIXES)
     if path is None:
-        return [], "no .vtx for this .mdl on any content root, so no faces to import"
+        # Mod_LoadVtxFile_vtmb opens the requested path's .vtx and never the header name's
+        # (recon 32), so the import does not borrow one the game would not load either.
+        why = ("no .vtx named after %s on any content root, so no faces to import; the "
+               "game opens the .vtx by the .mdl's own path and no other, so it draws "
+               "nothing for this model either" % os.path.basename(m.path))
+        near = content.same_checksum(m)
+        ck = m.checksum & 0xffffffff
+        if not near:
+            return [], "%s. No .vtx beside it or in a sibling directory has its checksum " \
+                "%#x" % (why, ck)
+        names = ", ".join(near[:4]) + (" and %d more" % (len(near) - 4) if len(near) > 4 else "")
+        return [], "%s. %s %s its checksum %#x, and neither the import nor the game reads " \
+            "%s" % (why, names, "has" if len(near) == 1 else "have", ck,
+                    "it" if len(near) == 1 else "them")
     try:
         v = vtx_mod.Vtx(path, blob)
     except Exception as exc:

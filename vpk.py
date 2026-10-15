@@ -108,14 +108,15 @@ class Vpks:
                     self.index[name] = (p, off, size)
         self.packs.reverse()
 
-    def read(self, name):
+    def read(self, name, limit=None):
+        """The entry's bytes, or its first `limit` bytes."""
         hit = self.index.get(name.replace("\\", "/").lower())
         if hit is None:
             return None
         path, off, size = hit
         with open(path, "rb") as f:
             f.seek(off)
-            return f.read(size)
+            return f.read(size if limit is None else min(size, limit))
 
 
 def main(argv):
