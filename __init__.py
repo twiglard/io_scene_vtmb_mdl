@@ -95,26 +95,6 @@ def _mode_tally(actions):
             for k in blender_export.ROOT_MOTION_MODES if k in got]
 
 
-FACE_FLEXDESC_WHY = (
-    ("morph", "lid flexes added: %s. The eyeball code weights them every frame, and no shape "
-              "key carries them, so the lids do not move"),
-    ("input", "lid inputs added: %s. No rule writes them, so their weight stays 0 and they "
-              "add nothing to the lid's travel"),
-    ("mouth", "mouth flex added: %s. No rule writes it, so its weight stays 0, and the game "
-              "scales the light on the mouth by that weight"),
-    (None, "flex names added: %s, named by a face record and nothing else"),
-)
-
-
-def _report_face_flexdescs(op, arm_obj, added):
-    """One warning per role the lid and mouth flexdescs an export appended play."""
-    roles = blender_export.flexdesc_roles(arm_obj, added)
-    for role, text in FACE_FLEXDESC_WHY:
-        names = [n for n in added if roles[n] == role]
-        if names:
-            op.report({"WARNING"}, text % ", ".join(names))
-
-
 def _write_vmts(context, dirs, dest, names, enabled):
     """The `.vmt` for each material the export just added, and what to say about it.
 
@@ -1943,7 +1923,6 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "vtmb_eyeball %d, so it is written as the donor had "
                                      "it. A donor export removes no eyeball"
                         % (i, model, i))
-        _report_face_flexdescs(self, obj, scene.get("face_flexdescs") or ())
         for name, has_lids in scene.get("eye_lid_targets") or ():
             self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
                                      "neither, so this one is written as the scene has it "
@@ -2560,7 +2539,6 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                      "neither, so no shipped file looks like this one"
                         % (name, "lid flexes and no aim points" if has_lids
                            else "aim points and no lid flexes"))
-        _report_face_flexdescs(self, obj, r.get("face_flexdescs") or ())
         eye_mats = r.get("eye_materials") or []
         if eye_mats:
             self.report({"WARNING"}, "no .vmt or .tth written for %d eye material%s: %s. A "

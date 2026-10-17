@@ -878,8 +878,7 @@ def draw_face(lay, context, arm_obj):
                 box.label(text="%s: not stashed" % label, icon="INFO")
             else:
                 box.prop(arm_obj, '["vtmb_mouth"]["%s"]' % k, text=label)
-        box.label(text="a flex name this file has not got is added to it, and the export "
-                       "says so", icon="INFO")
+        box.label(text="the export refuses a jaw flex no flex rule writes", icon="INFO")
     eyes = blender_export.eyeball_objects(arm_obj)
     n = sum(len(v) for v in eyes.values())
     if not n:

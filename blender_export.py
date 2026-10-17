@@ -2488,34 +2488,48 @@ def _material_index(d, name, added=None):
     return len(d.textures) - 1
 
 
-def _flexdesc_index(d, name, added=None):
-    """The mstudioflexdesc_t slot named `name`, appended if the file carries none.
+def face_flexes_refused(d):
+    """Refused naming every lid or mouth flex that nothing in the file as written makes.
 
-    Collected the way `_material_index` collects a material: a flex name reaching here by
-    a typo costs a descriptor the engine will never weight and nothing would be said.
+    The mouth's flex and lid flexes 0-5 are weights only a flex rule writes; lid flexes 6-7
+    are weights the eyeball code writes and only a shape key shows (`r_studioflex.cpp:118-144`).
+    9 of the 4445 shipped files fail it, named in roadmap section 4c.
     """
-    was = len(d.flexdescs)
-    i = build_mod.flexdesc_index(d, name)
-    if added is not None and len(d.flexdescs) > was:
-        added.append(name)
-    return i
+    rules = {struct.unpack_from("<i", r.raw, 0)[0] for r in d.flexrules}
+    keys = {struct.unpack_from("<i", f.raw, 0)[0] for bp in d.bodyparts for mr in bp.kids
+            for mesh in mr.kids for f in mesh.kids}
 
+    def names(ids):
+        return ", ".join(repr(d.flexdescs[i].name) if 0 <= i < len(d.flexdescs)
+                         else "#%d" % i for i in dict.fromkeys(ids))
 
-def flexdesc_roles(arm_obj, names):
-    """{name: "morph", "input", "mouth" or None} for flexdescs a face record appended.
-
-    `vtmb_eyeball_lidflexes` 0-5 are the lid inputs `r_studioflex.cpp:118-124` reads and 6-7
-    the lid morphs it writes at :139/:144; only a rule writes an input or the mouth's.
-    """
-    role = {}
-    mouth = arm_obj.get("vtmb_mouth")
-    if mouth and mouth.get("flex"):
-        role[str(mouth["flex"])] = "mouth"
-    for o in (o for objs in eyeball_objects(arm_obj).values() for o in objs):
-        for k, x in enumerate(o.get("vtmb_eyeball_lidflexes") or ()):
-            if x:
-                role.setdefault(str(x), "morph" if k >= 6 else "input")
-    return {n: role.get(n) for n in names}
+    bad = ["the mouth's %s, which no flex rule writes" % names([i])
+           for i in (struct.unpack_from("<i", r.raw, 16)[0] for r in d.mouths)
+           if i not in rules]
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            model = bytes(mr.raw[:128]).split(b"\0")[0].decode("latin1")
+            for k, e in enumerate((mr.extra or {}).get("eyes") or ()):
+                ids = struct.unpack_from("<6i", e.raw, 0x44) + struct.unpack_from(
+                    "<2i", e.raw, 0x74)
+                if not any(ids):
+                    continue
+                inputs = [i for i in ids[:6] if i not in rules]
+                morphs = [i for i in ids[6:] if i not in keys]
+                if inputs:
+                    bad.append("eyeball %d of %r: lid flexes %s, which no flex rule writes"
+                               % (k, model, names(inputs)))
+                if morphs:
+                    bad.append("eyeball %d of %r: lid flexes %s, which no shape key carries"
+                               % (k, model, names(morphs)))
+    if bad:
+        raise build_mod.Refused(
+            "nothing makes these face flexes, so the game would weight them for nothing: "
+            "%s. Write a flex rule of that name (Add flex line, in the armature's VTMB flex "
+            "controllers panel) or a shape key of that name, or give the mouth a Jaw flex a "
+            "rule writes (VTMB eyeballs and mouth), or set the eyeball empty's Lid flexes to "
+            "None (VTMB eyeball)"
+            % "; ".join(bad))
 
 
 # The three lid-flex name sets the corpus carries, and there is no fourth: over the 602
@@ -3199,13 +3213,12 @@ class _Named(object):
 def apply_face(d, m, arm_obj, scale):
     """The eyeball records and the one mouth record, written only where they differ.
 
-    Answers `{changed, materials, radius_keys, lid_targets, flexdescs, eye_empties,
-    eye_records}` -- the record count, the material names an eyeball put in the file, the
-    eyeballs whose `vtmb_eyeball_radius` says something neither the sphere nor the file
-    says, the eyeballs holding lid flexes without aim points or the other way round, the
-    flex names a lid or the mouth appended to the file's mstudioflexdesc_t array, the
-    empties no record took as (name, model, index), and the records no empty claimed as
-    (model, index), which keep the donor's bytes.
+    Answers `{changed, materials, radius_keys, lid_targets, eye_empties, eye_records}` --
+    the record count, the material names an eyeball put in the file, the eyeballs whose
+    `vtmb_eyeball_radius` says something neither the sphere nor the file says, the eyeballs
+    holding lid flexes without aim points or the other way round, the empties no record
+    took as (name, model, index), and the records no empty claimed as (model, index),
+    which keep the donor's bytes.
 
     Every index a scene holds is a NAME here and is resolved against this file: the two
     materials against mstudiotexture_t, the eight lid flexes and the mouth's flex against
@@ -3221,7 +3234,7 @@ def apply_face(d, m, arm_obj, scale):
     Raises Refused naming every lid target component at or past its eyeball's radius.
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
-           "flexdescs": [], "eye_empties": [], "eye_records": [], "lid_past_radius": []}
+           "eye_empties": [], "eye_records": [], "lid_past_radius": []}
     eyes = eyeball_objects(arm_obj)
     used = set()
     # A model record carries no name of its own in the description, so the name comes off
@@ -3298,7 +3311,7 @@ def _apply_mouth(d, m, arm_obj, out):
     fwd = (tuple(float(c) for c in mouth["forward"])
            if mouth.get("forward") is not None else have[1:4])
     flex = str(mouth.get("flex") or "")
-    fi = _flexdesc_index(d, flex, out["flexdescs"]) if flex else have[4]
+    fi = build_mod.flexdesc_index(d, flex) if flex else have[4]
     if (have[0] != bi or have[4] != fi
             or not all(_same(a, b) for a, b in zip(have[1:4], fwd))):
         struct.pack_into("<i3fi", raw, 0, bi, fwd[0], fwd[1], fwd[2], fi)
@@ -3338,7 +3351,7 @@ def _apply_eyeball(d, rec, obj, scale, out):
         if abs(write_mod.f32(t)) >= write_mod.f32(radius)]
     # A shipped record says "no lid flexes" by holding zero in all eight, never -1, so an
     # empty scene list writes eight zeros and not a sentinel.
-    ids = ([_flexdesc_index(d, x, out["flexdescs"]) if x else 0 for x in lids]
+    ids = ([build_mod.flexdesc_index(d, x) if x else 0 for x in lids]
            if len(lids) == 8 else [0] * 8)
     file_radius = struct.unpack_from("<f", raw, 0x18)[0]
     key = obj.get("vtmb_eyeball_radius")
@@ -4434,7 +4447,6 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["eye_lid_targets"] = face["lid_targets"]
     scene["eye_empties"] = face["eye_empties"]
     scene["eye_records"] = face["eye_records"]
-    scene["face_flexdescs"] = face["flexdescs"]
     # After the mesh pass above rather than beside it: an eyeball is the one thing that
     # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
     for name in face["materials"]:
@@ -4619,6 +4631,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # Whether or not the keys were written: a rule deleted in the panel leaves its flex
     # undriven just the same.
     mesh["flex_undriven"] = build_mod.undriven_flexes(d)
+    # After the keys and the rules, which come later here than the face pass and can make a
+    # name a face record appended.
+    face_flexes_refused(d)
 
     # After the geometry: a rest length is refitted against where the vertex now sits, and
     # a rebuilt model has just moved them.

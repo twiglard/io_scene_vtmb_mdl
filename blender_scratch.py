@@ -936,7 +936,7 @@ def scene_face(d, arm_obj, eye_meshes, bone_index, scale=1.0):
     a record's written position is what an eye mesh's `materialparam` names.
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
-           "flexdescs": [], "eye_empties": [], "eye_records": [], "lid_past_radius": [],
+           "eye_empties": [], "eye_records": [], "lid_past_radius": [],
            "eyeballs": 0, "unmeshed": [], "mouth": 0}
     models = {}
     for bi, bp in enumerate(d.bodyparts):
@@ -981,7 +981,7 @@ def scene_face(d, arm_obj, eye_meshes, bone_index, scale=1.0):
         eyed.add((bi, j))
     out["unmeshed"] = [(_model_name(d.bodyparts[bi].kids[0]), j) for bi in sorted(at)
                        for j in range(len(at[bi])) if (bi, j) not in eyed]
-    out["mouth"] = scene_mouth(d, arm_obj, bone_index, out)
+    out["mouth"] = scene_mouth(d, arm_obj, bone_index)
     return out
 
 
@@ -998,7 +998,7 @@ def eye_materials(d, appended):
     return out
 
 
-def scene_mouth(d, arm_obj, bone_index, out):
+def scene_mouth(d, arm_obj, bone_index):
     """The one mstudiomouth_t off `vtmb_mouth`, or nothing where the armature has none.
 
     The bone is a Blender name where the panel's picker set it and the file's where the
@@ -1015,7 +1015,8 @@ def scene_mouth(d, arm_obj, bone_index, out):
             if v is None or v == ""]
     if lack:
         raise Refused("the armature's mouth carries no %s, and with no donor there is no "
-                      "value to keep -- set it in the Face panel" % " and no ".join(lack))
+                      "value to keep -- set it in the armature's VTMB eyeballs and mouth "
+                      "panel" % " and no ".join(lack))
     bi = bone_index.get(bone)
     if bi is None:
         bi = stash_bones(arm_obj, bone_index).get(bone)
@@ -1023,7 +1024,7 @@ def scene_mouth(d, arm_obj, bone_index, out):
         raise Refused("the mouth is on bone %r, which is not being written" % bone)
     raw = bytearray(20)
     struct.pack_into("<i3fi", raw, 0, bi, *[float(c) for c in fwd],
-                     export_mod._flexdesc_index(d, flex, out["flexdescs"]))
+                     build_mod.flexdesc_index(d, flex))
     d.mouths.append(build_mod.Rec(raw))
     return 1
 
@@ -1381,10 +1382,11 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     if face["meshless"]:
         faces = list(d.faces)
     # Keys first, then rules, then lids and the mouth: each appends the flexdescs it names
-    # and the file lacks, and only the last two are reported, since nothing weights them.
+    # and the file lacks, and a lid or mouth flex no key or rule made is refused.
     face["controllers"], face["rules"], face["rule_flexdescs"] = export_mod.apply_flex(
         d, None, arm_obj)
     face.update(scene_face(d, arm_obj, face.pop("eye_meshes"), bone_index, scale))
+    export_mod.face_flexes_refused(d)
     # The scene is the authority: a box or a set the user placed is written whatever the
     # option says, and the refit fills in only a scene that carries neither.
     nbox, nset = scene_hitboxes(d, arm_obj, bone_index, scale)
@@ -1513,7 +1515,6 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             "eyeballs": face["eyeballs"], "mouths": face["mouth"],
             "eye_unmeshed": face["unmeshed"], "eye_empties": face["eye_empties"],
             "eye_radius_keys": face["radius_keys"], "eye_lid_targets": face["lid_targets"],
-            "face_flexdescs": face["flexdescs"],
             "anims": len(d.anims), "seqs": len(d.seqs),
             # Skipped: labels no written action reaches.
             "seqs_imported": seqs["imported"], "seqs_from_stash": seqs["written"],
