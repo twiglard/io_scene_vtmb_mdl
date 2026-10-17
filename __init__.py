@@ -318,6 +318,22 @@ def _cached_mdl(path):
     return _MDL_CACHE[key]
 
 
+def _export_armature(context):
+    """The armature both exports write: the active object, or the one owning an active mesh.
+
+    A mesh belongs to its parent when that is an armature, else to its first Armature
+    modifier's object, so File > Export works with a mesh selected. A mesh with neither
+    gives None, as does anything else that is not an armature.
+    """
+    obj = context.active_object
+    if obj is None or obj.type != "MESH":
+        return obj
+    if obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+    return next((mo.object for mo in obj.modifiers if mo.type == "ARMATURE"
+                 and mo.object is not None and mo.object.type == "ARMATURE"), None)
+
+
 def _base_from(op, context):
     """The .mdl being rewritten, and what named it: "source", "action", "armature" or "".
 
@@ -327,7 +343,7 @@ def _base_from(op, context):
     """
     if getattr(op, "source", ""):
         return bpy.path.abspath(op.source), "source"
-    obj = context.active_object
+    obj = _export_armature(context)
     ad = obj.animation_data if obj else None
     got = ad.action.get("vtmb_source") if ad and ad.action else None
     if got:
@@ -485,7 +501,7 @@ def _mesh_status(op, context, base, fields):
         no |= set(mesh_write.supported(mo.filetype, fields)[1])
     return (len(blender_export.mesh_objects(m, base)),
             len(mesh_write.models_of(m)), sorted(no),
-            len(blender_export.new_model_objects(m, base, context.active_object)))
+            len(blender_export.new_model_objects(m, base, _export_armature(context))))
 
 
 def _drop_takes(op, context, base):
@@ -507,7 +523,7 @@ def _drop_takes(op, context, base):
 def _surplus_bones(op, context, base):
     """Bones the armature has and the file does not, for the dialog. [] on any error:
     the draw runs on every redraw and a bad path is the Model section's to report."""
-    obj = context.active_object
+    obj = _export_armature(context)
     if not base or obj is None or obj.type != "ARMATURE":
         return []
     try:
@@ -536,7 +552,7 @@ def _donor_cdtextures(base):
 def _auto_name(op, context):
     """Which animation the active-action entry lands on, through the same resolver the
     write uses, so the dialog cannot name one slot while the write takes another."""
-    obj = context.active_object
+    obj = _export_armature(context)
     ad = obj.animation_data if obj else None
     if not (ad and ad.action):
         return None
@@ -551,7 +567,7 @@ def _matches(op, context):
     path = _base_path(op, context)
     anims = _base_anims(path)
     hits, unwritten, _add = blender_export.match_indices([n for n, _ in anims], path,
-                                                         context.active_object)
+                                                         _export_armature(context))
     return [(anims[i][0], a.name) for i, a in sorted(hits.items())], unwritten
 
 
@@ -951,7 +967,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
+        obj = _export_armature(context)
         return (obj is not None and obj.type == "ARMATURE"
                 and obj.animation_data is not None
                 and obj.animation_data.action is not None)
@@ -964,7 +980,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         # there, so they agree until the panel is used, and the panel is the edit this
         # carries through. Empty with no stamp, which keeps the donor's.
         self.cdtexture = ";".join(
-            blender_scratch.scene_cdtextures(context.active_object))
+            blender_scratch.scene_cdtextures(_export_armature(context)))
         base, why = _base_from(self, context)
         self.reading = ("%s (the armature's)" % os.path.basename(base) if why == "armature"
                         else os.path.basename(base) or "(none)")
@@ -974,7 +990,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     def draw(self, context):
         lay = self.layout
         base, why = _base_from(self, context)
-        act = context.active_object.animation_data.action
+        act = _export_armature(context).animation_data.action
 
         box = _section(lay, "vtmb_model", "Model", icon="FILE_3D")
         if box is not None:
@@ -1098,7 +1114,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             if box is not None:
                 # The mode is the action's own, edited in Object Data > VTMB animations.
                 # `root_motion` survives as a property a scripted caller can still force.
-                arm = context.active_object
+                arm = _export_armature(context)
                 _pair(box, "this action's keys",
                       "carry the travel" if act.get("vtmb_root_motion")
                       else "do not carry it")
@@ -1149,7 +1165,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         lay.label(text="Everything else is carried across unchanged.", icon="LOCKED")
 
     def execute(self, context):
-        obj = context.active_object
+        obj = _export_armature(context)
         src = _base_path(self, context)
         if not src:
             self.report({"ERROR"}, "nothing to read from: neither this action nor the "
@@ -2251,11 +2267,11 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
     def poll(cls, context):
         # Not the donor operator's four conditions: those want an assigned action, and
         # allsequences.mdl ships 59 bones with no animations and no sequences.
-        obj = context.active_object
+        obj = _export_armature(context)
         return obj is not None and obj.type == "ARMATURE" and bool(obj.data.bones)
 
     def invoke(self, context, event):
-        obj = context.active_object
+        obj = _export_armature(context)
         self.scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
         self.cdtexture = _scratch_cdtexture(obj)
         self.fit_hull = _scratch_fit_hull(obj)
@@ -2263,7 +2279,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         lay = self.layout
-        obj = context.active_object
+        obj = _export_armature(context)
         meshes = _scratch_meshes(context, obj)
         actions = _scratch_actions(obj)
 
@@ -2415,7 +2431,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 box.label(text=line)
 
     def execute(self, context):
-        obj = context.active_object
+        obj = _export_armature(context)
         meshes = _scratch_meshes(context, obj)
         try:
             with blender_export.placed(meshes, obj) as moved:
