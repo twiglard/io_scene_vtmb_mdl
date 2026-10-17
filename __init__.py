@@ -319,17 +319,20 @@ def _cached_mdl(path):
 
 
 def _export_armature(context):
-    """The armature both exports write: the active object, or the one owning an active mesh.
+    """The armature both exports write: the active object, or the one owning it.
 
-    A mesh belongs to its parent when that is an armature, else to its first Armature
-    modifier's object, so File > Export works with a mesh selected. A mesh with neither
-    gives None, as does anything else that is not an armature.
+    An object belongs to its parent when that is an armature, which every mesh and empty
+    the import and the panel buttons make is, and a mesh with no such parent to its first
+    Armature modifier's object, so File > Export works with any of them selected. Anything
+    else gives None.
     """
     obj = context.active_object
-    if obj is None or obj.type != "MESH":
+    if obj is None or obj.type == "ARMATURE":
         return obj
     if obj.parent is not None and obj.parent.type == "ARMATURE":
         return obj.parent
+    if obj.type != "MESH":
+        return None
     return next((mo.object for mo in obj.modifiers if mo.type == "ARMATURE"
                  and mo.object is not None and mo.object.type == "ARMATURE"), None)
 
