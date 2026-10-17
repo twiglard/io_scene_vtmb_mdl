@@ -970,10 +970,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 
     @classmethod
     def poll(cls, context):
+        # An armature imported with Animations off has no action, and `_base_from` reads
+        # its file off `vtmb_source`, so a mesh-only re-export of it opens too.
         obj = _export_armature(context)
-        return (obj is not None and obj.type == "ARMATURE"
-                and obj.animation_data is not None
-                and obj.animation_data.action is not None)
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        ad = obj.animation_data
+        return (ad is not None and ad.action is not None) or bool(obj.get("vtmb_source"))
 
     def invoke(self, context, event):
         # A scripted run leaves `source` set, and operator properties persist, so without
@@ -993,7 +996,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     def draw(self, context):
         lay = self.layout
         base, why = _base_from(self, context)
-        act = _export_armature(context).animation_data.action
+        ad = _export_armature(context).animation_data
+        act = ad.action if ad else None
 
         box = _section(lay, "vtmb_model", "Model", icon="FILE_3D")
         if box is not None:
@@ -1093,6 +1097,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         box.label(text="    " + blender_export.unwritten_line(*u))
                     if len(rest) > 3:
                         box.label(text="    and %d more" % (len(rest) - 3))
+            elif self.target != NONE and act is None:
+                box.label(text="no action is assigned: set Replace to Nothing to write "
+                               "the meshes alone", icon="ERROR")
             elif self.target != NONE:
                 auto = _auto_name(self, context)
                 if self.target == ACTIVE and not auto and self.add_new:
@@ -1111,7 +1118,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     _pair(box, "frames", "%d-%d (%d)" % (a, b, b - a + 1))
                     box.prop(self, "use_range")
 
-        if self.target != NONE:
+        if self.target != NONE and act is not None:
             box = _section(lay, "vtmb_rootmotion", "Root motion",
                            icon="ORIENTATION_GIMBAL")
             if box is not None:
@@ -1196,7 +1203,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     self.report({"WARNING"},
                                 blender_export.describe_unwritten(rest))
             else:
-                act = obj.animation_data.action
+                ad = obj.animation_data
+                act = ad.action if ad else None
+                if act is None:
+                    raise mdl_build.Refused(
+                        "no action is assigned to %s, so Replace has nothing to write: "
+                        "set Replace to Nothing to write the meshes alone, or to Every "
+                        "matching action" % obj.name)
                 if _appends_active(self, act, adds):
                     actions = {}
                 else:
