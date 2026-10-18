@@ -2592,6 +2592,9 @@ def flex_controller_fields(line):
         hi = 1.0 if hi is None else float(hi)
     except ValueError:
         raise ValueError("flex controller %r has a range that is not two numbers" % line)
+    if lo == hi:
+        raise ValueError("flex controller %r has an empty range: the server normalises a "
+                         "value to (v - min) / (max - min), which divides by zero" % line)
     return t, lo, hi, name
 
 

@@ -1364,11 +1364,30 @@ def _flex_armature(context):
     return obj if obj is not None and obj.type == "ARMATURE" else None
 
 
+_FLEX_RANGE = ("A rule reads the controller in these units: the server normalises a value "
+               "to (v - min) / (max - min) and the client maps it back to "
+               "w * (max - min) + min before the rules run. 0..1 on all 8649 shipped "
+               "controllers")
+
+
+def _draw_flex_dialog(self, context):
+    col = self.layout.column()
+    if self.kind == "CONTROLLER":
+        col.prop(self, "ctype")
+        col.prop(self, "name")
+        row = col.row(align=True)
+        row.prop(self, "lo")
+        row.prop(self, "hi")
+        col.label(text="a rule reads this controller in min..max units", icon="INFO")
+    else:
+        col.prop(self, "name", text="Flex")
+        col.prop(self, "expr")
+
+
 class VTMB_OT_edit_flex_line(bpy.types.Operator):
     bl_idname = "vtmb.edit_flex_line"
     bl_label = "Edit flex line"
-    bl_description = ("Rewrite one flex controller or flex rule. A controller keeps the "
-                      "range it had: it is 0..1 on all 8649 shipped controllers")
+    bl_description = "Rewrite one flex controller or flex rule"
     bl_options = {"REGISTER", "UNDO"}
 
     kind: bpy.props.EnumProperty(name="Array", items=FLEX_KIND_ITEMS,
@@ -1384,6 +1403,8 @@ class VTMB_OT_edit_flex_line(bpy.types.Operator):
         description="A controller's name, or the flex a rule drives. That name is the "
                     "only identity either has")
     expr: bpy.props.StringProperty(name="Expression", default="")
+    lo: bpy.props.FloatProperty(name="Min", default=0.0, description=_FLEX_RANGE)
+    hi: bpy.props.FloatProperty(name="Max", default=1.0, description=_FLEX_RANGE)
 
     @classmethod
     def poll(cls, context):
@@ -1397,20 +1418,14 @@ class VTMB_OT_edit_flex_line(bpy.types.Operator):
                 try:
                     fields = blender_export.flex_controller_fields(line)
                     self.ctype, self.name = fields[0], fields[3]
+                    self.lo, self.hi = fields[1], fields[2]
                 except ValueError:
                     self.name = line
             elif "=" in line:
                 self.name, self.expr = (x.strip() for x in line.split("=", 1))
         return context.window_manager.invoke_props_dialog(self)
 
-    def draw(self, context):
-        col = self.layout.column()
-        if self.kind == "CONTROLLER":
-            col.prop(self, "ctype")
-            col.prop(self, "name")
-        else:
-            col.prop(self, "name", text="Flex")
-            col.prop(self, "expr")
+    draw = _draw_flex_dialog
 
     def execute(self, context):
         arm_obj = _flex_armature(context)
@@ -1419,13 +1434,17 @@ class VTMB_OT_edit_flex_line(bpy.types.Operator):
             self.report({"ERROR"}, "there is no %s line %d"
                         % (self.kind.lower(), self.index))
             return {"CANCELLED"}
-        rng = (0.0, 1.0)
+        rng = [0.0, 1.0]
         if self.kind == "CONTROLLER":
             try:
                 fields = blender_export.flex_controller_fields(lines[self.index])
-                rng = (fields[1], fields[2])
+                rng = [fields[1], fields[2]]
             except ValueError:
                 pass
+            # Run without the dialog, a field the caller did not set keeps the line's own.
+            for k, key in enumerate(("lo", "hi")):
+                if self.properties.is_property_set(key):
+                    rng[k] = getattr(self, key)
         try:
             line = _flex_compose(self.kind, self.ctype, self.name, self.expr, rng)
         except ValueError as e:
@@ -1455,6 +1474,8 @@ class VTMB_OT_add_flex_line(bpy.types.Operator):
         search_options={"SORT", "SUGGESTION"})
     name: bpy.props.StringProperty(name="Name", default="")
     expr: bpy.props.StringProperty(name="Expression", default="")
+    lo: bpy.props.FloatProperty(name="Min", default=0.0, description=_FLEX_RANGE)
+    hi: bpy.props.FloatProperty(name="Max", default=1.0, description=_FLEX_RANGE)
 
     @classmethod
     def poll(cls, context):
@@ -1463,20 +1484,14 @@ class VTMB_OT_add_flex_line(bpy.types.Operator):
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
 
-    def draw(self, context):
-        col = self.layout.column()
-        if self.kind == "CONTROLLER":
-            col.prop(self, "ctype")
-            col.prop(self, "name")
-        else:
-            col.prop(self, "name", text="Flex")
-            col.prop(self, "expr")
+    draw = _draw_flex_dialog
 
     def execute(self, context):
         arm_obj = _flex_armature(context)
         lines = _flex_lines(arm_obj, self.kind)
         try:
-            line = _flex_compose(self.kind, self.ctype, self.name, self.expr)
+            line = _flex_compose(self.kind, self.ctype, self.name, self.expr,
+                                 (self.lo, self.hi))
         except ValueError as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
@@ -1553,9 +1568,8 @@ def draw_flex(lay, arm_obj):
         op.kind, op.index = "CONTROLLER", k
     box.operator("vtmb.add_flex_line", text="Add controller",
                  icon="ADD").kind = "CONTROLLER"
-    # 0.0..1.0 on all 8649 shipped controllers, so the range is stated and not offered.
-    box.label(text="every shipped controller ranges 0..1, and an edit keeps the range "
-                   "the line already has", icon="INFO")
+    box.label(text="every shipped controller ranges 0..1; Add and Edit set another, which "
+                   "a rule reads in those units", icon="INFO")
 
     box = lay.box()
     box.label(text="%d flex rule(s)" % len(rules), icon="SHAPEKEY_DATA")
