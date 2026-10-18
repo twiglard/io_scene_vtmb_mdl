@@ -951,6 +951,26 @@ class VTMB_OT_add_eyeball(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class VTMB_OT_add_mouth(bpy.types.Operator):
+    bl_idname = "vtmb.add_mouth"
+    bl_label = "Add mouth"
+    bl_description = ("Mouth on the active bone, forward (0, -1, 0), weighted by the flex "
+                      "'mouth'. All 200 shipped mouths hold those two, on Bip01 Head. The "
+                      "export refuses it until a flex rule writes 'mouth'")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and context.active_bone is not None and not obj.get("vtmb_mouth"))
+
+    def execute(self, context):
+        context.object["vtmb_mouth"] = {"bone": context.active_bone.name,
+                                        "forward": [0.0, -1.0, 0.0], "flex": "mouth"}
+        return {"FINISHED"}
+
+
 def draw_face(lay, context, arm_obj):
     """The one mouth record as properties, and the eyeballs named rather than indexed.
 
@@ -971,6 +991,7 @@ def draw_face(lay, context, arm_obj):
     mouth = arm_obj.get("vtmb_mouth")
     if not mouth:
         lay.label(text="no mouth", icon="INFO")
+        lay.operator("vtmb.add_mouth", icon="ADD")
     else:
         box = lay.box()
         box.label(text="mouth", icon="USER")
@@ -3016,7 +3037,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
-           VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball,
+           VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,

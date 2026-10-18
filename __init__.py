@@ -2035,6 +2035,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            ", and no mesh's vtmb_eye_slots names eyeball %d, so the game "
                            "draws no eye for it. Add Eyeball stamps the mesh it was "
                            "given" % i))
+        if scene.get("mouth_added"):
+            self.report({"INFO"}, "a mouth record appended, the donor having none")
         for model, i in scene.get("eye_records") or ():
             self.report({"WARNING"}, "eyeball %d of model %r has no empty stamped "
                                      "vtmb_eyeball %d, so it is written as the donor had "

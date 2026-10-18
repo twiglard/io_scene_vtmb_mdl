@@ -3252,7 +3252,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
            "eye_empties": [], "eye_records": [], "lid_past_radius": [],
-           "eyes_added": [], "eye_meshes": 0}
+           "eyes_added": [], "eye_meshes": 0, "mouth_added": False}
     eyes = eyeball_objects(arm_obj)
     used = set()
     at, added = {}, []
@@ -3370,8 +3370,10 @@ def _apply_mouth(d, m, arm_obj, out):
     index would say the wrong thing the moment a slot moves.
     """
     mouth = arm_obj.get("vtmb_mouth")
-    if not mouth or not d.mouths:
+    if not mouth:
         return 0
+    if not d.mouths:
+        return _add_mouth(d, m, arm_obj, mouth, out)
     raw = d.mouths[0].raw
     have = struct.unpack_from("<i3fi", raw, 0)
     # A key absent means the scene never said, so the file's own value stands -- the rule
@@ -3392,6 +3394,38 @@ def _apply_mouth(d, m, arm_obj, out):
         struct.pack_into("<i3fi", raw, 0, bi, fwd[0], fwd[1], fwd[2], fi)
         return 1
     return 0
+
+
+def _add_mouth(d, m, arm_obj, mouth, out):
+    """One mstudiomouth_t on a donor that carries none, off `vtmb_mouth` alone.
+
+    No record holds a value to keep, so a field the stash lacks is refused, as the no-donor
+    export refuses it. No mesh field marks a mouth's mesh on any shipped file, so the record
+    is the whole of it. The bone is a file name where the import stamped it and a Blender
+    name where the panel's picker set it, so both are tried.
+    """
+    bone = str(mouth.get("bone") or "")
+    flex = str(mouth.get("flex") or "")
+    fwd = mouth.get("forward")
+    lack = [k for k, v in (("bone", bone), ("forward", fwd), ("flex", flex))
+            if v is None or v == ""]
+    if lack:
+        raise build_mod.Refused("the armature's mouth carries no %s, and the donor has no "
+                                "mouth to keep a value from -- set it in the armature's VTMB "
+                                "eyeballs and mouth panel" % " and no ".join(lack))
+    bmap = bone_map(m, arm_obj)
+    bi = next((b.index for b in m.bones if b.name == bone), None)
+    if bi is None:
+        bi = next((b.index for b in m.bones if bmap.get(b.name) == bone), None)
+    if bi is None:
+        raise ValueError("the mouth is on bone %r, which is not one this model carries"
+                         % bone)
+    raw = bytearray(20)
+    struct.pack_into("<i3fi", raw, 0, bi, *[float(c) for c in fwd],
+                     build_mod.flexdesc_index(d, flex))
+    d.mouths.append(build_mod.Rec(raw))
+    out["mouth_added"] = True
+    return 1
 
 
 def _eye_material(d, raw, off, name, added):
@@ -4553,6 +4587,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     face = apply_face(d, m, arm_obj, scale, source)
     scene["face"] = face["changed"]
     scene["eyes_added"] = face["eyes_added"]
+    scene["mouth_added"] = face["mouth_added"]
     scene["eye_meshes"] = face["eye_meshes"]
     scene["eye_radius_keys"] = face["radius_keys"]
     scene["eye_lid_targets"] = face["lid_targets"]
