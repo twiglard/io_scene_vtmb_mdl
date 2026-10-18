@@ -17,6 +17,7 @@ import bpy
 import mathutils
 
 from . import blender_export
+from . import blender_flex_preview as preview_mod
 from . import blender_import
 from . import blender_scratch
 from . import mdl as mdl_mod
@@ -1299,8 +1300,10 @@ def _write_flex(arm_obj, kind, lines):
 
     Reading one back hands over a plain Python copy, so `arm[key][0] = x` writes into the
     copy and is discarded -- Blender's own Custom Properties list cannot edit one either.
+    A running preview is rebuilt; the message is why it stopped, if it did.
     """
     arm_obj[FLEX_KEYS[kind]] = list(lines)
+    return preview_mod.refresh(arm_obj)
 
 
 def _flex_type_search(self, context, edit_text):
@@ -1456,8 +1459,10 @@ class VTMB_OT_edit_flex_line(bpy.types.Operator):
                 self.report({"ERROR"}, why)
                 return {"CANCELLED"}
         lines[self.index] = line
-        _write_flex(arm_obj, self.kind, lines)
+        why = _write_flex(arm_obj, self.kind, lines)
         self.report({"INFO"}, "line %d is now %r" % (self.index, line))
+        if why:
+            self.report({"WARNING"}, why)
         return {"FINISHED"}
 
 
@@ -1500,8 +1505,10 @@ class VTMB_OT_add_flex_line(bpy.types.Operator):
             if why:
                 self.report({"ERROR"}, why)
                 return {"CANCELLED"}
-        _write_flex(arm_obj, self.kind, lines + [line])
+        why = _write_flex(arm_obj, self.kind, lines + [line])
         self.report({"INFO"}, "appended %r" % line)
+        if why:
+            self.report({"WARNING"}, why)
         return {"FINISHED"}
 
 
@@ -1537,8 +1544,10 @@ class VTMB_OT_remove_flex_line(bpy.types.Operator):
                                        "would leave the rule driving nothing" % (cited, was))
                 return {"CANCELLED"}
         gone = lines.pop(self.index)
-        _write_flex(arm_obj, self.kind, lines)
+        why = _write_flex(arm_obj, self.kind, lines)
         self.report({"INFO"}, "dropped %r" % gone)
+        if why:
+            self.report({"WARNING"}, why)
         return {"FINISHED"}
 
 
@@ -1597,6 +1606,97 @@ class VTMB_PT_flex(bpy.types.Panel):
     def draw(self, context):
         self.layout.use_property_split = False
         draw_flex(self.layout, context.object)
+
+
+class VTMB_OT_flex_preview(bpy.types.Operator):
+    bl_idname = "vtmb.flex_preview"
+    bl_label = "Preview rules"
+    bl_description = ("Drive every shape key from the flex rules: a slider per controller, a "
+                      "driven weight per flex and the renderer's window on each key. Run "
+                      "again after a shape key or eyeball edit")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return _flex_armature(context) is not None
+
+    def execute(self, context):
+        arm_obj = _flex_armature(context)
+        try:
+            n = preview_mod.start(arm_obj)
+        except ValueError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "%d controller(s), %d driven flex weight(s), %d undriven, "
+                              "%d shape key(s) driven" % n)
+        return {"FINISHED"}
+
+
+class VTMB_OT_flex_preview_stop(bpy.types.Operator):
+    bl_idname = "vtmb.flex_preview_stop"
+    bl_label = "Stop preview"
+    bl_description = ("Remove the preview's drivers and properties and put each shape key's "
+                      "value back")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        arm_obj = _flex_armature(context)
+        return arm_obj is not None and bool(arm_obj.get(preview_mod.ON))
+
+    def execute(self, context):
+        preview_mod.stop(_flex_armature(context))
+        self.report({"INFO"}, "the rule preview is off")
+        return {"FINISHED"}
+
+
+def draw_flex_preview(lay, arm_obj):
+    """The preview's buttons and, while it runs, a slider per controller and per flex
+    nothing drives."""
+    on = bool(arm_obj.get(preview_mod.ON))
+    row = lay.row(align=True)
+    row.operator("vtmb.flex_preview", text="Rebuild preview" if on else "Preview rules",
+                 icon="DRIVER")
+    if not on:
+        lay.label(text="drives each shape key from the rules; the export reads no key's "
+                       "value", icon="INFO")
+        return
+    row.operator("vtmb.flex_preview_stop", text="Stop preview", icon="X")
+    lay.label(text="lids drawn for a gaze straight ahead; a driven key cannot be dragged",
+              icon="INFO")
+    col = lay.column(align=True)
+    for line in _flex_lines(arm_obj, "CONTROLLER"):
+        try:
+            name = blender_export.flex_controller_fields(line)[3]
+        except ValueError:
+            continue
+        if preview_mod.CTL + name in arm_obj:
+            col.prop(arm_obj, '["%s%s"]' % (preview_mod.CTL, name), text=name, slider=True)
+    ad = arm_obj.animation_data
+    driven = {fc.data_path for fc in ad.drivers} if ad is not None else set()
+    free = sorted(k for k in arm_obj.keys() if k.startswith(preview_mod.FLEX)
+                  and '["%s"]' % k not in driven)
+    if free:
+        lay.label(text="%d flex(es) nothing in the file drives" % len(free))
+        col = lay.column(align=True)
+        for k in free:
+            col.prop(arm_obj, '["%s"]' % k, text=k[len(preview_mod.FLEX):], slider=True)
+
+
+class VTMB_PT_flex_preview(bpy.types.Panel):
+    bl_label = "Preview"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_parent_id = "VTMB_PT_flex"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def draw(self, context):
+        draw_flex_preview(self.layout, context.object)
 
 
 class VTMB_PT_accessories(bpy.types.Panel):
@@ -3053,6 +3153,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
+           VTMB_OT_flex_preview, VTMB_OT_flex_preview_stop, VTMB_PT_flex_preview,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,
            VTMB_OT_move_sequence, VTMB_OT_set_blend, VTMB_OT_resize_blends,

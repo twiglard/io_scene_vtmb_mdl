@@ -27,7 +27,8 @@ from . import (checksum, cloth, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_wri
                normal_table, paths,
                relocs, sections, tth, vmt_write, vpk, vtx, vtx_rebuild, vtx_write,
                bone_templates,
-               blender_import, blender_export, blender_scratch, blender_templates,
+               blender_import, blender_export, blender_flex_preview, blender_scratch,
+               blender_templates,
                blender_panel)
 
 import importlib
@@ -2759,8 +2760,8 @@ def register():
     for m in (checksum, sections, relocs, normal_table, cloth, mdl, mdl_write, mdl_build,
               mdl_rebuild, mesh_write, paths, tth, vmt_write, vpk, vtx, vtx_write,
               vtx_rebuild, bone_templates,
-              blender_import, blender_export, blender_scratch, blender_templates,
-              blender_panel):
+              blender_import, blender_export, blender_flex_preview, blender_scratch,
+              blender_templates, blender_panel):
         importlib.reload(m)
     # Tolerate a half-registered state left by an edit-and-re-enable cycle: a stale
     # class of the same bl_idname otherwise makes register_class raise.
