@@ -4176,7 +4176,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    frame_start=None, frame_end=None, fps=None, root_motion_in_keys=True,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
-                   write_cloth=True, vtx_flavours=("dx80",), placed=None):
+                   write_cloth=True, vtx_flavours=("dx80",), placed=None,
+                   before_write=None):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -4210,6 +4211,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     living in the .vtx alone and no field naming one. A rebuild writes the scene's
     positions and skinning as well, an original keeping what was imported only for the
     fields `mesh_fields` leaves out.
+
+    `before_write(d, added)` runs on the finished model before the `.vtx` or the `.mdl` is
+    written, so a caller that refuses over what the edit produced leaves nothing on disk.
+    `added` is the material names the export added, the list the `.vmt` writer reads.
     """
     m = mdl_mod.Mdl(source)
     if verify:
@@ -4640,6 +4645,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     cloth_was = cloth_edits(m, source, d, cloth_maps)
     cloth = apply_cloth(d, m, source, cloth_was) if write_cloth else None
 
+    if before_write is not None:
+        before_write(d, scene["added_materials"])
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)

@@ -137,15 +137,8 @@ def material_stems(name, search_paths=()):
     return out
 
 
-def vmt_value(blob, *keys):
-    """The value a .vmt assigns to the first of `keys` it carries, or None.
-
-    A // outside a quoted string ends the line. Four shipped files comment one
-    "$basetexture" out above the live one, so scanning the quoted tokens alone returns the
-    dead value -- gio_spirit.mdl draws gio_spirit.tth where its .vmt says giospiritbody.
-    The key is not always quoted: every $dudvmap in the corpus is bare, and that same scan
-    sees the values and none of the names.
-    """
+def _vmt_tokens(blob):
+    """Every token of a .vmt, braces included, with // comments cut off."""
     toks = []
     for line in blob.decode("latin1").splitlines():
         q = False
@@ -156,9 +149,36 @@ def vmt_value(blob, *keys):
                 line = line[:i]
                 break
         for m in _VMT_TOKEN.finditer(line):
-            t = m.group(1) if m.group(1) is not None else m.group(2)
-            if t not in ("{", "}"):
-                toks.append(t)
+            toks.append(m.group(1) if m.group(1) is not None else m.group(2))
+    return toks
+
+
+def vmt_pairs(blob):
+    """(shader, [(key, value), ...]) off a .vmt that is one flat block, else None.
+
+    All 406 shipped `Eyes` files are: a shader name, `{`, the pairs, `}`. A nested block
+    such as `Proxies` is not taken apart here.
+    """
+    toks = _vmt_tokens(blob)
+    if len(toks) < 3 or toks[1] != "{" or toks[-1] != "}":
+        return None
+    body = toks[2:-1]
+    if "{" in body or "}" in body or len(body) % 2:
+        return None
+    return toks[0].strip(), [(body[i].strip(), body[i + 1].strip())
+                             for i in range(0, len(body), 2)]
+
+
+def vmt_value(blob, *keys):
+    """The value a .vmt assigns to the first of `keys` it carries, or None.
+
+    A // outside a quoted string ends the line. Four shipped files comment one
+    "$basetexture" out above the live one, so scanning the quoted tokens alone returns the
+    dead value -- gio_spirit.mdl draws gio_spirit.tth where its .vmt says giospiritbody.
+    The key is not always quoted: every $dudvmap in the corpus is bare, and that same scan
+    sees the values and none of the names.
+    """
+    toks = [t for t in _vmt_tokens(blob) if t not in ("{", "}")]
     for key in keys:
         k = key.lower()
         for i in range(len(toks) - 1):

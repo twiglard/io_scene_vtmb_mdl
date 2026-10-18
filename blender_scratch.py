@@ -985,9 +985,9 @@ def scene_face(d, arm_obj, eye_meshes, bone_index, scale=1.0):
     return out
 
 
-def eye_materials(d, appended):
-    """The texture names an eyeball appended, then each eye mesh's own, once each."""
-    out = list(dict.fromkeys(appended))
+def eye_mesh_materials(d):
+    """The texture name of each mesh drawn as an eyeball, once each."""
+    out = []
     for bp in d.bodyparts:
         for mr in bp.kids:
             for mesh in mr.kids:
@@ -996,6 +996,11 @@ def eye_materials(d, appended):
                     if name not in out:
                         out.append(name)
     return out
+
+
+def eye_materials(d, appended):
+    """The texture names an eyeball appended, then each eye mesh's own, once each."""
+    return list(dict.fromkeys(list(appended) + eye_mesh_materials(d)))
 
 
 def scene_mouth(d, arm_obj, bone_index):
@@ -1492,10 +1497,16 @@ def write(d, faces, path, checksum):
     return data, vtx, st
 
 
-def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
+def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, before_write=None,
+                 **kw):
+    """`before_write(d, added)` runs on the built model before any file is written, so a
+    caller that refuses over what the build produced leaves nothing on disk. `added` is
+    every texture name, since with no donor every material is one the export added."""
     (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
      stray, hbox, seqs, face) = build(context, arm_obj, mesh_objs, actions,
                                       embedded_name(path), **kw)
+    if before_write is not None:
+        before_write(d, [r.name for r in d.textures])
     data, vtx, st = write(d, faces, path, checksum)
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
             "hull_inverted": export_mod.inverted_axes(d),
@@ -1507,9 +1518,10 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, **kw):
             # and not only the count, and taking them off d.textures is what stops the
             # list drifting from what add_material actually put in the file.
             "material_names": [r.name for r in d.textures],
-            # Not given a .vmt: a shipped eye mesh is `Eyes` on 588 of 598 and a glint
-            # `UnlitGeneric`, and an `Eyes` `$iris` is not derivable from the record.
+            # `$iris` is not derivable from the record, so an eye mesh's `.vmt` is copied
+            # from its import's and a name only an eyeball record carries gets none.
             "eye_materials": eye_materials(d, face["materials"]),
+            "eye_mesh_materials": eye_mesh_materials(d),
             "flexes": face["flexes"], "flex_records": face["flex_records"],
             "flex_controllers": face["controllers"], "flex_rules": face["rules"],
             "eyeballs": face["eyeballs"], "mouths": face["mouth"],

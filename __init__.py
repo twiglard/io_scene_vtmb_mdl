@@ -95,8 +95,11 @@ def _mode_tally(actions):
             for k in blender_export.ROOT_MOTION_MODES if k in got]
 
 
-def _write_vmts(context, dirs, dest, names, enabled):
+def _write_vmts(context, dirs, dest, names, enabled, texts=None):
     """The `.vmt` for each material the export just added, and what to say about it.
+
+    `texts` is {name: text} for a material whose file is not the `VertexLitGeneric` one
+    this composes -- an eye mesh's, from `_eye_vmts`.
 
     The directory is the first of `dirs`, because a name resolves against the whole list
     as a cross product and the first is the only one a writer can pick without guessing.
@@ -119,13 +122,71 @@ def _write_vmts(context, dirs, dest, names, enabled):
     wrote, kept = [], []
     for name, r in zip(names, rel):
         path = os.path.join(where, r)
-        text = vmt_write.vmt_text(vmt_write.texture_path(dirs[0], name))
+        text = ((texts or {}).get(name)
+                or vmt_write.vmt_text(vmt_write.texture_path(dirs[0], name)))
         (wrote if vmt_write.write_vmt(path, text) else kept).append(r)
     out = ""
     if wrote:
         out += "; wrote %d .vmt under %s" % (len(wrote), where)
     if kept:
         out += "; %d .vmt already existed and were left alone" % len(kept)
+    return out
+
+
+def _roots(context, arm_obj, filepath):
+    """The written file's own tree, then the armature's source, each with the preferences'
+    mods: a `.vmt` the export reads may sit in either."""
+    game_root, mods, extract = _prefs(context)
+    roots = []
+    for anchor in (filepath, arm_obj.get("vtmb_source") or ""):
+        for r in paths.roots(anchor, game_root, mods, extract):
+            if r not in roots:
+                roots.append(r)
+    return roots
+
+
+def _eye_vmts(context, arm_obj, dirs, dest, names, enabled):
+    """{name: text} for each eye mesh material in `names` whose `.vmt` is to be written.
+
+    `Eyes` takes `$iris` from the `.vmt` alone, so the text is the `.vmt` the material was
+    imported with, `$basetexture` pointed at the image written beside it. With nothing to
+    copy the export is refused: no `$iris` is invented, and that file is the user's to write.
+    """
+    if not (enabled and dirs and names):
+        return {}
+    where = os.path.join(paths.content_root(dest) or os.path.dirname(dest),
+                         paths.MATERIALS_DIR)
+    content = blender_import.Content(_roots(context, arm_obj, dest))
+    out, bad = {}, []
+    for name in names:
+        rel = os.path.join(dirs[0], name + ".vmt")
+        if os.path.exists(os.path.join(where, rel)):
+            continue
+        mat = bpy.data.materials.get(name)
+        search = ((list(mat.get("vtmb_search_paths") or ()) if mat is not None else [])
+                  or blender_scratch.scene_cdtextures(arm_obj))
+        blob = next((b for b in (content.read(s + ".vmt")
+                                 for s in paths.material_stems(name, search))
+                     if b is not None), None)
+        if blob is None:
+            bad.append((name, (paths.MATERIALS_DIR + "/" + rel).replace("\\", "/")))
+            continue
+        got = paths.vmt_pairs(blob)
+        if got is None:
+            raise mdl_build.Refused(
+                "the .vmt %r was imported with is not one flat block of keys, so it is not "
+                "copied: write %s by hand, or untick Write .vmt"
+                % (name, (paths.MATERIALS_DIR + "/" + rel).replace("\\", "/")))
+        shader, pairs = got
+        out[name] = vmt_write.vmt_text(
+            vmt_write.texture_path(dirs[0], name), shader=shader,
+            extra=[(k, v) for k, v in pairs if k.lower() != "$basetexture"])
+    if bad:
+        raise mdl_build.Refused(
+            "no .vmt to copy for the eye material%s %s, so nothing says what $iris %s: "
+            "write %s by hand (Eyes, with $basetexture and $iris), or untick Write .vmt"
+            % ("" if len(bad) == 1 else "s", ", ".join(repr(n) for n, _p in bad),
+               "is" if len(bad) == 1 else "they take", ", ".join(p for _n, p in bad)))
     return out
 
 
@@ -815,7 +876,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "with this also a materials/<dir>/<name>.vmt beside the model, so it "
                     "resolves to something rather than the purple checkerboard. The .mdl "
                     "carries only a name and a directory list, so without the .vmt "
-                    "nothing says which image the material means. An existing .vmt is "
+                    "nothing says which image the material means. An eye mesh's is the "
+                    ".vmt it was imported with, $basetexture pointed at its image, and "
+                    "the export stops when there is none to copy. An existing .vmt is "
                     "never overwritten")
     write_tth: bpy.props.BoolProperty(
         name="Write .tth/.ttz for new materials", default=False,
@@ -1233,9 +1296,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             arm_scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
             objs = (list(blender_export.mesh_objects(m, src).values())
                     + blender_export.new_model_objects(m, src, obj))
+            eye_vmts = {}
+
+            def vet(d, added):
+                eye_vmts.update(_eye_vmts(
+                    context, obj, blender_scratch.scene_cdtextures(obj), self.filepath,
+                    [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
+                    self.write_vmt))
+
             with blender_export.placed(objs, obj) as moved:
                 r = blender_export.export_actions(
                     context, obj, src, self.filepath, actions, scale=arm_scale,
+                    before_write=vet,
                     placed={row["object"]: row["matrix"] for row in moved},
                     root_motion_in_keys=self.root_motion_in_keys,
                     root_motion=self.root_motion,
@@ -1974,7 +2046,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                          ", ".join(scene["added_materials"])))
             dirs = blender_scratch.scene_cdtextures(obj)
             extra += _write_vmts(context, dirs, self.filepath,
-                                 scene["added_materials"], self.write_vmt)
+                                 scene["added_materials"], self.write_vmt, eye_vmts)
             extra += _write_tths(context, dirs, self.filepath,
                                  scene["added_materials"], self.write_tth,
                                  self.tth_format)
@@ -2101,12 +2173,7 @@ def _cloth_bumps(context, arm_obj, filepath):
     if (len(head) < 232 or not int.from_bytes(head[228:232], "little")
             & mdl_build.STUDIOHDR_FLAGS_CLOTH):
         return []
-    game_root, mods, extract = _prefs(context)
-    roots = []
-    for anchor in (filepath, arm_obj.get("vtmb_source") or ""):
-        for r in paths.roots(anchor, game_root, mods, extract):
-            if r not in roots:
-                roots.append(r)
+    roots = _roots(context, arm_obj, filepath)
     if not roots:
         return []
     hits, _unread = blender_export.cloth_bumpmaps(mdl.Mdl(filepath),
@@ -2186,7 +2253,9 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     "added -- there is no donor to have carried a texture record -- so "
                     "without this the model resolves nothing and draws as the purple "
                     "checkerboard. The .mdl carries only a name and the directory list "
-                    "above, so nothing else says which image a material means. An "
+                    "above, so nothing else says which image a material means. An eye "
+                    "mesh's is the .vmt it was imported with, $basetexture pointed at "
+                    "its image, and the export stops when there is none to copy. An "
                     "existing .vmt is never overwritten")
     write_tth: bpy.props.BoolProperty(
         name="Write .tth/.ttz for every material", default=False,
@@ -2449,13 +2518,22 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         obj = _export_armature(context)
         meshes = _scratch_meshes(context, obj)
+        dirs = paths.cdtexture_list(self.cdtexture)
+        eye_vmts = {}
+
+        def vet(d, added):
+            eye_vmts.update(_eye_vmts(
+                context, obj, dirs, self.filepath,
+                [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
+                self.write_vmt))
+
         try:
             with blender_export.placed(meshes, obj) as moved:
                 hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
                 typed = blender_scratch.scene_hull(obj, self.scale)
                 r = blender_scratch.export_scene(
                     context, obj, meshes, _scratch_actions(obj), self.filepath, self.checksum,
-                    scale=self.scale, surfaceprop=self.surfaceprop,
+                    before_write=vet, scale=self.scale, surfaceprop=self.surfaceprop,
                     cdtexture=self.cdtexture, hull=hull, use_range=self.use_range,
                     activity=self.activity, hitboxes=self.fit_hitboxes,
                     root_motion=self.root_motion, no_mesh=self.no_mesh,
@@ -2571,18 +2649,19 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                      "neither, so no shipped file looks like this one"
                         % (name, "lid flexes and no aim points" if has_lids
                            else "aim points and no lid flexes"))
-        eye_mats = r.get("eye_materials") or []
-        if eye_mats:
-            self.report({"WARNING"}, "no .vmt or .tth written for %d eye material%s: %s. A "
-                                     "shipped eye mesh uses the Eyes shader, whose $iris is "
-                                     "a texture the record does not name, and a glint "
-                                     "UnlitGeneric"
-                        % (len(eye_mats), "" if len(eye_mats) == 1 else "s",
-                           ", ".join(eye_mats[:4])))
-        mats = [n for n in r.get("material_names") or [] if n not in eye_mats]
+        eye_meshes = r.get("eye_mesh_materials") or []
+        unread = [n for n in r.get("eye_materials") or [] if n not in eye_meshes]
+        if unread:
+            self.report({"INFO"}, "no .vmt or .tth written for %d name%s only an eyeball "
+                                  "record carries: %s. StudioRender reads neither the iris "
+                                  "nor the glint index, and 556 of the 594 shipped glint "
+                                  "names have no .vmt either"
+                        % (len(unread), "" if len(unread) == 1 else "s",
+                           ", ".join(unread[:4])))
+        mats = [n for n in r.get("material_names") or [] if n not in unread]
         if mats:
-            dirs = paths.cdtexture_list(self.cdtexture)
-            said = _write_vmts(context, dirs, self.filepath, mats, self.write_vmt)
+            said = _write_vmts(context, dirs, self.filepath, mats, self.write_vmt,
+                               eye_vmts)
             said += _write_tths(context, dirs, self.filepath, mats, self.write_tth,
                                 self.tth_format)
             if said:
