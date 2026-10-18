@@ -1699,13 +1699,21 @@ class VTMB_PT_flex_preview(bpy.types.Panel):
         draw_flex_preview(self.layout, context.object)
 
 
+FLEX_AUTHORED = "vtmb_flex_authored"
+
+
 def _key_stamp(obj, k):
-    """(flexdesc, window, in the file) for shape key k, off the import's stamps by key name."""
+    """(flexdesc, window, in the file) for shape key k, off the stamps by key name.
+
+    A key `vtmb.set_key_window` stamped is listed in `vtmb_flex_authored` and is not the
+    file's, though both exports read its stamp the same way."""
+    name = obj.data.shape_keys.key_blocks[k].name
     names = list(obj.get("vtmb_flex_names") or [])
-    fd, t = blender_export.key_flex(obj.data.shape_keys.key_blocks[k].name, names,
-                                    obj.get("vtmb_flex_descs"),
+    fd, t = blender_export.key_flex(name, names, obj.get("vtmb_flex_descs"),
                                     obj.get("vtmb_flex_targets") or [])
-    return fd, tuple(t if t is not None else build_mod.FLEX_TARGET), t is not None
+    mine = [str(x) for x in obj.get(FLEX_AUTHORED) or ()]
+    return (fd, tuple(t if t is not None else build_mod.FLEX_TARGET),
+            t is not None and name not in mine)
 
 
 def _flex_writer(arm_obj, fd):
@@ -1745,7 +1753,9 @@ def draw_shape_key(lay, obj):
     if filed:
         col.label(text="flex %s, window %s" % (fd, win))
     else:
-        col.label(text="not in the file: written as a new flex %s, window %s" % (fd, win))
+        col.label(text="not in the file: written as flex %s, window %s" % (fd, win))
+        col.label(text="an export from a donor writes it only with Shape keys as flexes on")
+        col.operator("vtmb.set_key_window", text="Set flex and window", icon="PREFERENCES")
     steps = sorted((_key_stamp(obj, j)[1], key.key_blocks[j].name)
                    for j in range(1, len(key.key_blocks)) if _key_stamp(obj, j)[0] == fd)
     at = steps.index((t, key.key_blocks[k].name)) + 1
@@ -1759,6 +1769,92 @@ def draw_shape_key(lay, obj):
                        "window draws %g" % preview_mod.window(t, 0.0), icon="ERROR")
 
 
+def key_window_refused(obj, k, fd, t):
+    """Why shape key k cannot be stamped flex `fd` at window `t`, or None."""
+    if blender_export.prestamp_flexes(obj):
+        return blender_export._summed_keys(obj.name)
+    if _key_stamp(obj, k)[2]:
+        return ("key %r is the file's own; a new window would drop the file's record. Copy "
+                "the key and give the copy its window" % obj.data.shape_keys.key_blocks[k].name)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", fd):
+        return ("a flex rule reads a flex as %%name, the name a letter or _ and then letters, "
+                "digits and _, so no rule could read %r" % fd)
+    win = ", ".join("%g" % c for c in t)
+    if not t[0] < t[3]:
+        return ("window (%s) draws nothing: the renderer skips every weight at or under the "
+                "first and at or over the last" % win)
+    t = build_mod.flex_target_key(t)
+    for j in range(1, len(obj.data.shape_keys.key_blocks)):
+        fj, tj, _filed = _key_stamp(obj, j)
+        if j != k and (fj, build_mod.flex_target_key(tj)) == (fd, t):
+            return ("key %r is already flex %s at that window, and two keys on one window "
+                    "would come back as one" % (obj.data.shape_keys.key_blocks[j].name, fd))
+    return None
+
+
+class VTMB_OT_set_key_window(bpy.types.Operator):
+    bl_idname = "vtmb.set_key_window"
+    bl_label = "Set flex and window"
+    bl_description = ("Give a shape key the file did not carry the flex it is a step of and "
+                      "the window the renderer ramps it over")
+    bl_options = {"REGISTER", "UNDO"}
+
+    flex: bpy.props.StringProperty(
+        name="Flex", default="",
+        description="The flex this key is a step of: its own name for a new flex, or another "
+                    "key's flex to make this one its next step")
+    window: bpy.props.FloatVectorProperty(
+        name="Window", size=4, default=build_mod.FLEX_TARGET,
+        description="t0..t3: the key ramps in from t0 to t1, holds to t2 and ramps out to t3 "
+                    "over the flex's weight. (0, 1, 10, 11) is studiomdl's default")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "MESH" and obj.data.shape_keys is not None
+                and 0 < obj.active_shape_key_index < len(obj.data.shape_keys.key_blocks)
+                and not _key_stamp(obj, obj.active_shape_key_index)[2])
+
+    def invoke(self, context, event):
+        obj = context.object
+        fd, t, _filed = _key_stamp(obj, obj.active_shape_key_index)
+        self.flex, self.window = fd, t
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.object
+        k = obj.active_shape_key_index
+        name = obj.data.shape_keys.key_blocks[k].name
+        fd = self.flex.strip() or name
+        t = tuple(float(c) for c in self.window)
+        why = key_window_refused(obj, k, fd, t)
+        if why:
+            self.report({"ERROR"}, why)
+            return {"CANCELLED"}
+        names = [str(x) for x in obj.get("vtmb_flex_names") or ()]
+        descs = [str(x) for x in obj.get("vtmb_flex_descs") or ()]
+        targets = [[float(c) for c in x] for x in obj.get("vtmb_flex_targets") or ()]
+        mine = [str(x) for x in obj.get(FLEX_AUTHORED) or ()]
+        if name in names:
+            at = names.index(name)
+            descs[at], targets[at] = fd, list(t)
+        else:
+            names.append(name)
+            descs.append(fd)
+            targets.append(list(t))
+        if name not in mine:
+            mine.append(name)
+        obj["vtmb_flex_names"], obj["vtmb_flex_descs"] = names, descs
+        obj["vtmb_flex_targets"], obj[FLEX_AUTHORED] = targets, mine
+        self.report({"INFO"}, "key %s is flex %s at window (%s)"
+                    % (name, fd, ", ".join("%g" % c for c in t)))
+        arm_obj = obj.parent if obj.parent is not None and obj.parent.type == "ARMATURE" else None
+        why = preview_mod.refresh(arm_obj) if arm_obj is not None else None
+        if why:
+            self.report({"WARNING"}, why)
+        return {"FINISHED"}
+
+
 class VTMB_PT_shape_key(bpy.types.Panel):
     bl_label = "VTMB flex"
     bl_space_type = "PROPERTIES"
@@ -1770,7 +1866,8 @@ class VTMB_PT_shape_key(bpy.types.Panel):
     def poll(cls, context):
         obj = context.object
         return (obj is not None and obj.type == "MESH" and obj.data.shape_keys is not None
-                and obj.get("vtmb_flex_names") is not None)
+                and (obj.get("vtmb_flex_names") is not None
+                     or obj.parent is not None and obj.parent.type == "ARMATURE"))
 
     def draw(self, context):
         draw_shape_key(self.layout, context.object)
@@ -3231,7 +3328,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_OT_flex_preview, VTMB_OT_flex_preview_stop, VTMB_PT_flex_preview,
-           VTMB_PT_shape_key,
+           VTMB_OT_set_key_window, VTMB_PT_shape_key,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,
            VTMB_OT_move_sequence, VTMB_OT_set_blend, VTMB_OT_resize_blends,
