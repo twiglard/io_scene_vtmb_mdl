@@ -841,6 +841,116 @@ def draw_accessories(lay, context, arm_obj):
                          obj.parent_bone or "no bone"))
 
 
+def eye_mesh_choices(context, arm_obj):
+    """[(object, stamp slot, material name, model name)] per mesh that can be an eye.
+
+    The stamp slot is what `vtmb_eye_slots` holds: the slot the import stamped where the
+    object came from a file, since both exports map it through `slot_moves`, and the slot
+    itself on a mesh made in Blender. A slot added after the import is left out -- it is
+    no file mesh on a donor export -- and so is a mesh already an eye.
+    """
+    out = []
+    for obj in arm_meshes(context, arm_obj):
+        mats = obj.data.materials
+        taken = {int(s) for s, _p in obj.get("vtmb_eye_slots") or ()}
+        model = str(obj.get("vtmb_model") or obj.name + ".smd")
+        moves = blender_export.slot_moves(obj)[0]
+        if moves is None:
+            slots = [(j, j) for j in range(len(mats))]
+        else:
+            slots = sorted((here, s) for s, here in moves.items() if here is not None)
+        for here, s in slots:
+            if s in taken or not 0 <= here < len(mats) or mats[here] is None:
+                continue
+            out.append((obj, s, mats[here].name, model))
+    return out
+
+
+# Blender keeps no copy of the strings an enum callback returns, so they are held here.
+_EYE_MESH_ITEMS = []
+
+
+def _eye_mesh_items(self, context):
+    _EYE_MESH_ITEMS[:] = [("%s\t%d" % (obj.name, s), "%s: %s" % (obj.name, mat),
+                           "model %r, material slot %d" % (model, s))
+                          for obj, s, mat, model in eye_mesh_choices(context, context.object)]
+    return _EYE_MESH_ITEMS or [("", "no mesh", "")]
+
+
+class VTMB_OT_add_eyeball(bpy.types.Operator):
+    bl_idname = "vtmb.add_eyeball"
+    bl_label = "Add eyeball"
+    bl_description = ("Eyeball on the active bone, drawn by the chosen mesh. Every shipped "
+                      "model with eyes carries two, 301 of them")
+    bl_options = {"REGISTER", "UNDO"}
+
+    mesh: bpy.props.EnumProperty(
+        name="Eye mesh", items=_eye_mesh_items,
+        description="The material slot whose mesh the game draws as this eyeball. Its "
+                    "material is also the iris, as on 160 of the 602 shipped records")
+    radius: bpy.props.FloatProperty(
+        name="Radius", default=0.5, min=1e-3,
+        description="In model units. 568 of the 602 shipped records hold 0.5")
+    iris_scale: bpy.props.FloatProperty(
+        name="Iris scale", default=1.0 / 0.55, min=1e-3,
+        description="294 of the 602 shipped records hold 1/0.55 and 172 hold 2")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and context.active_bone is not None)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm_obj = context.object
+        bone = arm_obj.data.bones.get(context.active_bone.name)
+        if bone is None:
+            self.report({"ERROR"}, "bone %r is not in the armature yet; leave Edit mode first"
+                        % context.active_bone.name)
+            return {"CANCELLED"}
+        pick = next((x for x in eye_mesh_choices(context, arm_obj)
+                     if "%s\t%d" % (x[0].name, x[1]) == self.mesh), None)
+        if pick is None:
+            self.report({"ERROR"}, "no mesh of this armature has a material slot that is "
+                                   "not an eye already")
+            return {"CANCELLED"}
+        mesh_obj, slot, mat, model = pick
+        scale = float(arm_obj.get("vtmb_scale", 1.0) or 1.0)
+        mine = blender_export.eyeball_objects(arm_obj).get(model) or []
+        index = max((int(o["vtmb_eyeball"]) for o in mine), default=-1) + 1
+        obj = bpy.data.objects.new("%s.eye%d" % (arm_obj.name, index), None)
+        obj.empty_display_type = "SPHERE"
+        obj.empty_display_size = self.radius * scale
+        _link_beside(arm_obj, obj)
+        obj.parent = arm_obj
+        obj.parent_type = "BONE"
+        obj.parent_bone = bone.name
+        obj.matrix_parent_inverse = mathutils.Matrix.Translation((0.0, -bone.length, 0.0))
+        # `up` is model +Z and `forward` model +Y on 602 of 602 shipped records, both
+        # rotated into the bone, which is what 2003 studiomdl writes (studiomdl.cpp:2538).
+        inv = bone.matrix_local.to_3x3().normalized().transposed()
+        up = inv @ mathutils.Vector((0.0, 0.0, 1.0))
+        fw = inv @ mathutils.Vector((0.0, 1.0, 0.0))
+        obj.matrix_basis = mathutils.Matrix((up.cross(fw), up, fw)).transposed().to_4x4()
+        obj["vtmb_eyeball"] = index
+        obj["vtmb_eyeball_model"] = model
+        obj["vtmb_eyeball_radius"] = self.radius
+        obj["vtmb_eyeball_iris_scale"] = self.iris_scale
+        obj["vtmb_eyeball_iris"] = mat
+        # "" writes 0. StudioRender reads no glint index, and "glint" on a donor without
+        # that texture would append one.
+        obj["vtmb_eyeball_glint"] = ""
+        obj["vtmb_eyeball_uppertarget"] = [0.0, 0.0, 0.0]
+        obj["vtmb_eyeball_lowertarget"] = [0.0, 0.0, 0.0]
+        obj["vtmb_eyeball_lidflexes"] = []
+        stamp = [list(x) for x in mesh_obj.get("vtmb_eye_slots") or ()]
+        mesh_obj["vtmb_eye_slots"] = stamp + [[slot, index]]
+        return {"FINISHED"}
+
+
 def draw_face(lay, context, arm_obj):
     """The one mouth record as properties, and the eyeballs named rather than indexed.
 
@@ -879,6 +989,7 @@ def draw_face(lay, context, arm_obj):
             else:
                 box.prop(arm_obj, '["vtmb_mouth"]["%s"]' % k, text=label)
         box.label(text="the export refuses a jaw flex no flex rule writes", icon="INFO")
+    lay.operator("vtmb.add_eyeball", icon="HIDE_OFF")
     eyes = blender_export.eyeball_objects(arm_obj)
     n = sum(len(v) for v in eyes.values())
     if not n:
@@ -947,8 +1058,8 @@ def draw_eyeball(lay, obj):
         lay.label(text="the file held %.4f; the sphere is what gets written"
                        % float(key), icon="INFO")
     # `lay.prop` on an absent ID key raises inside draw(), and every one of these is
-    # stamped by the import alone -- nothing here creates an eyeball -- so a key missing
-    # is an older .blend and gets the value as a label instead. The two aim points are
+    # stamped by the import and by `vtmb.add_eyeball`, so a key missing is an older
+    # .blend and gets the value as a label instead. The two aim points are
     # 3-float ID-property arrays and `["key"]` is the right path for one: it is what
     # Blender's own Custom Properties panel uses, rna_prop_ui.py:228, and its MAX_DISPLAY_ROWS
     # cutout at 8 elements is well above three.
@@ -2905,7 +3016,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
-           VTMB_OT_remove_flex_line,
+           VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,

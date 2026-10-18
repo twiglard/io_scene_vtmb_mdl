@@ -782,9 +782,10 @@ def append_models(d, objs, bone_index, family, added, scale=1.0):
     return rows, faces, skipped
 
 
-def stamp_appended(d, rows):
+def stamp_appended(d, rows, arm_obj=None):
     """The import's own stamps on each appended object, so the next export rewrites its
     model rather than appending another."""
+    eyes = eyeball_objects(arm_obj) if arm_obj is not None else {}
     for row in rows:
         obj, me = row["object"], row["object"].data
         obj["vtmb_index"] = sum(len(bp.kids) for bp in d.bodyparts[:row["bodypart"]])
@@ -796,6 +797,14 @@ def stamp_appended(d, rows):
         if obj.get("vtmb_meshes") is None:
             obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
         obj["vtmb_slot_mats"] = [x.name if x else "" for x in me.materials]
+        # The model was written with no eyeball record, so an eye stamp no empty on it
+        # claims is a copy's, naming its original's eyeball, which this model has not got.
+        mine = {int(o["vtmb_eyeball"]) for o in eyes.get(obj.name + ".smd", ())}
+        eye = [[int(a), int(b)] for a, b in obj.get("vtmb_eye_slots") or () if int(b) in mine]
+        if eye:
+            obj["vtmb_eye_slots"] = eye
+        else:
+            obj.pop("vtmb_eye_slots", None)
         refs = dict((slot, ref) for slot, ref, _n in row["slots"])
         # The skin-family switch reads one per slot, and an empty slot has none.
         if all(s in refs for s in range(len(me.materials))):
@@ -3210,15 +3219,23 @@ class _Named(object):
         self.name = name
 
 
-def apply_face(d, m, arm_obj, scale):
+def apply_face(d, m, arm_obj, scale, source=None):
     """The eyeball records and the one mouth record, written only where they differ.
 
-    Answers `{changed, materials, radius_keys, lid_targets, eye_empties, eye_records}` --
-    the record count, the material names an eyeball put in the file, the eyeballs whose
-    `vtmb_eyeball_radius` says something neither the sphere nor the file says, the eyeballs
-    holding lid flexes without aim points or the other way round, the empties no record
-    took as (name, model, index), and the records no empty claimed as (model, index),
-    which keep the donor's bytes.
+    Answers `{changed, materials, radius_keys, lid_targets, eye_empties, eye_records,
+    eyes_added, eye_meshes}` -- the record count, the material names an eyeball put in the
+    file, the eyeballs whose `vtmb_eyeball_radius` says something neither the sphere nor
+    the file says, the eyeballs holding lid flexes without aim points or the other way
+    round, the empties no record took as (name, model, index), the records no empty
+    claimed as (model, index), which keep the donor's bytes, the records appended as
+    (name, model, index, position, some mesh draws it), and the meshes whose eye fields
+    were rewritten.
+
+    An empty naming a donor model and claiming an index past that model's records is
+    appended, in index order, and its position is what an eye mesh's `materialparam`
+    names. An empty naming no model edits records and never appends: the model it would
+    land on is a guess. `source` is what finds the mesh objects whose `vtmb_eye_slots`
+    point a mesh at its eyeball; without it no mesh is touched.
 
     Every index a scene holds is a NAME here and is resolved against this file: the two
     materials against mstudiotexture_t, the eight lid flexes and the mouth's flex against
@@ -3234,29 +3251,87 @@ def apply_face(d, m, arm_obj, scale):
     Raises Refused naming every lid target component at or past its eyeball's radius.
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
-           "eye_empties": [], "eye_records": [], "lid_past_radius": []}
+           "eye_empties": [], "eye_records": [], "lid_past_radius": [],
+           "eyes_added": [], "eye_meshes": 0}
     eyes = eyeball_objects(arm_obj)
     used = set()
+    at, added = {}, []
+    bmap = None
     # A model record carries no name of its own in the description, so the name comes off
     # the parsed file walked beside it -- same file, same order.
-    for bp, dbp in zip(m.bodyparts, d.bodyparts):
-        for model, mr in zip(bp.models, dbp.kids):
-            recs = (mr.extra or {}).get("eyes") or []
-            if not recs:
-                continue
-            want = eyes.get(model.name) or eyes.get("") or []
-            for i, rec, obj in _eye_pairs(recs, want):
-                if obj is None:
-                    out["eye_records"].append((model.name, i))
+    for bi, (bp, dbp) in enumerate(zip(m.bodyparts, d.bodyparts)):
+        for mi, (model, mr) in enumerate(zip(bp.models, dbp.kids)):
+            recs = mr.extra.setdefault("eyes", [])
+            named = eyes.get(model.name) or []
+            pos = at[bi, mi] = {i: i for i in range(len(recs))}
+            if recs:
+                for i, rec, obj in _eye_pairs(recs, named or eyes.get("") or []):
+                    if obj is None:
+                        out["eye_records"].append((model.name, i))
+                        continue
+                    used.add(obj.name)
+                    out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
+            for obj in named:
+                i = int(obj["vtmb_eyeball"])
+                if i in pos:
                     continue
+                if bmap is None:
+                    bmap = bone_map(m, arm_obj)
+                rec = build_mod.Rec(bytearray(140))
+                struct.pack_into("<i", rec.raw, 0x04,
+                                 _accessory_bone(obj, m, arm_obj, bmap, "eyeball"))
+                _apply_eyeball(d, rec, obj, scale, out)
+                pos[i] = len(recs)
+                recs.append(rec)
                 used.add(obj.name)
-                out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
+                added.append((obj.name, model.name, i, bi, mi, pos[i]))
+                out["changed"] += 1
     _lid_targets_refused(out["lid_past_radius"])
     out["eye_empties"] = [(obj.name, model, int(obj["vtmb_eyeball"]))
                           for model, objs in sorted(eyes.items()) for obj in objs
                           if obj.name not in used]
+    meshed = set()
+    if source is not None:
+        out["eye_meshes"], meshed = _apply_eye_meshes(d, m, source, at)
+    out["eyes_added"] = [(name, model, i, k, (bi, mi, k) in meshed)
+                         for name, model, i, bi, mi, k in added]
     out["changed"] += _apply_mouth(d, m, arm_obj, out)
     return out
+
+
+def _apply_eye_meshes(d, m, source, at):
+    """Each mesh a `vtmb_eye_slots` stamp names, drawn as the eyeball it names.
+
+    The stamp is [slot, eyeball index] per eye mesh, the slot being the one `vtmb_meshes`
+    records for that file mesh, so it reads the same after a slot reorder. `at` is
+    {(bodypart, model): {eyeball index: record position}}. A mesh no stamp names keeps
+    the donor's fields, so an untouched import writes what it read. Answers (meshes
+    rewritten, {(bodypart, model, record position) some mesh draws}).
+    """
+    changed, meshed = 0, set()
+    for (bi, mi), obj in sorted(mesh_objects(m, source).items()):
+        stash, stamp = obj.get("vtmb_meshes"), obj.get("vtmb_eye_slots")
+        if not stash or not stamp:
+            continue
+        kids = d.bodyparts[bi].kids[mi].kids
+        pos = at.get((bi, mi), {})
+        for slot, param in stamp:
+            for j in range(min(len(stash), len(kids))):
+                if int(stash[j][0]) != int(slot):
+                    continue
+                k = pos.get(int(param))
+                if k is None:
+                    raise build_mod.Refused(
+                        "%s: file mesh %d is the eye of eyeball %d, and the model has no "
+                        "such record and no eyeball empty claims it. Restore the empty, or "
+                        "delete vtmb_eye_slots from the object's custom properties to "
+                        "write the mesh as an ordinary one" % (obj.name, j, int(param)))
+                meshed.add((bi, mi, k))
+                raw = kids[j].raw
+                if struct.unpack_from("<2i", raw, 0x18) != (1, k):
+                    struct.pack_into("<2i", raw, 0x18, 1, k)
+                    changed += 1
+    return changed, meshed
 
 
 def _lid_targets_refused(bad):
@@ -4087,6 +4162,35 @@ def cut_vtx_lods(source, dest, written=(), carry=True):
     return out
 
 
+def vtx_eye_flags(d, dest):
+    """MESH_IS_EYES re-derived from each written mesh's `materialtype` in every `.vtx`
+    beside `dest`: [(flavour, mesh headers changed)] per file rewritten.
+
+    The donor's `.vtx` is rewritten only when geometry moved, so a mesh an added eyeball
+    made an eye would otherwise keep the donor's 0 there. A file a writer could not walk
+    is left alone: `cut_vtx_lods` has already reported it.
+    """
+    eyed = {(i, j, k) for i, bp in enumerate(d.bodyparts) for j, mr in enumerate(bp.kids)
+            for k, mesh in enumerate(mr.kids)
+            if struct.unpack_from("<i", mesh.raw, 0x18)[0] == 1}
+    out = []
+    for flavour in VTX_FLAVOURS:
+        p = vtx_path(dest, flavour)
+        if not os.path.exists(p):
+            continue
+        with open(p, "rb") as f:
+            data = f.read()
+        try:
+            new, n = vtxw_mod.set_eye_flags(data, eyed)
+        except struct.error:
+            continue
+        if n:
+            with open(p, "wb") as f:
+                f.write(new)
+            out.append((flavour, n))
+    return out
+
+
 def phy_path(p):
     return (p[:-4] if p[-4:].lower() == ".mdl" else p) + ".phy"
 
@@ -4446,8 +4550,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["cloth_two_bone"] = vol.get("two_bone") or []
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)
-    face = apply_face(d, m, arm_obj, scale)
+    face = apply_face(d, m, arm_obj, scale, source)
     scene["face"] = face["changed"]
+    scene["eyes_added"] = face["eyes_added"]
+    scene["eye_meshes"] = face["eye_meshes"]
     scene["eye_radius_keys"] = face["radius_keys"]
     scene["eye_lid_targets"] = face["lid_targets"]
     scene["eye_empties"] = face["eye_empties"]
@@ -4661,12 +4767,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
     # wrote.
     lods = cut_vtx_lods(source, dest, [x["flavour"] for x in touched], carry=not touched)
-    no_vtx = not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
+    eye_flags = vtx_eye_flags(d, dest)
+    no_vtx =not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
     with open(dest, "wb") as f:
         f.write(data)
     # A save-as leaves the armature describing the donor, which has no such model.
     if same_file(source, dest):
-        stamp_appended(d, appended)
+        stamp_appended(d, appended, arm_obj)
     mesh["appended"] = [dict((k, v) for k, v in x.items() if k != "object")
                         for x in appended]
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
@@ -4691,7 +4798,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
                       if (revised or removed or added_bones or cloth_removed) else []),
             "cloth": cloth, "cloth_edits": cloth_was, "cloth_removed": cloth_removed,
-            "lods": lods, "no_vtx": no_vtx,
+            "lods": lods, "no_vtx": no_vtx, "vtx_eye_flags": eye_flags,
             "phy": phy_report(source, dest, removed, renamed, bool(revised))}
 
 

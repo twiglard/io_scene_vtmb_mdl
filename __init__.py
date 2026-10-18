@@ -1651,6 +1651,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             % (row["file"], row["was"], row["bytes"],
                                "" if row["bytes"] == 1 else "s",
                                " and ".join(lost) or "nothing else changes"))
+        for flavour, n in r.get("vtx_eye_flags") or []:
+            self.report({"INFO"}, "%s: the eye flag on %d mesh header%s set to follow the "
+                                  "model's eye meshes" % (os.path.basename(
+                                      blender_export.vtx_path(self.filepath, flavour)), n,
+                                      "" if n == 1 else "s"))
         if r.get("no_vtx"):
             self.report({"WARNING"},
                         "%s has no .dx80.vtx beside it, so none was written, and the "
@@ -2018,10 +2023,18 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "The sphere is what was written and the key has been "
                                      "corrected to it" % (name, key, live))
         for name, model, i in scene.get("eye_empties") or ():
-            self.report({"WARNING"}, "%r claims eyeball %d of model %r, which the donor has "
-                                     "not got or an empty sorting first by name already "
-                                     "claims, so nothing of it was written. A donor "
-                                     "export adds no eyeball" % (name, i, model))
+            self.report({"WARNING"}, "%r claims eyeball %d of model %r, which is no model "
+                                     "of the donor's, or an empty sorting first by name "
+                                     "already claims that index, or the empty names no "
+                                     "model and the model has no such record, so nothing "
+                                     "of it was written" % (name, i, model or ""))
+        for name, model, i, k, meshed in scene.get("eyes_added") or ():
+            self.report({"INFO"} if meshed else {"WARNING"},
+                        "%r appended as eyeball %d of model %r%s"
+                        % (name, k, model, "" if meshed else
+                           ", and no mesh's vtmb_eye_slots names eyeball %d, so the game "
+                           "draws no eye for it. Add Eyeball stamps the mesh it was "
+                           "given" % i))
         for model, i in scene.get("eye_records") or ():
             self.report({"WARNING"}, "eyeball %d of model %r has no empty stamped "
                                      "vtmb_eyeball %d, so it is written as the donor had "

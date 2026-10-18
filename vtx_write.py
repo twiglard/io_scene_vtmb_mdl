@@ -510,6 +510,38 @@ def cut_lods(data):
     return v.to_bytes(), was, dropped
 
 
+def set_eye_flags(data, eyed):
+    """`data` with MESH_IS_EYES set on the meshes in `eyed` and clear on the rest, every
+    LOD: (bytes, mesh headers changed). `eyed` is a set of (bodypart, model, mesh).
+
+    Patched in place rather than re-laid, since a flag moves no byte. Bit 0x02 lands on
+    exactly the meshes the `.mdl` marks `materialtype == 1`, 43 903 of 43 903 mesh headers
+    over the 8875 shipped files, so a file already right comes back unchanged. The other
+    bits are left as read: 0x01, MESH_IS_TEETH, is on 40 headers whose mesh is no eye.
+    """
+    out = bytearray(data)
+    nbp, bpo = struct.unpack_from("<2i", out, 28)
+    changed = 0
+    for i in range(nbp):
+        bo = bpo + i * BODYPART_STRIDE
+        nmodels, mo_ = struct.unpack_from("<2i", out, bo)
+        for j in range(nmodels):
+            mo = bo + mo_ + j * MODEL_STRIDE
+            nlods, lo_ = struct.unpack_from("<2i", out, mo)
+            for l in range(nlods):
+                lo = mo + lo_ + l * LOD_STRIDE
+                nmesh, eo_ = struct.unpack_from("<2i", out, lo)
+                for k in range(nmesh):
+                    at = lo + eo_ + k * MESH_STRIDE + 2
+                    was = struct.unpack_from("<h", out, at)[0]
+                    want = ((was | MESH_IS_EYES) if (i, j, k) in eyed
+                            else (was & ~MESH_IS_EYES))
+                    if want != was:
+                        struct.pack_into("<h", out, at, want)
+                        changed += 1
+    return bytes(out), changed
+
+
 def pack_vert0(orig_id):
     return struct.pack("<h", orig_id)
 
