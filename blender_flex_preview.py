@@ -117,6 +117,15 @@ def _window_expr(t):
     return "0.0 if w <= %s or w >= %s else (%s)" % (_bound(t0), _bound(t3), inner)
 
 
+def window(t, w):
+    """The renderer's window at the weight `w`, what each key's driver computes."""
+    t0, t1, t2, t3 = (float(c) for c in t)
+    if w <= t0 or w >= t3:
+        return 0.0
+    x = (w - t0) / (t1 - t0) if w < t1 else (t3 - w) / (t3 - t2) if w > t2 else 1.0
+    return 0.0 if -CUT < x < CUT else x
+
+
 def _lid_expr(inputs, readable):
     """R_StudioEyeballPosition's lid height for a gaze straight ahead, or None.
 

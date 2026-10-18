@@ -1699,6 +1699,83 @@ class VTMB_PT_flex_preview(bpy.types.Panel):
         draw_flex_preview(self.layout, context.object)
 
 
+def _key_stamp(obj, k):
+    """(flexdesc, window, in the file) for shape key k, off the import's stamps by key name."""
+    names = list(obj.get("vtmb_flex_names") or [])
+    fd, t = blender_export.key_flex(obj.data.shape_keys.key_blocks[k].name, names,
+                                    obj.get("vtmb_flex_descs"),
+                                    obj.get("vtmb_flex_targets") or [])
+    return fd, tuple(t if t is not None else build_mod.FLEX_TARGET), t is not None
+
+
+def _flex_writer(arm_obj, fd):
+    """What writes a flexdesc's weight in the game, as a line of text, or None."""
+    if arm_obj is None:
+        return None
+    for line in arm_obj.get("vtmb_flexrules") or ():
+        line = str(line)
+        if "=" in line and line.split("=", 1)[0].strip() == fd:
+            return "weight written by flex rule %s" % line
+    for objs in blender_export.eyeball_objects(arm_obj).values():
+        for e in objs:
+            lids = [str(x) for x in (e.get("vtmb_eyeball_lidflexes") or ())]
+            if len(lids) == 8 and fd in lids[6:]:
+                return "weight written by eyeball %s's %s lid" % (
+                    e.name, "upper" if lids[6] == fd else "lower")
+    return None
+
+
+def draw_shape_key(lay, obj):
+    """The active shape key as the file has it: its flex, its window, which step of that flex
+    it is along the weight, and what writes the flex's weight."""
+    key = obj.data.shape_keys
+    k = obj.active_shape_key_index
+    if key is None or not 0 <= k < len(key.key_blocks):
+        return
+    if k == 0:
+        lay.label(text="the rest shape, which no flex record holds")
+        return
+    if blender_export.prestamp_flexes(obj):
+        lay.label(text="imported before 2026-10-15, so nothing says which flex this key is; "
+                       "re-import the model", icon="ERROR")
+        return
+    fd, t, filed = _key_stamp(obj, k)
+    win = "(%s)" % ", ".join("%g" % c for c in t)
+    col = lay.column(align=True)
+    if filed:
+        col.label(text="flex %s, window %s" % (fd, win))
+    else:
+        col.label(text="not in the file: written as a new flex %s, window %s" % (fd, win))
+    steps = sorted((_key_stamp(obj, j)[1], key.key_blocks[j].name)
+                   for j in range(1, len(key.key_blocks)) if _key_stamp(obj, j)[0] == fd)
+    at = steps.index((t, key.key_blocks[k].name)) + 1
+    col.label(text="step %d of %d of flex %s along its weight" % (at, len(steps), fd))
+    arm_obj = obj.parent if obj.parent is not None and obj.parent.type == "ARMATURE" else None
+    writer = _flex_writer(arm_obj, fd)
+    if writer:
+        col.label(text=writer)
+    else:
+        col.label(text="nothing writes its weight, so the game holds it at 0, where this "
+                       "window draws %g" % preview_mod.window(t, 0.0), icon="ERROR")
+
+
+class VTMB_PT_shape_key(bpy.types.Panel):
+    bl_label = "VTMB flex"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+    bl_parent_id = "DATA_PT_shape_keys"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "MESH" and obj.data.shape_keys is not None
+                and obj.get("vtmb_flex_names") is not None)
+
+    def draw(self, context):
+        draw_shape_key(self.layout, context.object)
+
+
 class VTMB_PT_accessories(bpy.types.Panel):
     bl_label = "VTMB attachments and hitboxes"
     bl_space_type = "PROPERTIES"
@@ -3154,6 +3231,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_OT_flex_preview, VTMB_OT_flex_preview_stop, VTMB_PT_flex_preview,
+           VTMB_PT_shape_key,
            VTMB_PT_armature, VTMB_PT_poseparams, VTMB_PT_actions, VTMB_PT_action,
            VTMB_OT_rename_sequence, VTMB_OT_add_sequence, VTMB_OT_remove_sequence,
            VTMB_OT_move_sequence, VTMB_OT_set_blend, VTMB_OT_resize_blends,
