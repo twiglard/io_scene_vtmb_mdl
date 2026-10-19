@@ -2385,15 +2385,77 @@ def eyeball_objects(arm_obj):
     return out
 
 
+def stray_eyeballs(m, arm_obj):
+    """Eyeball empties of this file's models, in the armature's scene, under no armature.
+
+    Clear Parent (Alt+P) takes an empty out of `eyeball_objects`, which would read it as
+    deleted; nothing then says which bone it moves with.
+    """
+    models = {mo.name for bp in m.bodyparts for mo in bp.models}
+    scenes = set(arm_obj.users_scene)
+    out = []
+    for obj in bpy.data.objects:
+        if (obj.get("vtmb_eyeball") is None
+                or str(obj.get("vtmb_eyeball_model") or "") not in models
+                or not scenes & set(obj.users_scene)):
+            continue
+        up = obj.parent
+        while up is not None and up.type != "ARMATURE":
+            up = up.parent
+        if up is None:
+            out.append(obj.name)
+    return sorted(out)
+
+
+def bone_space(obj):
+    """An accessory empty's matrix in its bone's space, where the viewport draws it.
+
+    Blender places a bone child at `bone.matrix_local @ Translation((0, length, 0)) @
+    matrix_parent_inverse @ matrix_basis`. Ctrl+P > Bone puts the bone's own inverse in
+    the parent inverse and the world matrix in `matrix_basis`, so the whole product is
+    read. The import's parent inverse cancels the tail offset, and while it still does,
+    `matrix_basis` is read alone: Edit Mode recomputes every bone's length, by up to 7.6e-06
+    on andrei, and the product would carry that into every record. On a bone Blender
+    deleted, `matrix_basis` alone, where `remove_bone` already moved the file's record.
+    """
+    arm_obj = obj.parent
+    bone = (arm_obj.data.bones.get(obj.parent_bone)
+            if arm_obj is not None and arm_obj.type == "ARMATURE"
+            and obj.parent_type == "BONE" else None)
+    if bone is None or _tail_inverse(obj.matrix_parent_inverse, bone.length):
+        return obj.matrix_basis
+    return (mathutils.Matrix.Translation((0.0, bone.length, 0.0))
+            @ obj.matrix_parent_inverse @ obj.matrix_basis)
+
+
+def _tail_inverse(inv, length):
+    """Whether `inv` is `Translation((0, -length, 0))` up to 16 float32 steps of the length,
+    the parent inverse `blender_import._bone_child` sets."""
+    if any(inv[r][c] != (1.0 if r == c else 0.0) for r in range(4) for c in range(3)):
+        return False
+    return (inv[0][3] == 0.0 and inv[2][3] == 0.0 and inv[3][3] == 1.0
+            and abs(inv[1][3] + length) <= max(length, 1.0) * 2.0 ** -19)
+
+
+# Deleting one end of a capsule is itself refused, so the way out names both. A donor
+# export keeps the record of an eyeball whose empty is gone (decision 21 is open).
+_DELETE = {"cloth capsule end": "delete both of the capsule's ends",
+           "eyeball": "delete it, which clears this but removes no eye: one the donor "
+                      "carries stays in the file as the donor had it"}
+
+
 def _accessory_bone(obj, m, arm_obj, bmap, what):
     """The file bone index an accessory empty is mounted on.
 
     An empty whose bone Blender deleted passes to the first surviving ancestor, which is
     where `remove_bone` already put the file's own record.
     """
+    fix = ("Parent it to one of the model's bones (Ctrl+P > Bone, or Object properties > "
+           "Relations), or %s" % _DELETE.get(what, "delete it"))
     want = obj.parent_bone if obj.parent_type == "BONE" else ""
     if not want:
-        raise ValueError("%s %r is not parented to a bone" % (what, obj.name))
+        raise build_mod.Refused("%s %r is not parented to a bone, so nothing says which bone "
+                                "it moves with. %s" % (what, obj.name, fix))
     for b in m.bones:
         if bmap.get(b.name) == want:
             return b.index
@@ -2403,22 +2465,17 @@ def _accessory_bone(obj, m, arm_obj, bmap, what):
         name = gone[name]
         if name in bmap:
             return next(b.index for b in m.bones if b.name == name)
-    raise ValueError("%s %r is on bone %r, which is not one this model carries"
-                     % (what, obj.name, want))
+    raise build_mod.Refused("%s %r is on bone %r, which is not one this model carries. %s"
+                            % (what, obj.name, want, fix))
 
 
 def read_attachments(m, arm_obj, scale):
-    """[(name, type, bone, 12 floats)] out of the scene, in bone space.
-
-    `matrix_basis` is already the file's own bone-space matrix -- Blender's bone parenting
-    supplies `bone.matrix_local` and `matrix_parent_inverse` takes the tail offset back
-    out -- so nothing here inverts anything and there is no error to cancel.
-    """
+    """[(name, type, bone, 12 floats)] out of the scene, in bone space (`bone_space`)."""
     bmap = bone_map(m, arm_obj)
     out = []
     for obj in accessory_objects(arm_obj)[0]:
         bi = _accessory_bone(obj, m, arm_obj, bmap, "attachment")
-        local = obj.matrix_basis
+        local = bone_space(obj)
         out.append((str(obj.get("vtmb_attachment") or obj.name),
                     int(obj.get("vtmb_attachment_type") or 0), bi,
                     tuple(local[r][c] / (scale if c == 3 else 1.0)
@@ -2435,7 +2492,7 @@ def hitbox_extent(obj, scale):
     donor path and `blender_scratch.scene_hitboxes`, so what a box empty means has one
     definition and the turn is refused on both.
     """
-    local = obj.matrix_basis
+    local = bone_space(obj)
     mid = [local[r][3] / scale for r in range(3)]
     half = [local.col[c].to_3d().length / scale for c in range(3)]
     # mstudiobbox_t is an AABB in bone space and carries no rotation, so a turned empty
@@ -3256,6 +3313,12 @@ def apply_face(d, m, arm_obj, scale, source=None):
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
            "eye_empties": [], "eye_records": [], "lid_past_radius": [],
            "eyes_added": [], "eye_meshes": 0, "mouth_added": False}
+    stray = stray_eyeballs(m, arm_obj)
+    if stray:
+        raise build_mod.Refused(
+            "eyeball empty %s is not parented to a bone, so nothing says which bone it moves "
+            "with. Parent it to one of the model's bones (Ctrl+P > Bone, or Object properties "
+            "> Relations), or %s" % (", ".join(repr(n) for n in stray), _DELETE["eyeball"]))
     eyes = eyeball_objects(arm_obj)
     used = set()
     at, added = {}, []
@@ -3273,7 +3336,11 @@ def apply_face(d, m, arm_obj, scale, source=None):
                         out["eye_records"].append((model.name, i))
                         continue
                     used.add(obj.name)
-                    out["changed"] += _apply_eyeball(d, rec, obj, scale, out)
+                    if bmap is None:
+                        bmap = bone_map(m, arm_obj)
+                    out["changed"] += _apply_eyeball(
+                        d, rec, obj, scale, out,
+                        _accessory_bone(obj, m, arm_obj, bmap, "eyeball"))
             for obj in named:
                 i = int(obj["vtmb_eyeball"])
                 if i in pos:
@@ -3443,9 +3510,11 @@ def _eye_material(d, raw, off, name, added):
     return _material_index(d, name, added)
 
 
-def _apply_eyeball(d, rec, obj, scale, out):
+def _apply_eyeball(d, rec, obj, scale, out, bone=None):
+    """Rewrite one mstudioeyeball_t off its empty; 1 if any field moved. `bone`, where
+    given, is the file bone index the empty is on, written to +0x04."""
     raw = rec.raw
-    local = obj.matrix_basis
+    local = bone_space(obj)
     org = tuple(local[r][3] / scale for r in range(3))
     up = tuple(local.col[1][:3])
     fw = tuple(local.col[2][:3])
@@ -3493,10 +3562,13 @@ def _apply_eyeball(d, rec, obj, scale, out):
     # 0-2 org, 3 radius, 4-6 up, 7-9 forward, 10 iris, 11 iris_scale, 12 glint,
     # 13-18 the six lid flexes, 19-21 uppertarget, 22-24 lowertarget, 25-26 the two lids.
     ints = (10, 12, 13, 14, 15, 16, 17, 18, 25, 26)
-    if all((a == b) if i in ints else
-           (_same_dir(a, b) if 4 <= i <= 9 else _same(a, b))
-           for i, (a, b) in enumerate(zip(have, want))):
+    rebone = bone is not None and struct.unpack_from("<i", raw, 0x04)[0] != bone
+    if not rebone and all((a == b) if i in ints else
+                          (_same_dir(a, b) if 4 <= i <= 9 else _same(a, b))
+                          for i, (a, b) in enumerate(zip(have, want))):
         return 0
+    if bone is not None:
+        struct.pack_into("<i", raw, 0x04, bone)
     struct.pack_into("<3f", raw, 0x08, *org)
     struct.pack_into("<f", raw, 0x18, radius)
     struct.pack_into("<3f", raw, 0x1c, *up)

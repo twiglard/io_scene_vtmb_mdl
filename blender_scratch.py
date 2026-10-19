@@ -913,7 +913,8 @@ def add_attachments(d, arm_obj, bone_index, scale=1.0):
         if want not in bone_index:
             raise Refused("attachment %r is on bone %r, which is not being written"
                           % (obj.name, want or "<none>"))
-        rows = [[obj.matrix_basis[r][c] / (scale if c == 3 else 1.0) for c in range(4)]
+        local = export_mod.bone_space(obj)
+        rows = [[local[r][c] / (scale if c == 3 else 1.0) for c in range(4)]
                 for r in range(3)]
         build_mod.add_attachment(d, str(obj.get("vtmb_attachment") or obj.name),
                                  bone_index[want], rows,
