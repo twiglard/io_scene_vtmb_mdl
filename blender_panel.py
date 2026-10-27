@@ -796,7 +796,7 @@ def cloth_volume_line(arm_obj):
     """
     try:
         caps, sphs = blender_export.cloth_volume_objects(arm_obj)
-    except ValueError as exc:
+    except build_mod.Refused as exc:
         return str(exc), None
     if arm_obj.get("vtmb_source") and not arm_obj.get("vtmb_cloth_volumes"):
         return "cloth volumes: the file's own are carried -- import it again to edit them", None

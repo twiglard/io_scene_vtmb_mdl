@@ -2502,8 +2502,8 @@ def hitbox_extent(obj, scale):
                    - (1.0 if r == c else 0.0))
                for c in range(3) for r in range(3))
     if turn > 1e-3:
-        raise ValueError("hitbox %r is turned %.4f out of its bone's axes, and "
-                         "mstudiobbox_t carries no rotation" % (obj.name, turn))
+        raise build_mod.Refused("hitbox %r is turned %.4f out of its bone's axes, and "
+                                "mstudiobbox_t carries no rotation" % (obj.name, turn))
     return (tuple(a - b for a, b in zip(mid, half)),
             tuple(a + b for a, b in zip(mid, half)))
 
@@ -3639,16 +3639,17 @@ def cloth_volume_objects(arm_obj):
             end = int(obj.get("vtmb_cloth_capsule_end") or 0)
             ends = caps.setdefault(key, {})
             if end in ends:
-                raise ValueError("%r and %r both say they are end %d of cloth capsule %d on "
-                                 "model %d; delete one, or add a capsule with Add Cloth "
-                                 "Capsule" % (ends[end].name, obj.name, end, key[1], key[0]))
+                raise build_mod.Refused(
+                    "%r and %r both say they are end %d of cloth capsule %d on model %d; "
+                    "delete one, or add a capsule with Add Cloth Capsule"
+                    % (ends[end].name, obj.name, end, key[1], key[0]))
             ends[end] = obj
         elif obj.get("vtmb_cloth_sphere") is not None:
             key = (int(gi), int(obj["vtmb_cloth_sphere"]))
             if key in sphs:
-                raise ValueError("%r and %r both say they are cloth sphere %d on model %d; "
-                                 "delete one, or add a sphere with Add Cloth Sphere"
-                                 % (sphs[key].name, obj.name, key[1], key[0]))
+                raise build_mod.Refused("%r and %r both say they are cloth sphere %d on model "
+                                        "%d; delete one, or add a sphere with Add Cloth Sphere"
+                                        % (sphs[key].name, obj.name, key[1], key[0]))
             sphs[key] = obj
     return caps, sphs
 
@@ -3657,12 +3658,12 @@ def cloth_volume_radius(obj, scale):
     """A volume's radius in model units: the SPHERE empty's display size times its scale."""
     s = [abs(c) for c in obj.scale]
     if max(s) - min(s) > ACC_EPS * max(1.0, max(s)):
-        raise ValueError("cloth volume %r is scaled %.4g %.4g %.4g, and a sphere has one "
-                         "radius" % (obj.name, *obj.scale))
+        raise build_mod.Refused("cloth volume %r is scaled %.4g %.4g %.4g, and a sphere has "
+                                "one radius" % (obj.name, *obj.scale))
     r = obj.empty_display_size * s[0] / (scale or 1.0)
     if not math.isfinite(r) or r <= 0.0:
-        raise ValueError("cloth volume %r has radius %r, and a collision radius has to be "
-                         "positive" % (obj.name, r))
+        raise build_mod.Refused("cloth volume %r has radius %r, and a collision radius has "
+                                "to be positive" % (obj.name, r))
     return r
 
 
@@ -3690,9 +3691,9 @@ def _capsule_radius(ends, gi, k, scale):
         return r[1]
     if _same(r[1], was[1]):
         return r[0]
-    raise ValueError("cloth capsule %d on model %d has radius %.6g at %r and %.6g at %r, "
-                     "and a capsule has one radius; make the two ends the same size"
-                     % (k, gi, r[0], ends[0].name, r[1], ends[1].name))
+    raise build_mod.Refused("cloth capsule %d on model %d has radius %.6g at %r and %.6g at "
+                            "%r, and a capsule has one radius; make the two ends the same size"
+                            % (k, gi, r[0], ends[0].name, r[1], ends[1].name))
 
 
 def _volume_blob(recs, was, fmt, nint):
@@ -3727,8 +3728,8 @@ def apply_cloth_volumes(d, m, arm_obj, scale):
     flat = [mr for dbp in d.bodyparts for mr in dbp.kids]
     for gi, _k in list(caps) + list(sphs):
         if not 0 <= gi < len(flat):
-            raise ValueError("a cloth volume empty names model %d, and the file has %d"
-                             % (gi, len(flat)))
+            raise build_mod.Refused("a cloth volume empty names model %d, and the file has %d"
+                                    % (gi, len(flat)))
     bmap = bone_map(m, arm_obj)
     changed, two = 0, []
     for gi, mr in enumerate(flat):
@@ -3736,9 +3737,9 @@ def apply_cloth_volumes(d, m, arm_obj, scale):
         for key in sorted(k for k in caps if k[0] == gi):
             if set(caps[key]) != {0, 1}:
                 (end, obj), = caps[key].items()
-                raise ValueError("%r is end %d of cloth capsule %d on model %d and the other "
-                                 "end is gone; delete it too, or add a capsule with Add "
-                                 "Cloth Capsule" % (obj.name, end, key[1], gi))
+                raise build_mod.Refused("%r is end %d of cloth capsule %d on model %d and the "
+                                        "other end is gone; delete it too, or add a capsule "
+                                        "with Add Cloth Capsule" % (obj.name, end, key[1], gi))
             ends = (caps[key][0], caps[key][1])
             b = [_accessory_bone(o, m, arm_obj, bmap, "cloth capsule end") for o in ends]
             if b[0] != b[1]:
