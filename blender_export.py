@@ -3803,6 +3803,22 @@ def sequence_actions(anim_names, source, arm_obj, actions=None):
 BLEND_KEEP_INDEX = True
 
 
+def seq_tombstones(arm_obj):
+    """[(label, src or None)] for each removal `vtmb_seqs_removed` holds, in the order made.
+
+    An entry is a bare label where a scene before 2026-10-27 wrote it, else {label, src}:
+    `src` is the file ordinal and outlives a rename of the entry, which the label does not.
+    """
+    out = []
+    for x in arm_obj.get("vtmb_seqs_removed") or ():
+        if isinstance(x, str):
+            out.append((x, None))
+        else:
+            src = x.get("src")
+            out.append((str(x.get("label") or ""), None if src is None else int(src)))
+    return out
+
+
 def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     """Label, activity, group size and the blend grid out of `arm_obj["vtmb_sequences"]`.
 
@@ -3824,9 +3840,9 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     and the word the file already carries stands, the rule a knockback record on a deleted
     bone follows.
 
-    The list itself is the scene's as well. `vtmb_seqs_removed` names the labels a removal
-    tombstoned, `src` on an entry is the file ordinal it came from and is what a reorder is
-    resolved through, and a trailing entry marked `new` is one the scene authored, which
+    The list itself is the scene's as well. `vtmb_seqs_removed` names what a removal
+    tombstoned, by `src` where it carries one and else by label, `src` on an entry is the
+    file ordinal it came from and is what a reorder is resolved through, and a trailing entry marked `new` is one the scene authored, which
     `add_sequence` appends. All three are positive marks rather than absences, the
     spring-chain rule: a stash shorter than the file with nothing tombstoned leaves the
     trailing records alone. A stash with no `src` is one an import before it made, which
@@ -3842,12 +3858,19 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     for name in anim_names:
         (carried_twice if name in seen else seen).add(name)
     n = 0
+    # The donor's own: 39 of the 4445 shipped models play an animation from two sequences
+    # and 19 carry one no sequence plays, so only what this export changes is reported.
+    was_cited = _cited_counts(d)
+    was_orphan = {anim_names[k] for k in range(len(anim_names)) if k not in was_cited}
 
     # Resolved to the record OBJECT before anything is dropped: a removal renumbers every
     # later ordinal, and a `src` names the file as the import read it.
     byord = list(d.seqs)
-    for label in [str(x) for x in (arm_obj.get("vtmb_seqs_removed") or ())]:
-        at = [k for k, r in enumerate(d.seqs) if (r.name or "") == label]
+    for label, src in seq_tombstones(arm_obj):
+        if src is not None and 0 <= src < len(byord):
+            at = [k for k, r in enumerate(d.seqs) if r is byord[src]]
+        else:
+            at = [k for k, r in enumerate(d.seqs) if (r.name or "") == label]
         if not at:
             # The donor no longer has it, so the tombstone has nothing to answer. Reported
             # rather than refused: an export to another path leaves the mark standing, and
@@ -3858,7 +3881,7 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
         moves["removed"].append(was)
         moves["autolayers_lost"] += lost
         moves["dangling"] += naming
-        moves["orphans"] = orphans
+        moves["orphans"] = [a for a in orphans if a not in was_orphan]
         n += 1
 
     fresh = 0
@@ -3978,16 +4001,21 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     # the action, and the stash has just rewritten it.
     for k, acts in _first_citers(d, actions).items():
         n += _apply_seq_action(d.seqs[k], acts)
-    # Last, off the grid the stash has just written. 0 of the 4445 shipped models carry an
-    # animation two sequences cite, so an added sequence naming one another already plays
-    # makes the first of them, and `_action_seq` reaches only the earlier of the two.
+    # Last, off the grid the stash has just written: `_action_seq` reaches only the
+    # earlier of two sequences playing one animation.
+    moves["twice"] = [anim_names[a] if 0 <= a < len(anim_names) else "animation %d" % a
+                      for a, c in sorted(_cited_counts(d).items())
+                      if c > 1 and was_cited.get(a, 0) < 2]
+    return n, out_of_range, moves
+
+
+def _cited_counts(d):
+    """{animation index: how many sequences play it}."""
     cited = {}
     for rec in d.seqs:
         for a in set(build_mod._seq_anims(rec.raw)):
             cited[a] = cited.get(a, 0) + 1
-    moves["twice"] = [anim_names[a] if 0 <= a < len(anim_names) else "animation %d" % a
-                      for a, c in sorted(cited.items()) if c > 1]
-    return n, out_of_range, moves
+    return cited
 
 
 def _first_citers(d, actions):

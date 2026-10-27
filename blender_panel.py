@@ -3054,7 +3054,7 @@ class VTMB_OT_rename_sequence(bpy.types.Operator):
 class VTMB_OT_add_sequence(bpy.types.Operator):
     bl_idname = "vtmb.add_sequence"
     bl_label = "Add sequence"
-    bl_description = ("Append a second sequence playing this action's animation. 0 of the "
+    bl_description = ("Append a second sequence playing this action's animation. 39 of the "
                       "4445 shipped models carry an animation two sequences cite, and the "
                       "panels here reach the earlier of the two")
     bl_options = {"REGISTER", "UNDO"}
@@ -3098,9 +3098,9 @@ class VTMB_OT_add_sequence(bpy.types.Operator):
 class VTMB_OT_remove_sequence(bpy.types.Operator):
     bl_idname = "vtmb.remove_sequence"
     bl_label = "Remove sequence"
-    bl_description = ("Drop this action's sequence from the file. Its animation stays and "
-                      "nothing will play it -- 0 of the 4445 shipped models carry one no "
-                      "sequence cites")
+    bl_description = ("Drop this action's sequence from the file. Its animation stays, and "
+                      "nothing plays it unless another sequence does -- 19 of the 4445 "
+                      "shipped models carry one no sequence cites")
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -3115,8 +3115,11 @@ class VTMB_OT_remove_sequence(bpy.types.Operator):
             _write_stash(arm_obj, stash)
             self.report({"INFO"}, "dropped %r, which this scene had added" % label)
             return {"FINISHED"}
-        tomb = [str(x) for x in arm_obj.get("vtmb_seqs_removed") or ()]
-        arm_obj["vtmb_seqs_removed"] = tomb + [label]
+        src = gone.get("src")
+        tomb = blender_export.seq_tombstones(arm_obj) + [
+            (label, None if src is None else int(src))]
+        arm_obj["vtmb_seqs_removed"] = [{"label": t} if s is None else {"label": t, "src": s}
+                                        for t, s in tomb]
         for x in stash:
             x["autolayers"] = [str(v) for v in x.get("autolayers") or ()
                                if str(v) != label]
@@ -3247,6 +3250,14 @@ class VTMB_OT_resize_blends(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _draw_tombstones(lay, arm_obj):
+    tomb = [t for t, _s in blender_export.seq_tombstones(arm_obj)]
+    if tomb:
+        lay.label(text="%d removal%s pending: %s"
+                       % (len(tomb), "" if len(tomb) == 1 else "s", ", ".join(tomb[:3])),
+                  icon="TRASH")
+
+
 def draw_action_sequence(lay, context, act):
     """The sequence list itself: which record this action drives, its label, its blend grid
     and where it sits among the others.
@@ -3259,6 +3270,9 @@ def draw_action_sequence(lay, context, act):
     arm_obj = _action_armature(context, act)
     if arm_obj is None:
         lay.label(text="no imported sequence names this action", icon="INFO")
+        obj = context.object
+        if obj is not None and obj.type == "ARMATURE":
+            _draw_tombstones(lay, obj)
         return
     k, seq = _action_seq(arm_obj, act)
     stash = list(arm_obj.get("vtmb_sequences") or ())
@@ -3278,11 +3292,7 @@ def draw_action_sequence(lay, context, act):
     lay.operator("vtmb.add_sequence", icon="ADD")
     if seq.get("new"):
         lay.label(text="added here, appended on the next export", icon="INFO")
-    tomb = [str(x) for x in arm_obj.get("vtmb_seqs_removed") or ()]
-    if tomb:
-        lay.label(text="%d removal%s pending: %s"
-                       % (len(tomb), "" if len(tomb) == 1 else "s", ", ".join(tomb[:3])),
-                  icon="TRASH")
+    _draw_tombstones(lay, arm_obj)
     if also:
         # `_action_seq` takes the first entry whose first blend names this action, so the
         # others are reachable from no panel.

@@ -1868,7 +1868,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         % (os.path.basename(src), ", ".join(sl["missing"])))
         if sl.get("orphans"):
             self.report({"WARNING"}, "%d animation%s no sequence plays now: %s. The engine "
-                                     "reaches an animation only through a sequence, and 0 "
+                                     "reaches an animation only through a sequence; 19 "
                                      "of the 4445 shipped models carry one"
                         % (len(sl["orphans"]),
                            "" if len(sl["orphans"]) == 1 else "s",
@@ -1882,8 +1882,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "resolves that at load time to nothing"
                         % ", ".join("%s at %s" % (n, f) for n, f in sl["dangling"][:4]))
         if sl.get("twice"):
-            self.report({"WARNING"}, "%d animation%s played by more than one sequence: %s. "
-                                     "0 of the 4445 shipped models carry one, and the "
+            self.report({"WARNING"}, "%d animation%s now played by more than one sequence: "
+                                     "%s. 39 of the 4445 shipped models carry one, and the "
                                      "panels reach the earlier sequence of each"
                         % (len(sl["twice"]), "" if len(sl["twice"]) == 1 else "s",
                            ", ".join(sl["twice"][:4])))

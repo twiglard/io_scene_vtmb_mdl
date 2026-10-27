@@ -3409,9 +3409,9 @@ def remove_sequence(d, i):
     The last sequence is not refused.  `numseq` 0 ships on 10 of the 4445 models, every one
     an `*allsequences.mdl` include stub carrying `numanim` 0 as well.
 
-    An animation no surviving sequence plays is reported and not refused.  0 of the 4445
-    models ship one -- every shipped animation is cited by exactly one sequence -- but
-    nothing in the file requires it and a scene part-way through an edit has it.
+    An animation no surviving sequence plays is reported and not refused.  19 of the 4445
+    models ship 242 of them, all under `character/shared/` bar `wolf_form` and
+    `wolf_form_2`, and 39 ship 403 animations two or more sequences play.
 
     Returns (label, [(label, entries lost)], [orphaned animation names],
              [(label, which name field)]).
