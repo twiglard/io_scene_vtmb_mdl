@@ -2903,6 +2903,43 @@ def replace_model(d, bi, mi, meshes, keep_center=True, donor_tris=None,
     return faces, retang, (flexdrop, flexempty), cloth
 
 
+def drop_meshes(d, bi, mi, ks):
+    """Take file meshes `ks` out of one model, with their vertices and flex records.
+
+    A mesh after a dropped one moves down by the vertices dropped ahead of it. A cloth
+    binding names model vertices, so dropping vertices under one is refused unless the
+    whole model goes, which takes the binding with it; `replace_model` with an empty run
+    is how a caller drops a mesh's vertices under cloth first. Every model of no vertex
+    in the corpus, 97 of them, also has no mesh, so a model left with none is that form.
+    """
+    mr = d.bodyparts[bi].kids[mi]
+    ks = set(ks)
+    whole = ks >= set(range(len(mr.kids)))
+    verts, tang = mr.extra.get("verts") or b"", mr.extra.get("tangents") or b""
+    nv = len(tang) // 16
+    vs = len(verts) // nv if nv else 0
+    gone = sum(struct.unpack_from("<i", mr.kids[k].raw, 0x08)[0] for k in ks
+               if k < len(mr.kids))
+    if gone and mr.extra.get("cloth") and not whole:
+        raise Refused("bodypart %d model %d: dropping %d vertices of meshes %s would "
+                      "renumber its cloth binding" % (bi, mi, gone, sorted(ks)))
+    vb, tb, kids, at = bytearray(), bytearray(), [], 0
+    for k, x in enumerate(mr.kids):
+        if k in ks:
+            continue
+        n, off = struct.unpack_from("<2i", x.raw, 0x08)
+        vb += verts[off * vs:(off + n) * vs]
+        tb += tang[off * 16:(off + n) * 16]
+        struct.pack_into("<i", x.raw, 0x0c, at)
+        at += n
+        kids.append(x)
+    mr.kids[:] = kids
+    mr.extra["verts"], mr.extra["tangents"] = bytes(vb), bytes(tb)
+    if whole:
+        mr.extra.pop("cloth", None)
+        struct.pack_into("<i", mr.raw, 0x9c, 0)
+
+
 def _unit(v):
     L = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
     return (v[0] / L, v[1] / L, v[2] / L) if L > 1e-12 else None

@@ -1417,7 +1417,7 @@ def rebased_box(model, place):
 
 
 def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
-                 donor_tris=None, place=None):
+                 donor_tris=None, place=None, empty=()):
     """One model's geometry replaced from the scene, its per-mesh triangles and its edits.
 
     Refuses a renumbering the file cannot absorb rather than dropping what it would break:
@@ -1445,12 +1445,14 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
     `fields` is what the checkboxes asked for. Without it a face added or a winding
     reversed changes Blender's corner normal on every vertex it touches, and the split
     would take that as an edit and write it -- on an export that never asked for normals.
+
+    `empty` names file meshes written with no vertex, for the caller to drop.
     """
     # Deferred: blender_scratch imports this module, so a top-level import is a cycle.
     from . import blender_scratch as scratch_mod
     carry = []
     runs, unskinned, kept, why, edits, origins = scratch_mod.split_mesh(
-        obj, bone_index, 1.0, fields, carry)
+        obj, bone_index, 1.0, fields, carry, empty)
     mr = d.bodyparts[bi].kids[mi]
     if not kept:
         carries = []
@@ -1796,14 +1798,18 @@ def _old_import_text(old):
             % said)
 
 
-def read_meshes(m, source, fields, boxes=None):
+def read_meshes(m, source, fields, boxes=None, blank=None):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
     fifth bone group no record can hold, the vertices whose normal moved by more than the
     round trip's own error and less than `NORMAL_EPS`, which are written from the stash and
     so lose the edit, the UV layers no model wrote, the donor's own triangles, the
     vertices no bone drives any more, which go to bone 0 at full weight, and the vertex
-    groups that skin something and name no bone."""
+    groups that skin something and name no bone.
+
+    `blank`, a list where the scene's import made an object for every model with a
+    vertex, collects (bodypart, model, name) for each such model whose object is gone
+    instead of naming it missing."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
     donor_meshes = {}
@@ -1817,8 +1823,11 @@ def read_meshes(m, source, fields, boxes=None):
         if obj is None:
             # The import makes no object for a model of no LOD-0 triangle, which 97 shipped
             # models over 91 files are, so the scene has nothing of it to supply.
-            if drawn_model(mo, donor_faces, bi, mi):
-                missing.append(mo.name or "model %d of bodypart %d" % (mi, bi))
+            name = mo.name or "model %d of bodypart %d" % (mi, bi)
+            if drawn_model(mo, donor_faces, bi, mi) and blank is not None:
+                blank.append((bi, mi, name))
+            elif drawn_model(mo, donor_faces, bi, mi):
+                missing.append(name)
                 unsupported |= set(no)
             continue
         # Before the rebuild branch below, which would report nothing for a model that
@@ -2548,8 +2557,8 @@ def _tail_inverse(inv, length):
 # Deleting one end of a capsule is itself refused, so the way out names both, and so is
 # deleting an eyeball's empty while its eye's faces stay (decision 21).
 _DELETE = {"cloth capsule end": "delete both of the capsule's ends",
-           "eyeball": "delete it and the eye's faces (Delete > Only Faces), which removes "
-                      "the eyeball"}
+           "eyeball": "delete it and the eye's faces, which removes the eyeball and its "
+                      "mesh"}
 
 
 def _accessory_bone(obj, m, arm_obj, bmap, what):
@@ -3421,7 +3430,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
            "eye_empties": [], "eye_records": [], "lid_past_radius": [],
            "eyes_added": [], "eye_meshes": 0, "mouth_added": False, "eyes_removed": [],
-           "mouth_removed": False}
+           "mouth_removed": False, "eye_gone": {}}
     stray = stray_eyeballs(m, arm_obj)
     if stray:
         raise build_mod.Refused(
@@ -3433,7 +3442,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
     at, added, gone = {}, [], {}
     bmap = None
     removal = bool(arm_obj.get("vtmb_eyeballs"))
-    parts = eye_mesh_parts(m, source) if removal else {}
+    parts = eye_mesh_parts(m, source, blanks_here(arm_obj, source)) if removal else {}
     # A model record carries no name of its own in the description, so the name comes off
     # the parsed file walked beside it -- same file, same order.
     for bi, (bp, dbp) in enumerate(zip(m.bodyparts, d.bodyparts)):
@@ -3452,9 +3461,8 @@ def apply_face(d, m, arm_obj, scale, source=None):
                     if i in have:
                         raise build_mod.Refused(
                             "eyeball %d of model %r has no empty, and %s still draws it. "
-                            "Delete the eye's faces as well to remove the eyeball (Edit "
-                            "Mode, Delete > Only Faces: a mesh left with no vertices is "
-                            "refused), or restore the empty"
+                            "Delete the eye's faces as well to remove the eyeball, which "
+                            "drops its mesh, or restore the empty"
                             % (i, model.name, " and ".join(have[i])))
                     gone.setdefault((bi, mi), set()).add(i)
                     out["eyes_removed"].append((model.name, i))
@@ -3500,6 +3508,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
                           for model, objs in sorted(eyes.items()) for obj in objs
                           if obj.name not in used]
     meshed = set()
+    out["eye_gone"] = gone
     if source is not None:
         out["eye_meshes"], meshed = _apply_eye_meshes(d, m, source, at,
                                                       gone if removal else None)
@@ -3562,12 +3571,35 @@ def apply_appended_eyes(d, m, arm_obj, scale, rows):
     return out
 
 
-def eye_mesh_parts(m, source):
+def blanks_here(arm_obj, source):
+    """Whether a model of `source` whose object is gone is written with no vertex: the
+    scene's import made an object for every model of that same file."""
+    return bool(source) and same_file(arm_obj.get("vtmb_mesh_models"), source)
+
+
+def eye_mesh_drops(m, source, gone):
+    """{(bodypart, model): {file mesh}}: the eye meshes of the eyeballs `apply_face`
+    removed, by the `vtmb_eye_slots` entry naming each. `apply_face` refused any whose
+    slot still holds a face, so these are written with no vertex and dropped."""
+    out = {}
+    for (bi, mi), obj in mesh_objects(m, source).items():
+        stash, stamp = obj.get("vtmb_meshes") or (), obj.get("vtmb_eye_slots") or ()
+        for slot, param in stamp:
+            if int(param) not in gone.get((bi, mi), ()):
+                continue
+            for j, row in enumerate(stash):
+                if int(row[0]) == int(slot):
+                    out.setdefault((bi, mi), set()).add(j)
+    return out
+
+
+def eye_mesh_parts(m, source, blanks=False):
     """{(bodypart, model): {eyeball index: [what draws it]}}: the eye meshes in the scene.
 
     A `vtmb_eye_slots` entry counts while its slot, resolved through `slot_moves`, still
     holds a face, so deleting an eye's faces is what takes its mesh away. A model no scene
-    object supplies is carried as the file has it, so its file's eye meshes count.
+    object supplies is carried as the file has it, so its file's eye meshes count -- unless
+    `blanks`, where the export writes such a model with no vertex and so no eye.
     """
     out = {}
     objs = mesh_objects(m, source) if source is not None else {}
@@ -3575,6 +3607,8 @@ def eye_mesh_parts(m, source):
         for mi, mo in enumerate(bp.models):
             at = out.setdefault((bi, mi), {})
             obj = objs.get((bi, mi))
+            if obj is None and blanks and drawn_model(mo):
+                continue
             if obj is None:
                 for j, x in enumerate(mo.meshes):
                     if x.materialtype == 1:
@@ -4638,7 +4672,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved):
             "removed": gone, "renamed": moved, "geometry": geometry_moved}
 
 
-def revise_vtx(source, dest, data, revised, flavours=("dx80",)):
+def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
     """Rewrite the .vtx for a model whose geometry moved, and return what each cost.
 
     The donor's own file supplies every strip group the edit did not touch, so a change to
@@ -4658,7 +4692,7 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",)):
         src = vtx_path(source, flavour)
         if not os.path.exists(src):
             continue
-        blob, st = vtxr_mod.revise(written, src, revised, lod0_only=True)
+        blob, st = vtxr_mod.revise(written, src, revised, lod0_only=True, drop=drop)
         path = vtx_path(dest, flavour)
         with open(path, "wb") as f:
             f.write(blob)
@@ -5009,7 +5043,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     mesh = {"fields": tuple(mesh_fields), "verts": 0, "models": 0,
             "missing": [], "unsupported": [], "normals": 0, "rebuilt": [],
             "unskinned": 0, "renumbered": 0, "crowded": [], "blind_normals": 0,
-            "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0,
+            "rebuilt_uvs": 0, "rebuilt_added": 0, "rebuilt_deleted": 0, "blanked": [],
             "flex_dropped": 0, "flex_emptied": 0, "uv_spare": [], "tangents": 0,
             "cloth_rebuilt": [], "cloth_renumbered": [], "cloth_carried": [],
             "cloth_promoted": [], "cloth_rigid": [],
@@ -5027,15 +5061,30 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # added, deleted or re-wound moves no .mdl byte and no checkbox names one -- and a
     # mesh the scene changed is rebuilt from the scene rather than from the file, which
     # is what leaves the written model independent of the donor's own geometry.
+    blank = [] if blanks_here(arm_obj, source) else None
     cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
         mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
         mesh["unskinned"], mesh["stray_groups"] = read_meshes(
-            m, source, mesh_fields, boxes)
-    if mesh_fields and not cells and not rebuild and not mesh["missing"]:
+            m, source, mesh_fields, boxes, blank)
+    if (mesh_fields and not cells and not rebuild and not mesh["missing"] and not blank
+            and any(drawn_model(mo, donor_faces, bi, mi)
+                    for bi, mi, _bp, mo in mesh_mod.models_of(m))):
         # Only where a field was asked for: with none, an untouched scene reaches neither
         # list and that is the whole of a default export rather than a scene that belongs
-        # to another file.
+        # to another file. A file of no vertex at all, null.mdl's form, has nothing to
+        # supply.
         raise SceneRefused("no scene mesh belongs to %s" % os.path.basename(source))
+    # Decision 21: a removed eyeball's mesh and a deleted object's model leave the file.
+    # Dropped just before the emit, so every pass above walks the donor's mesh numbering.
+    drops = {}
+    eye_drops = eye_mesh_drops(m, source, face["eye_gone"])
+    for key, obj in mesh_objects(m, source).items() if eye_drops else ():
+        if key in eye_drops:
+            cells.pop(key, None)
+            rebuild[key] = obj
+    for bi, mi, name in blank or ():
+        drops[(bi, mi)] = set(range(len(d.bodyparts[bi].kids[mi].kids)))
+        mesh["blanked"].append(name)
     for (bi, mi), verts in sorted(cells.items()):
         rec = d.bodyparts[bi].kids[mi]
         mo = m.bodyparts[bi].models[mi]
@@ -5075,7 +5124,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         tri = donor_faces.get((bi, mi))
         faces, unskinned, kept, edits = rebuild_cell(
             d, obj, bi, mi, bone_index, mesh_fields,
-            list(tri.elements()) if tri else None, place=placed.get(obj.name))
+            list(tri.elements()) if tri else None, place=placed.get(obj.name),
+            empty=eye_drops.get((bi, mi), ()))
+        if (bi, mi) in eye_drops:
+            drops[(bi, mi)] = set(eye_drops[(bi, mi)])
         for k, tris in enumerate(faces):
             revised[(bi, mi, k)] = tris
         now = sum(struct.unpack_from("<i", x.raw, 0x08)[0]
@@ -5160,6 +5212,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     cloth_was = cloth_edits(m, source, d, cloth_maps)
     cloth = apply_cloth(d, m, source, cloth_was) if write_cloth else None
 
+    for (bi, mi), ks in sorted(drops.items()):
+        build_mod.drop_meshes(d, bi, mi, ks)
     if before_write is not None:
         before_write(d, scene["added_materials"])
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
@@ -5170,8 +5224,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
     # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
     # was named, so an empty face map is the whole of what either needs.
-    touched = (revise_vtx(source, dest, data, revised, vtx_flavours)
-               if (revised or removed or added_bones or cloth_removed) else [])
+    touched = (revise_vtx(source, dest, data, revised, vtx_flavours, drops)
+               if (revised or removed or added_bones or cloth_removed or drops) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
     # wrote.

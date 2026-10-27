@@ -1457,6 +1457,14 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     objs, warning = ([], None) if not with_mesh else \
         build_meshes(context, m, arm_obj, name, scale, content, with_flexes)
     build_accessories(context, m, arm_obj, name, scale)
+    # Only where every model with a vertex got its object does a missing one mean the user
+    # deleted it, which the donor export of this same file writes as a model of no vertex.
+    drawn = sum(1 for bp in m.bodyparts for mo in bp.models if mo.numvertices)
+    made = {(o.get("vtmb_bodypart"), o.get("vtmb_model")) for o in objs}
+    if with_mesh and drawn and len(made) == drawn:
+        arm_obj["vtmb_mesh_models"] = m.path
+    else:
+        arm_obj.pop("vtmb_mesh_models", None)
 
     wanted, missing, opened = [], [], [m.path]
     if with_anims:

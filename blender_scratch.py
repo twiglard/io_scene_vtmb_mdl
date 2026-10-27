@@ -165,7 +165,7 @@ def identity_map(obj, me):
     return out
 
 
-def original_runs(obj, me, why=None, carry=None):
+def original_runs(obj, me, why=None, carry=None, empty=()):
     """The file's mesh partition as [(material slot, [Blender vertex, ...]), ...].
 
     A vertex the edit deleted is left out of its run, so the survivors stay in file order
@@ -184,6 +184,9 @@ def original_runs(obj, me, why=None, carry=None):
     belongs to; or a mesh every vertex of which has gone, `numvertices` 0 being a form 0 of
     9741 shipped meshes has. Each of those appends to `why`, which the caller reports and
     cannot work out for itself.
+
+    `empty` names file meshes, by position, to come back with no vertex whatever the scene
+    still holds of them: the eye mesh of a removed eyeball, which the export then drops.
     """
     if why is None:
         why = []
@@ -202,9 +205,9 @@ def original_runs(obj, me, why=None, carry=None):
     moves = export_mod.slot_moves(obj)[0]
     claimed = set(_point_ints(me, "vtmb_orig") or ())
     runs, at, slots = [], 0, set()
-    for slot, n in spec:
+    for fi, (slot, n) in enumerate(spec):
         members, kept_at = [], []
-        for k in range(int(n)):
+        for k in range(0 if fi in empty else int(n)):
             vi = ident.get(at + k)
             if vi is not None:
                 members.append(vi)
@@ -215,7 +218,7 @@ def original_runs(obj, me, why=None, carry=None):
                            "stands where the file put that original, so writing either "
                            "would name the wrong vertex" % (at + k))
                 return None
-        if int(n) and not members:
+        if int(n) and not members and fi not in empty:
             why.append("every vertex of one of the file's meshes is claimed by no vertex "
                        "of the scene, and a mesh with numvertices 0 is a form 0 of 9741 "
                        "shipped meshes has")
@@ -249,7 +252,8 @@ def wound(corners):
     return tuple(reversed(corners))
 
 
-def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals"), carry=None):
+def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals"), carry=None,
+               empty=()):
     """([(material slot, verts, faces), ...], unskinned, kept, why, edits, origins).
 
     The format stores one normal, one UV and one skin per vertex, so a seam or a hard edge
@@ -276,6 +280,8 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals"), carry=None
     donor's per-vertex fields through it instead of by position, which is what lets a
     delete keep the file's own numbering for every vertex that survived. It is None per run
     on the rebuilt partition, where no output vertex has an original.
+
+    `empty` is `original_runs`'s.
     """
     me = obj.data
     if not me.polygons:
@@ -309,7 +315,7 @@ def split_mesh(obj, bone_index, scale=1.0, fields=("uvs", "normals"), carry=None
         why.append("nothing stashed the file's own UVs on this mesh")
     else:
         spans = []
-        runs = original_runs(obj, me, why, spans)
+        runs = original_runs(obj, me, why, spans, empty)
         if runs is not None:
             out = _split_preserved(me, runs, stash, uvs, normals, uv_layer,
                                    rec, key_of, why, fields)

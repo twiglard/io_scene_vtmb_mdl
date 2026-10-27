@@ -200,7 +200,7 @@ def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, force_no_fl
     return out
 
 
-def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
+def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None):
     """One .vtx re-emitted with new triangles for the cells named and the rest untouched.
 
     `mdl` is the model as it will be written, since a changed mesh's bone bindings come out
@@ -221,6 +221,10 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
     and its strip groups become the passes that rule asks for, so their number and kind
     can change.
 
+    `drop` is {(bodypart, model): {donor mesh index}} for meshes `mdl_build.drop_meshes`
+    took out of the .mdl; they leave every LOD here too. `faces` stays keyed by the donor's
+    mesh index, and the written model's mesh is the donor's less those dropped ahead of it.
+
     The .mdl's checksum is written through unchanged: the pair only has to agree with each
     other, and both files are written together.
     """
@@ -234,16 +238,21 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
         for j, model in enumerate(bp.models):
             src_model = mdl.bodyparts[i].models[j]
             verts = mdl.vertices(src_model)
+            gone = (drop or {}).get((i, j)) or set()
             for li, lod in enumerate(model.lods):
                 if li and lod0_only:
                     ri += sum(len(e.groups) for e in lod.meshes)
+                    lod.meshes[:] = [e for k, e in enumerate(lod.meshes) if k not in gone]
                     continue
                 # Read off the donor before any mesh of this LOD is re-dealt: a mesh gaining
                 # a flexed group would otherwise change it for the meshes after.
                 force_no_flex = not any(g.flags & W.SG_IS_FLEXED
                                         for e in lod.meshes for g in e.groups)
                 for k, mesh in enumerate(lod.meshes):
-                    src_mesh = src_model.meshes[k]
+                    if k in gone:
+                        ri += len(mesh.groups)
+                        continue
+                    src_mesh = src_model.meshes[k - sum(1 for g in gone if g < k)]
                     # LOD 0 only. A lower LOD draws a subset of the same mesh vertices by
                     # their original ids, so an edit that adds vertices leaves its
                     # triangles valid, and handing it LOD 0's would replace it with them.
@@ -285,6 +294,8 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False):
                             cells.append((g, orig, [tuple(local[x] for x in t)
                                                     for t in mine]))
                     _fill(v, src_mesh, verts, cells, st)
+                if gone:
+                    lod.meshes[:] = [e for k, e in enumerate(lod.meshes) if k not in gone]
     # A bodypart past the donor's is one `mdl_build.add_model` appended, given one LOD.
     for i in range(len(v.bodyparts), len(mdl.bodyparts)):
         bp = W.BodyPart()

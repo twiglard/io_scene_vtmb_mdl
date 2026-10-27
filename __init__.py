@@ -1222,8 +1222,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 _pair(box, "meshes", "none: the file declares no vertices", icon="INFO")
             elif fields:
                 got, total, no, new = _mesh_status(self, context, base, fields)
-                _pair(box, "meshes", "%d of %d" % (got, total),
-                      icon="NONE" if got == total else "ERROR")
+                arm = _export_armature(context)
+                if got < total and arm is not None and blender_export.blanks_here(arm, base):
+                    _pair(box, "meshes", "%d of %d, %d written with no vertex"
+                          % (got, total, total - got), icon="INFO")
+                else:
+                    _pair(box, "meshes", "%d of %d" % (got, total),
+                          icon="NONE" if got == total else "ERROR")
                 if new:
                     _pair(box, "appended", "%d new object%s, a bodypart each"
                           % (new, "" if new == 1 else "s"), icon="ADD")
@@ -1346,6 +1351,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         mesh = r["mesh"]
         _report_placed(self, moved, mesh["fields"],
                        {row["name"] for row in mesh.get("appended") or ()})
+        if mesh.get("blanked"):
+            self.report({"INFO"}, "%d model%s of %s written with no vertex, the object "
+                                  "deleted from the scene: %s"
+                        % (len(mesh["blanked"]), "" if len(mesh["blanked"]) == 1 else "s",
+                           os.path.basename(src), ", ".join(mesh["blanked"][:4])))
         if mesh["missing"] and mesh["fields"]:
             self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "
                                      "the file's own: %s"
