@@ -1947,6 +1947,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "leaf -- so this takes a path no shipped file takes"
                         % (scene["spring_ends"],
                            "" if scene["spring_ends"] == 1 else "s"))
+        for k, was, now in scene.get("spring_end_renamed") or ():
+            self.report({"INFO"}, "spring bone chain %d ends at %r, the bone now called %r"
+                        % (k, was, now))
         if scene.get("spring_switched"):
             self.report({"WARNING"},
                         "%d spring bone chain%s switched on or off. A chain that starts "

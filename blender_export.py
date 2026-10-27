@@ -2164,6 +2164,20 @@ def spring_start(k, have, off):
     return -1 - start
 
 
+def spring_end_bone(arm_obj, end):
+    """The pose bone a stored spring end means: the one Blender calls `end`, else the one
+    whose `vtmb_bone_name` says it was `end` in the file, else None.
+
+    The end is stored as a name, the picker offers Blender's names, and Blender has no
+    rename event to rewrite the key with, so either kind of name can be standing there.
+    """
+    pb = arm_obj.pose.bones.get(end)
+    if pb is not None:
+        return pb
+    hits = [p for p in arm_obj.pose.bones if str(p.get("vtmb_bone_name") or "") == end]
+    return hits[0] if len(hits) == 1 else None
+
+
 def spring_endbone(k, start, end, m):
     """The `mstudiospringbone_t.endbone` a named end bone resolves to, or a refusal.
 
@@ -2254,7 +2268,8 @@ def apply_springbones(d, m, arm_obj):
     """
     claimed, add, drop = spring_chains(arm_obj)
     out = {"changed": 0, "ends": 0, "switched": 0, "unclaimed": [],
-           "added": [], "removed": [], "stamps": {}, "gone": [], "over_mask": 0}
+           "added": [], "removed": [], "stamps": {}, "gone": [], "over_mask": 0,
+           "end_renamed": []}
 
     def name_of(i):
         return m.bones[i].name if 0 <= i < len(m.bones) else "bone %d" % i
@@ -2314,9 +2329,14 @@ def apply_springbones(d, m, arm_obj):
             # below already follow -- writing -1 here would repoint the chain at the leaf.
             want = have
         elif end:
+            # `m.bones` keeps the file's names, so the end resolves through its bone's stamp.
+            eb = spring_end_bone(arm_obj, str(end))
+            fname = str(end) if eb is None else str(eb.get("vtmb_bone_name") or eb.name)
+            if eb is not None and eb.name != end:
+                out["end_renamed"].append((k, str(end), eb.name))
             # +0x00 carries the start bone as -1-bone when the chain starts disabled, and
             # want0 is the form this export is writing rather than the one it read.
-            want = spring_endbone(k, want0 if want0 >= 0 else -1 - want0, end, m)
+            want = spring_endbone(k, want0 if want0 >= 0 else -1 - want0, fname, m)
             out["ends"] += 1
         else:
             want = -1
@@ -4680,7 +4700,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     sp = apply_springbones(d, m, arm_obj)
     scene["springs"] = sp["changed"]
     for key in ("ends", "switched", "unclaimed", "added", "removed", "stamps",
-                "gone", "over_mask"):
+                "gone", "over_mask", "end_renamed"):
         scene["spring_" + key] = sp[key]
     scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
     vol = apply_cloth_volumes(d, m, arm_obj, scale)

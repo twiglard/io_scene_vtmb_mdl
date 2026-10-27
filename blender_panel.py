@@ -1001,20 +1001,18 @@ def draw_face(lay, context, arm_obj):
     else:
         box = lay.box()
         box.label(text="mouth", icon="USER")
-        # A nested id-property path is a real RNA path in 5.2: `prop` and `prop_search`
-        # both take `["vtmb_mouth"]["bone"]` and a write through one reaches the stash.
-        # `prop` on an absent key still raises inside draw(), and the import is the only
-        # thing that stamps these, so a key missing is an older .blend and gets a label.
+        # Registered properties over the stash: 5.2.2 draws nothing for a nested
+        # id-property path such as `["vtmb_mouth"]["bone"]`, though path_resolve reads it.
+        # A key missing is an older .blend, since only the import stamps these.
         if mouth.get("bone") is None:
             box.label(text="bone: not stashed", icon="INFO")
         else:
-            box.prop_search(arm_obj, '["vtmb_mouth"]["bone"]', *bone_search(arm_obj),
-                            text="Bone")
+            box.prop_search(arm_obj, "vtmb_mouth_bone", *bone_search(arm_obj), text="Bone")
         for k, label in (("forward", "Forward"), ("flex", "Jaw flex")):
             if mouth.get(k) is None:
                 box.label(text="%s: not stashed" % label, icon="INFO")
             else:
-                box.prop(arm_obj, '["vtmb_mouth"]["%s"]' % k, text=label)
+                box.prop(arm_obj, "vtmb_mouth_%s" % k, text=label)
         box.label(text="the export refuses a jaw flex no flex rule writes", icon="INFO")
     lay.operator("vtmb.add_eyeball", icon="HIDE_OFF")
     eyes = blender_export.eyeball_objects(arm_obj)
@@ -1122,6 +1120,28 @@ def _lid_side(obj):
         if lids == names:
             return side
     return "other"
+
+
+def _mouth_get(key):
+    def get(self):
+        m = self.get("vtmb_mouth")
+        v = m.get(key) if m else None
+        if key == "forward":
+            return tuple(float(x) for x in v) if v is not None and len(v) == 3 else (0.0,) * 3
+        return str(v or "")
+    return get
+
+
+def _mouth_set(key):
+    def put(self, v):
+        m = self.get("vtmb_mouth")
+        if not m:
+            return
+        # A copy, not the group: every reassignment of the key frees what it held.
+        d = m.to_dict()
+        d[key] = [float(x) for x in v] if key == "forward" else str(v)
+        self["vtmb_mouth"] = d
+    return put
 
 
 def _lids_get(self):
@@ -2891,6 +2911,11 @@ class VTMB_PT_bone(bpy.types.Panel):
         else:
             col.prop_search(pb, '["vtmb_spring_end"]',
                             *bone_search(context.object), text="Ends at")
+            end = str(pb["vtmb_spring_end"])
+            eb = blender_export.spring_end_bone(context.object, end) if end else None
+            if eb is not None and eb.name != end:
+                col.label(text="%r is now called %r, which the export writes" % (end, eb.name),
+                          icon="INFO")
             col.label(text="empty runs the chain first-child to the leaf")
         off = pb.get("vtmb_spring_disabled")
         if off is None:
@@ -3420,6 +3445,18 @@ def register_props():
             get=(lambda k: lambda self: float(self.get("vtmb_cloth_%s" % k) or 0.0))(_k),
             set=(lambda k: lambda self, v: self.__setitem__("vtmb_cloth_%s" % k,
                                                             float(v)))(_k)))
+    bpy.types.Object.vtmb_mouth_bone = bpy.props.StringProperty(
+        name="Bone", description="The bone the mouth's forward vector turns with",
+        get=_mouth_get("bone"), set=_mouth_set("bone"))
+    bpy.types.Object.vtmb_mouth_forward = bpy.props.FloatVectorProperty(
+        name="Forward", size=3, subtype="XYZ",
+        description="The mouth's forward vector in its bone's space, (0, -1, 0) on all 200 "
+                    "shipped mouths",
+        get=_mouth_get("forward"), set=_mouth_set("forward"))
+    bpy.types.Object.vtmb_mouth_flex = bpy.props.StringProperty(
+        name="Jaw flex", description="The flex whose weight opens the mouth, 'mouth' on all "
+                                     "200 shipped mouths",
+        get=_mouth_get("flex"), set=_mouth_set("flex"))
     bpy.types.Object.vtmb_eyeball_lids = bpy.props.EnumProperty(
         name="Lid flexes", get=_lids_get, set=_lids_set,
         items=(("none", "None", "All eight flexdesc indices zero, which is how 210 of "
@@ -3504,7 +3541,8 @@ def unregister_props():
         if hasattr(bpy.types.Object, key + "_xyz"):
             delattr(bpy.types.Object, key + "_xyz")
     names = ["vtmb_cloth_on", "vtmb_cloth_flip_on", "vtmb_cloth_preset_name",
-             "vtmb_cloth_pin_text", "vtmb_eyeball_lids", "vtmb_bodypart_text"]
+             "vtmb_cloth_pin_text", "vtmb_eyeball_lids", "vtmb_bodypart_text",
+             "vtmb_mouth_bone", "vtmb_mouth_forward", "vtmb_mouth_flex"]
     for k, _l, _lo, _hi, _d in CLOTH_NUMBERS:
         names += ["vtmb_cloth_%s_on" % k, "vtmb_cloth_%s_num" % k]
     for attr in names:
