@@ -2044,8 +2044,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for model, i in scene.get("eye_records") or ():
             self.report({"WARNING"}, "eyeball %d of model %r has no empty stamped "
                                      "vtmb_eyeball %d, so it is written as the donor had "
-                                     "it. A donor export removes no eyeball"
+                                     "it: this scene was imported before an export could "
+                                     "remove an eyeball. Re-import the model to remove one "
+                                     "by deleting its empty and its eye's faces"
                         % (i, model, i))
+        for model, i in scene.get("eyes_removed") or ():
+            self.report({"INFO"}, "eyeball %d of model %r removed, its empty and its eye's "
+                                  "faces both gone; any later eyeball of the model moves "
+                                  "down and its eye mesh follows" % (i, model))
         for name, has_lids in scene.get("eye_lid_targets") or ():
             self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
                                      "neither, so this one is written as the scene has it "

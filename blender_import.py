@@ -737,6 +737,9 @@ def build_accessories(context, m, arm_obj, name, scale):
     # An export reads the volume empties only where this is set, so a scene imported
     # before they were drawn, or one missing a volume's bone, carries the file's own.
     arm_obj["vtmb_cloth_volumes"] = 1
+    # And the eyeballs: only where every record has its empty does a missing empty mean
+    # the user deleted it, which is what lets the donor export remove the record.
+    arm_obj["vtmb_eyeballs"] = 1
     if not m.attachments and not m.hitboxsets and not eyes and not vols:
         return made
     coll = _accessory_collection(context, arm_obj, name)
@@ -760,7 +763,9 @@ def build_accessories(context, m, arm_obj, name, scale):
         for model in bp.models:
             for e in model.eyeballs:
                 obj = _eyeball_empty(m, e, model, arm_obj, name, scale, dbs)
-                if obj is not None:
+                if obj is None:
+                    arm_obj.pop("vtmb_eyeballs", None)
+                else:
                     coll.objects.link(obj)
                     _bone_child(obj, arm_obj, dbs[m.bones[e.bone].name])
                     made.append(obj)

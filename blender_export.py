@@ -12,6 +12,7 @@ the model. A mesh that did not move takes the index-for-index patch instead.
 """
 
 import array
+import collections
 import contextlib
 import copy
 import math
@@ -2465,6 +2466,44 @@ def stray_eyeballs(m, arm_obj):
     return sorted(out)
 
 
+# The stamp each kind of accessory empty carries, and what the message calls it.
+ACCESSORY_KEYS = (("vtmb_attachment", "attachment"), ("vtmb_hitbox_group", "hitbox"),
+                  ("vtmb_hitboxset", "hitbox set"), ("vtmb_cloth_volume_model", "cloth volume"))
+
+
+def stray_accessories(arm_obj, eyes=False):
+    """[(kind, name)]: accessory empties in the armature's scene under no armature.
+
+    Clear Parent (Alt+P) leaves the empty in the outliner and takes it out of what the
+    export reads, which would write it as deleted. An armature is the only owner an empty
+    names, so one stray stops the export of every armature in its scene.
+    """
+    keys = ACCESSORY_KEYS + ((("vtmb_eyeball", "eyeball"),) if eyes else ())
+    scenes = set(arm_obj.users_scene)
+    out = []
+    for obj in bpy.data.objects:
+        kind = next((k for key, k in keys if obj.get(key) is not None), None)
+        if kind is None or not scenes & set(obj.users_scene):
+            continue
+        up = obj.parent
+        while up is not None and up.type != "ARMATURE":
+            up = up.parent
+        if up is None:
+            out.append((kind, obj.name))
+    return sorted(out)
+
+
+def stray_text(stray):
+    one = len(stray) == 1
+    names = ", ".join("%s %r" % x for x in stray[:6])
+    if len(stray) > 6:
+        names += " and %d more" % (len(stray) - 6)
+    it = "it" if one else "them"
+    return ("%s %s under no armature, so the export would write %s as deleted. Parent %s "
+            "back under the armature (Ctrl+P), or delete %s"
+            % (names, "is" if one else "are", it, it, it))
+
+
 def bone_space(obj):
     """An accessory empty's matrix in its bone's space, where the viewport draws it.
 
@@ -2495,11 +2534,11 @@ def _tail_inverse(inv, length):
             and abs(inv[1][3] + length) <= max(length, 1.0) * 2.0 ** -19)
 
 
-# Deleting one end of a capsule is itself refused, so the way out names both. A donor
-# export keeps the record of an eyeball whose empty is gone (decision 21 is open).
+# Deleting one end of a capsule is itself refused, so the way out names both, and so is
+# deleting an eyeball's empty while its eye's faces stay (decision 21).
 _DELETE = {"cloth capsule end": "delete both of the capsule's ends",
-           "eyeball": "delete it, which clears this but removes no eye: one the donor "
-                      "carries stays in the file as the donor had it"}
+           "eyeball": "delete it and the eye's faces (Delete > Only Faces), which removes "
+                      "the eyeball"}
 
 
 def _accessory_bone(obj, m, arm_obj, bmap, what):
@@ -3370,7 +3409,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
            "eye_empties": [], "eye_records": [], "lid_past_radius": [],
-           "eyes_added": [], "eye_meshes": 0, "mouth_added": False}
+           "eyes_added": [], "eye_meshes": 0, "mouth_added": False, "eyes_removed": []}
     stray = stray_eyeballs(m, arm_obj)
     if stray:
         raise build_mod.Refused(
@@ -3379,26 +3418,56 @@ def apply_face(d, m, arm_obj, scale, source=None):
             "> Relations), or %s" % (", ".join(repr(n) for n in stray), _DELETE["eyeball"]))
     eyes = eyeball_objects(arm_obj)
     used = set()
-    at, added = {}, []
+    at, added, gone = {}, [], {}
     bmap = None
+    removal = bool(arm_obj.get("vtmb_eyeballs"))
+    parts = eye_mesh_parts(m, source) if removal else {}
     # A model record carries no name of its own in the description, so the name comes off
     # the parsed file walked beside it -- same file, same order.
     for bi, (bp, dbp) in enumerate(zip(m.bodyparts, d.bodyparts)):
         for mi, (model, mr) in enumerate(zip(bp.models, dbp.kids)):
             recs = mr.extra.setdefault("eyes", [])
             named = eyes.get(model.name) or []
-            pos = at[bi, mi] = {i: i for i in range(len(recs))}
-            if recs:
-                for i, rec, obj in _eye_pairs(recs, named or eyes.get("") or []):
-                    if obj is None:
-                        out["eye_records"].append((model.name, i))
-                        continue
-                    used.add(obj.name)
-                    if bmap is None:
-                        bmap = bone_map(m, arm_obj)
-                    out["changed"] += _apply_eyeball(
-                        d, rec, obj, scale, out,
-                        _accessory_bone(obj, m, arm_obj, bmap, "eyeball"))
+            drew = {x.materialparam for x in model.meshes if x.materialtype == 1}
+            have = parts.get((bi, mi), {})
+            keep = []
+            for i, rec, obj in _eye_pairs(recs, named or eyes.get("") or []):
+                if obj is None and not removal:
+                    out["eye_records"].append((model.name, i))
+                    keep.append((i, rec, None))
+                    continue
+                if obj is None:
+                    if i in have:
+                        raise build_mod.Refused(
+                            "eyeball %d of model %r has no empty, and %s still draws it. "
+                            "Delete the eye's faces as well to remove the eyeball (Edit "
+                            "Mode, Delete > Only Faces: a mesh left with no vertices is "
+                            "refused), or restore the empty"
+                            % (i, model.name, " and ".join(have[i])))
+                    gone.setdefault((bi, mi), set()).add(i)
+                    out["eyes_removed"].append((model.name, i))
+                    continue
+                # 4 of the 602 shipped records are drawn by no mesh, so only one the donor
+                # drew has a mesh to lose.
+                if removal and i in drew and i not in have:
+                    raise build_mod.Refused(
+                        "eyeball %d of model %r still has its empty %r, and no mesh draws "
+                        "it any more. Delete the empty as well to remove the eyeball, or "
+                        "restore the eye's faces" % (i, model.name, obj.name))
+                keep.append((i, rec, obj))
+            if (bi, mi) in gone:
+                recs[:] = [rec for _i, rec, _o in keep]
+                out["changed"] += 1
+            pos = at[bi, mi] = {i: k for k, (i, _r, _o) in enumerate(keep)}
+            for i, rec, obj in keep:
+                if obj is None:
+                    continue
+                used.add(obj.name)
+                if bmap is None:
+                    bmap = bone_map(m, arm_obj)
+                out["changed"] += _apply_eyeball(
+                    d, rec, obj, scale, out,
+                    _accessory_bone(obj, m, arm_obj, bmap, "eyeball"))
             for obj in named:
                 i = int(obj["vtmb_eyeball"])
                 if i in pos:
@@ -3420,7 +3489,8 @@ def apply_face(d, m, arm_obj, scale, source=None):
                           if obj.name not in used]
     meshed = set()
     if source is not None:
-        out["eye_meshes"], meshed = _apply_eye_meshes(d, m, source, at)
+        out["eye_meshes"], meshed = _apply_eye_meshes(d, m, source, at,
+                                                      gone if removal else None)
     out["eyes_added"] = [(name, model, i, k, (bi, mi, k) in meshed)
                          for name, model, i, bi, mi, k in added]
     out["changed"] += _apply_mouth(d, m, arm_obj, out)
@@ -3480,7 +3550,39 @@ def apply_appended_eyes(d, m, arm_obj, scale, rows):
     return out
 
 
-def _apply_eye_meshes(d, m, source, at):
+def eye_mesh_parts(m, source):
+    """{(bodypart, model): {eyeball index: [what draws it]}}: the eye meshes in the scene.
+
+    A `vtmb_eye_slots` entry counts while its slot, resolved through `slot_moves`, still
+    holds a face, so deleting an eye's faces is what takes its mesh away. A model no scene
+    object supplies is carried as the file has it, so its file's eye meshes count.
+    """
+    out = {}
+    objs = mesh_objects(m, source) if source is not None else {}
+    for bi, bp in enumerate(m.bodyparts):
+        for mi, mo in enumerate(bp.models):
+            at = out.setdefault((bi, mi), {})
+            obj = objs.get((bi, mi))
+            if obj is None:
+                for j, x in enumerate(mo.meshes):
+                    if x.materialtype == 1:
+                        at.setdefault(x.materialparam, []).append(
+                            "file mesh %d of %r, which no object in the scene supplies"
+                            % (j, mo.name))
+                continue
+            moves = slot_moves(obj)[0]
+            faces = collections.Counter(p.material_index for p in obj.data.polygons)
+            mats = obj.data.materials
+            for slot, param in obj.get("vtmb_eye_slots") or ():
+                here = int(slot) if moves is None else moves.get(int(slot))
+                if here is not None and faces[here]:
+                    mat = mats[here].name if here < len(mats) and mats[here] else "?"
+                    at.setdefault(int(param), []).append(
+                        "material slot %d (%s) of %r" % (here, mat, obj.name))
+    return out
+
+
+def _apply_eye_meshes(d, m, source, at, gone=None):
     """Each mesh a `vtmb_eye_slots` stamp names, drawn as the eyeball it names.
 
     The stamp is [slot, eyeball index] per eye mesh, the slot being the one `vtmb_meshes`
@@ -3488,15 +3590,34 @@ def _apply_eye_meshes(d, m, source, at):
     {(bodypart, model): {eyeball index: record position}}. A mesh no stamp names keeps
     the donor's fields, so an untouched import writes what it read. Answers (meshes
     rewritten, {(bodypart, model, record position) some mesh draws}).
+
+    `gone` is {(bodypart, model): {eyeball index removed}}, given where the scene can
+    remove an eyeball. Then every donor eye mesh is rewritten: an ordinary mesh, (0, 0) as
+    on 9143 of 9143 shipped, where a scene object supplies the model, since its stamp says
+    which are eyes, and its eyeball's new position where none does.
     """
-    changed, meshed = 0, set()
-    for (bi, mi), obj in sorted(mesh_objects(m, source).items()):
+    objs = mesh_objects(m, source)
+    want = {}
+    if gone is not None:
+        for bi, dbp in enumerate(d.bodyparts):
+            for mi, mr in enumerate(dbp.kids):
+                pos = at.get((bi, mi), {})
+                for j, kid in enumerate(mr.kids):
+                    kind, param = struct.unpack_from("<2i", kid.raw, 0x18)
+                    if kind == 1 and (bi, mi) in objs:
+                        want[bi, mi, j] = (0, 0)
+                    elif kind == 1 and param in pos:
+                        want[bi, mi, j] = (1, pos[param])
+    for (bi, mi), obj in sorted(objs.items()):
         stash, stamp = obj.get("vtmb_meshes"), obj.get("vtmb_eye_slots")
         if not stash or not stamp:
             continue
         kids = d.bodyparts[bi].kids[mi].kids
         pos = at.get((bi, mi), {})
         for slot, param in stamp:
+            # A removed eyeball's entry is one whose faces went, or `apply_face` refused.
+            if gone is not None and int(param) in gone.get((bi, mi), ()):
+                continue
             for j in range(min(len(stash), len(kids))):
                 if int(stash[j][0]) != int(slot):
                     continue
@@ -3507,11 +3628,15 @@ def _apply_eye_meshes(d, m, source, at):
                         "such record and no eyeball empty claims it. Restore the empty, or "
                         "delete vtmb_eye_slots from the object's custom properties to "
                         "write the mesh as an ordinary one" % (obj.name, j, int(param)))
-                meshed.add((bi, mi, k))
-                raw = kids[j].raw
-                if struct.unpack_from("<2i", raw, 0x18) != (1, k):
-                    struct.pack_into("<2i", raw, 0x18, 1, k)
-                    changed += 1
+                want[bi, mi, j] = (1, k)
+    changed, meshed = 0, set()
+    for (bi, mi, j), v in sorted(want.items()):
+        raw = d.bodyparts[bi].kids[mi].kids[j].raw
+        if v[0] == 1:
+            meshed.add((bi, mi, v[1]))
+        if struct.unpack_from("<2i", raw, 0x18) != v:
+            struct.pack_into("<2i", raw, 0x18, *v)
+            changed += 1
     return changed, meshed
 
 
@@ -4579,6 +4704,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     old = old_imports(m, source, arm_obj)
     if old:
         raise build_mod.Refused(_old_import_text(old))
+    stray = stray_accessories(arm_obj)
+    if stray:
+        raise build_mod.Refused(stray_text(stray))
     # Before anything is read off the scene: Shift+D copies the stamps, so two objects can
     # claim one model and the file has one mesh per model to put them in. A copy the export
     # can tell apart is dropped and reported; one it cannot is refused, since taking either
@@ -4809,6 +4937,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["eye_lid_targets"] = face["lid_targets"]
     scene["eye_empties"] = face["eye_empties"]
     scene["eye_records"] = face["eye_records"]
+    scene["eyes_removed"] = face["eyes_removed"]
     # After the mesh pass above rather than beside it: an eyeball is the one thing that
     # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
     for name in face["materials"]:

@@ -1389,6 +1389,9 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     for p in includes:
         build_mod.add_include(d, p)
     build_mod.set_cdtextures(d, paths_mod.cdtexture_list(cdtexture))
+    stray = export_mod.stray_accessories(arm_obj, eyes=True)
+    if stray:
+        raise Refused(export_mod.stray_text(stray))
     bone_index = add_bones(d, arm_obj, scale, surfaceprop)
     if not bone_index:
         raise Refused("the armature has no bones")
