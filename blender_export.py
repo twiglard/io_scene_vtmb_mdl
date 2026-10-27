@@ -1171,7 +1171,7 @@ def _canon_faces(tris):
     return collections.Counter(vtxr_mod._canon(t) for t in tris)
 
 
-def _donor_faces(source, m):
+def _donor_faces(source, m, meshes=None):
     """{(bodypart, model): the donor's own LOD-0 triangles}, in the file's winding.
 
     Triangles live in the .vtx alone -- `mstudiomesh_t` carries no count -- so a face
@@ -1181,6 +1181,9 @@ def _donor_faces(source, m):
 
     Empty where no .vtx sits beside the source, which leaves the caller comparing what it
     compared before rather than rebuilding every model on a missing file.
+
+    `meshes`, if given, is filled with {(bodypart, model): {triangle: {file mesh index}}},
+    which is what says a face has moved to another material slot.
     """
     path = vtx_path(source)
     if not source or not os.path.exists(path):
@@ -1196,12 +1199,37 @@ def _donor_faces(source, m):
             continue
         base = mo.meshes[sg.mesh].vertexoffset
         ids = reader.orig_vert_ids(sg)
-        per.setdefault(sg.model, []).extend(
-            tuple(ids[x] + base for x in t) for t in reader.triangles(sg))
+        tris = [tuple(ids[x] + base for x in t) for t in reader.triangles(sg)]
+        per.setdefault(sg.model, []).extend(tris)
+        if meshes is not None:
+            at = meshes.setdefault((models[sg.model][0], models[sg.model][1]), {})
+            for t in tris:
+                at.setdefault(vtxr_mod._canon(t), set()).add(sg.mesh)
     for gi, tris in per.items():
         bi, mi = models[gi][0], models[gi][1]
         out[(bi, mi)] = _canon_faces(tris)
     return out
+
+
+def moved_faces(obj, donor_meshes):
+    """How many triangles sit on a material slot other than the one their file mesh speaks
+    through now, by `vtmb_meshes` and `slot_moves`. A triangle the donor carries on two
+    meshes, or on a mesh whose slot is gone, decides nothing."""
+    stash = obj.get("vtmb_meshes")
+    if not stash or not donor_meshes:
+        return 0
+    moves = slot_moves(obj)[0]
+    me = obj.data
+    me.calc_loop_triangles()
+    n = 0
+    for tri in me.loop_triangles:
+        js = donor_meshes.get(vtxr_mod._canon(tuple(tri.vertices)[::-1]))
+        if not js or len(js) != 1:
+            continue
+        slot = slot_of(stash, moves, next(iter(js)))
+        if slot is not None and slot != tri.material_index:
+            n += 1
+    return n
 
 
 def _scene_faces(me):
@@ -1215,7 +1243,7 @@ def _scene_faces(me):
     return _canon_faces(tuple(tri.vertices)[::-1] for tri in me.loop_triangles)
 
 
-def _must_rebuild(obj, model, fields, donor_faces=None, box=None):
+def _must_rebuild(obj, model, fields, donor_faces=None, box=None, donor_meshes=None):
     """Whether this object has outgrown the in-place path.
 
     In place patches fields index for index; the split path rewrites the whole model and
@@ -1238,6 +1266,10 @@ def _must_rebuild(obj, model, fields, donor_faces=None, box=None):
     if len(me.vertices) != model.numvertices:
         return True
     if donor_faces is not None and _scene_faces(me) != donor_faces:
+        return True
+    # In place keeps each triangle in the strip group it came from, so a face moved to
+    # another slot would keep its old material.
+    if moved_faces(obj, donor_meshes):
         return True
     if "positions" in fields and outside_box(me, model, box):
         return True
@@ -1421,7 +1453,7 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
         if mr.extra.get("cloth"):
             carries.append("a cloth binding, which is one entry per vertex per row")
         if carries:
-            raise ValueError(
+            raise build_mod.Refused(
                 "%s: the file's own vertex numbering could not be recovered -- %s -- and "
                 "this model carries %s" % (obj.name, why, " and ".join(carries)))
     # `origins` is one list per run and the written model-local numbering is the runs
@@ -1768,7 +1800,8 @@ def read_meshes(m, source, fields, boxes=None):
     groups that skin something and name no bone."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
-    donor_faces = _donor_faces(source, m)
+    donor_meshes = {}
+    donor_faces = _donor_faces(source, m, donor_meshes)
     edits, rebuild, missing, unsupported, renormals = {}, {}, [], set(), 0
     blind_normals = unskinned = 0
     crowded, uv_spare, stray = [], [], []
@@ -1791,7 +1824,7 @@ def read_meshes(m, source, fields, boxes=None):
         if odd:
             stray.append((obj.name, odd))
         if (_must_rebuild(obj, mo, ok, donor_faces.get((bi, mi)),
-                          (boxes or {}).get((bi, mi)))
+                          (boxes or {}).get((bi, mi)), donor_meshes.get((bi, mi)))
                 or ("weights" in fields and off_bone0(obj, mo, bone_index))):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.

@@ -459,12 +459,22 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
         seen.append(keys)
 
     for tri in me.loop_triangles:
+        # A triangle whose originals all sit in one run but whose slot names another was
+        # moved there: it goes to that slot's run and its corners are copied in.
+        target = run_of_slot.get(tri.material_index)
+        homes = {where[me.loops[li].vertex_index] for li in tri.loops
+                 if me.loops[li].vertex_index in where}
+        if len(homes) == 1 and target is None:
+            why.append("a triangle of the file's was moved onto material slot %d, which names "
+                       "no mesh of the file" % tri.material_index)
+            return None
+        moved = len(homes) == 1 and target not in homes
         corners = []
         for li in tri.loops:
             vi = me.loops[li].vertex_index
             ri = where.get(vi)
             if ri is None:
-                ri = run_of_slot.get(tri.material_index)
+                ri = target
                 if ri is None:
                     why.append("a triangle sits on material slot %d, which names no mesh "
                                "of the file" % tri.material_index)
@@ -473,6 +483,8 @@ def _split_preserved(me, runs, stash, uvs, normals, uv_layer, rec, key_of, why, 
                 u, w = uv_layer.data[li].uv
             else:
                 n, u, w = corner(vi, li)
+                if moved:
+                    ri = target
             key = key_of(vi, n, u, w)
             at = seen[ri].get(key)
             if at is None:
