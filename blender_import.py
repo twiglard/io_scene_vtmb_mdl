@@ -58,6 +58,18 @@ class Content:
                 return "%s!%s" % (hit[0], key), v.read(key)
         return None, None
 
+    def where(self, rel):
+        """The path `find` would answer, without reading a pack hit's bytes."""
+        rel = rel.replace("\\", "/").lstrip("/")
+        key = rel.lower()
+        for r, v in zip(self.roots, self.packs):
+            p = os.path.join(r, rel.replace("/", os.sep))
+            if os.path.isfile(p):
+                return p
+            if v is not None and key in v.index:
+                return "%s!%s" % (v.index[key][0], key)
+        return None
+
     def read(self, rel):
         path, blob = self.find(rel)
         if path is None:

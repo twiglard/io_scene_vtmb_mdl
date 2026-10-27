@@ -234,6 +234,41 @@ def arm_meshes(context, arm_obj):
     return out
 
 
+def mesh_owner(obj):
+    """The armature that owns this mesh, by parent or by Armature modifier, else None."""
+    if obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+    for mo in obj.modifiers:
+        o = getattr(mo, "object", None)
+        if o is not None and o.type == "ARMATURE":
+            return o
+    return None
+
+
+def material_lines(context, obj, mat):
+    """[(text, icon)]: where `mat` resolves, or every path tried where it resolves nowhere.
+
+    The engine tries each of the model's material directories for each material name and
+    takes the first hit, so a name no directory holds draws as the purple checkerboard.
+    Only the active slot is looked up, since this runs on every redraw.
+    """
+    arm = mesh_owner(obj)
+    if arm is None:
+        return [("no armature owns this mesh, so no material directories apply", "INFO")]
+    stems = paths_mod.material_stems(mat.name, blender_scratch.scene_cdtextures(arm))
+    tried = [("    %s.vmt" % st, "NONE") for st in stems]
+    content = _content(context, arm)
+    if content is None:
+        return [("no content root: set Game root in the add-on preferences", "ERROR")] + tried
+    for st in stems:
+        hit = content.where(st + ".vmt")
+        if hit is not None:
+            return [("%r resolves to %s.vmt" % (mat.name, st), "CHECKMARK"),
+                    ("    found at %s" % hit, "NONE")]
+    return [("%r resolves against nothing, so the game draws it as the purple "
+             "checkerboard" % mat.name, "ERROR")] + tried
+
+
 def scene_material_names(context, arm_obj):
     """Every material slot name on the meshes this armature owns, first-seen order."""
     out = []
@@ -3356,11 +3391,29 @@ class VTMB_PT_action_sequence(bpy.types.Panel):
         draw_action_sequence(self.layout, context, panel_action(context))
 
 
+class VTMB_PT_material(bpy.types.Panel):
+    bl_label = "VTMB material"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "material"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "MESH"
+                and getattr(context, "material", None) is not None)
+
+    def draw(self, context):
+        for text, icon in material_lines(context, context.object, context.material):
+            self.layout.label(text=text, icon=icon)
+
+
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
            VTMB_OT_set_skin_family, VTMB_PT_skin_families,
-           VTMB_PT_cloth,
+           VTMB_PT_cloth, VTMB_PT_material,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_OT_add_cloth_capsule,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
