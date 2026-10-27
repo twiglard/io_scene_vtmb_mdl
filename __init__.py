@@ -2042,6 +2042,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            "given" % i))
         if scene.get("mouth_added"):
             self.report({"INFO"}, "a mouth record appended, the donor having none")
+        if scene.get("mouth_removed"):
+            self.report({"INFO"}, "the donor's mouth record removed, the armature carrying "
+                                  "none; Add mouth puts one back")
         for model, i in scene.get("eye_records") or ():
             self.report({"WARNING"}, "eyeball %d of model %r has no empty stamped "
                                      "vtmb_eyeball %d, so it is written as the donor had "

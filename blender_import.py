@@ -308,12 +308,17 @@ def build_armature(context, m, name, scale, root_motion=True):
     # nummouths is 0 or 1 over the whole corpus.  The bone goes in by NAME and the flex by
     # name too: the index is 16 on 196 of the 200 shipped records and 0 on 4 that simply
     # list `mouth` first, so an index would say the wrong thing about either.
+    # Only where the file's mouth was stashed, or it has none, does a missing stash mean the
+    # user removed it, which is what lets the donor export drop the record.
+    arm_obj["vtmb_mouths"] = 1
     if m.mouth is not None and 0 <= m.mouth.bone < len(m.bones):
         arm_obj["vtmb_mouth"] = {
             "bone": m.bones[m.mouth.bone].name,
             "forward": list(m.mouth.forward),
             "flex": m.mouth.name or "",
         }
+    elif m.mouth is not None:
+        arm_obj.pop("vtmb_mouths", None)
     # Both lists are studiomdl's own QC lines, which is the only syntax there is for
     # either -- Option_Flexcontroller and Option_Flexrule, studiomdl.cpp:2875 and :2914.
     # A controller is identified across models by its NAME alone: client.dll 100c4351

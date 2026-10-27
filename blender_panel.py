@@ -1012,6 +1012,23 @@ class VTMB_OT_add_mouth(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class VTMB_OT_remove_mouth(bpy.types.Operator):
+    bl_idname = "vtmb.remove_mouth"
+    bl_label = "Remove mouth"
+    bl_description = ("Drop the armature's mouth. The export then writes no mouth record, "
+                      "the donor's included. Add mouth puts one back")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj is not None and obj.type == "ARMATURE" and "vtmb_mouth" in obj
+
+    def execute(self, context):
+        del context.object["vtmb_mouth"]
+        return {"FINISHED"}
+
+
 def draw_face(lay, context, arm_obj):
     """The one mouth record as properties, and the eyeballs named rather than indexed.
 
@@ -1049,6 +1066,7 @@ def draw_face(lay, context, arm_obj):
             else:
                 box.prop(arm_obj, "vtmb_mouth_%s" % k, text=label)
         box.label(text="the export refuses a jaw flex no flex rule writes", icon="INFO")
+        box.operator("vtmb.remove_mouth", icon="X")
     lay.operator("vtmb.add_eyeball", icon="HIDE_OFF")
     eyes = blender_export.eyeball_objects(arm_obj)
     n = sum(len(v) for v in eyes.values())
@@ -3419,6 +3437,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
+           VTMB_OT_remove_mouth,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_OT_flex_preview, VTMB_OT_flex_preview_stop, VTMB_PT_flex_preview,
            VTMB_OT_set_key_window, VTMB_PT_shape_key,

@@ -3420,7 +3420,8 @@ def apply_face(d, m, arm_obj, scale, source=None):
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
            "eye_empties": [], "eye_records": [], "lid_past_radius": [],
-           "eyes_added": [], "eye_meshes": 0, "mouth_added": False, "eyes_removed": []}
+           "eyes_added": [], "eye_meshes": 0, "mouth_added": False, "eyes_removed": [],
+           "mouth_removed": False}
     stray = stray_eyeballs(m, arm_obj)
     if stray:
         raise build_mod.Refused(
@@ -3688,6 +3689,12 @@ def _apply_mouth(d, m, arm_obj, out):
     """
     mouth = arm_obj.get("vtmb_mouth")
     if not mouth:
+        # Decision 21: on a scene the import stamped, no stash is a mouth removed. Nothing
+        # indexes a mouth record, so the rest of the file stands.
+        if d.mouths and arm_obj.get("vtmb_mouths"):
+            del d.mouths[:]
+            out["mouth_removed"] = True
+            return 1
         return 0
     if not d.mouths:
         return _add_mouth(d, m, arm_obj, mouth, out)
@@ -4943,6 +4950,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["face"] = face["changed"]
     scene["eyes_added"] = face["eyes_added"]
     scene["mouth_added"] = face["mouth_added"]
+    scene["mouth_removed"] = face["mouth_removed"]
     scene["eye_meshes"] = face["eye_meshes"]
     scene["eye_radius_keys"] = face["radius_keys"]
     scene["eye_lid_targets"] = face["lid_targets"]
