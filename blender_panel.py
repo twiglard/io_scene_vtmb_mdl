@@ -486,12 +486,15 @@ def cloth_sigmas(obj):
 
 
 def cloth_pins(obj):
-    """(pinned, total) for the object's pin group, or None where it cannot be counted."""
+    """(pinned, total) for the object's pin group, (None, total) on a mesh over CLOTH_CAP,
+    or None where the object has no such group."""
     me = obj.data
     vg = obj.vertex_groups.get(str(obj.get("vtmb_cloth_pin_group") or
                                    blender_scratch.PIN_GROUP))
-    if vg is None or len(me.vertices) > CLOTH_CAP:
+    if vg is None:
         return None
+    if len(me.vertices) > CLOTH_CAP:
+        return None, len(me.vertices)
     n = sum(1 for v in me.vertices if any(g.group == vg.index for g in v.groups))
     return n, len(me.vertices)
 
@@ -534,6 +537,8 @@ def draw_cloth(lay, obj):
     pins = cloth_pins(obj)
     if pins is None:
         lay.label(text="no vertex group %r" % group, icon="ERROR")
+    elif pins[0] is None:
+        lay.label(text="%r is not counted on a mesh over %d vertices" % (group, CLOTH_CAP))
     elif pins[0] == 0:
         lay.label(text="%r is empty -- every particle would be free" % group, icon="ERROR")
     elif pins[0] == pins[1]:
