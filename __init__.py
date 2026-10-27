@@ -565,7 +565,8 @@ def _mesh_status(op, context, base, fields):
     for _bi, _mi, _bp, mo in mesh_write.models_of(m):
         no |= set(mesh_write.supported(mo.filetype, fields)[1])
     return (len(blender_export.mesh_objects(m, base)),
-            len(mesh_write.models_of(m)), sorted(no),
+            sum(1 for x in mesh_write.models_of(m) if blender_export.drawn_model(x[3])),
+            sorted(no),
             len(blender_export.new_model_objects(m, base, _export_armature(context))))
 
 

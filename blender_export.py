@@ -1815,8 +1815,11 @@ def read_meshes(m, source, fields, boxes=None):
         ok, no = mesh_mod.supported(mo.filetype, fields)
         obj = found.get((bi, mi))
         if obj is None:
-            missing.append(mo.name)
-            unsupported |= set(no)
+            # The import makes no object for a model of no LOD-0 triangle, which 97 shipped
+            # models over 91 files are, so the scene has nothing of it to supply.
+            if drawn_model(mo, donor_faces, bi, mi):
+                missing.append(mo.name or "model %d of bodypart %d" % (mi, bi))
+                unsupported |= set(no)
             continue
         # Before the rebuild branch below, which would report nothing for a model that
         # took the split path.
@@ -1844,6 +1847,14 @@ def read_meshes(m, source, fields, boxes=None):
             unskinned += nu if skin_counted(mo) else 0
     return (edits, rebuild, missing, sorted(unsupported), renormals, crowded,
             blind_normals, uv_spare, donor_faces, unskinned, stray)
+
+
+def drawn_model(mo, donor_faces=None, bi=None, mi=None):
+    """Whether the import made an object for this model: it has vertices and, where the
+    donor's .vtx was read, LOD-0 triangles."""
+    if not mo.numvertices:
+        return False
+    return not donor_faces or bool(donor_faces.get((bi, mi)))
 
 
 def named_index(anim_names, action):
