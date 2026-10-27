@@ -3427,6 +3427,59 @@ def apply_face(d, m, arm_obj, scale, source=None):
     return out
 
 
+def apply_appended_eyes(d, m, arm_obj, scale, rows):
+    """Eyeball records for the models this export appended, and their eye meshes' fields.
+
+    `apply_face` runs before the append and walks the donor's models only, so an empty
+    naming an appended object's model (`<object>.smd`) is written here: one record per
+    eyeball index in index order, and each mesh its object's `vtmb_eye_slots` names set to
+    `materialtype` 1 and the record's position. The slot in that stamp is the object's own,
+    which is what `split_mesh`'s runs carry. Answers apply_face's keys for what it wrote,
+    plus `used`, the empties it took.
+    """
+    out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
+           "lid_past_radius": [], "eyes_added": [], "eye_meshes": 0, "used": set()}
+    eyes = eyeball_objects(arm_obj)
+    bmap = None
+    for row in rows:
+        model = row["name"] + ".smd"
+        named = sorted(eyes.get(model) or (), key=lambda o: (int(o["vtmb_eyeball"]), o.name))
+        if not named:
+            continue
+        mr = d.bodyparts[row["bodypart"]].kids[0]
+        recs = mr.extra.setdefault("eyes", [])
+        pos = {}
+        for obj in named:
+            i = int(obj["vtmb_eyeball"])
+            if i in pos:
+                continue
+            if bmap is None:
+                bmap = bone_map(m, arm_obj)
+            rec = build_mod.Rec(bytearray(140))
+            struct.pack_into("<i", rec.raw, 0x04,
+                             _accessory_bone(obj, m, arm_obj, bmap, "eyeball"))
+            _apply_eyeball(d, rec, obj, scale, out)
+            pos[i] = len(recs)
+            recs.append(rec)
+            out["used"].add(obj.name)
+        meshed = set()
+        for slot, param in row["object"].get("vtmb_eye_slots") or ():
+            k = pos.get(int(param))
+            if k is None:
+                continue
+            for j, (s, _r, _n) in enumerate(row["slots"]):
+                if s == int(slot):
+                    struct.pack_into("<2i", mr.kids[j].raw, 0x18, 1, k)
+                    out["eye_meshes"] += 1
+                    meshed.add(k)
+        out["eyes_added"] += [(obj.name, model, int(obj["vtmb_eyeball"]),
+                               pos[int(obj["vtmb_eyeball"])],
+                               pos[int(obj["vtmb_eyeball"])] in meshed)
+                              for obj in named if obj.name in out["used"]]
+    _lid_targets_refused(out["lid_past_radius"])
+    return out
+
+
 def _apply_eye_meshes(d, m, source, at):
     """Each mesh a `vtmb_eye_slots` stamp names, drawn as the eyeball it names.
 
@@ -4910,6 +4963,16 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     appended, add_faces, mesh["not_appended"] = append_models(
         d, new_objs, bone_index, skin_family(m, arm_obj), scene["added_materials"], scale)
     revised.update(add_faces)
+    eyes = apply_appended_eyes(d, m, arm_obj, scale, appended)
+    if eyes["used"]:
+        scene["eyes_added"] = scene["eyes_added"] + eyes["eyes_added"]
+        scene["eye_meshes"] += eyes["eye_meshes"]
+        scene["eye_empties"] = [x for x in scene["eye_empties"] if x[0] not in eyes["used"]]
+        scene["eye_radius_keys"] = scene["eye_radius_keys"] + eyes["radius_keys"]
+        scene["eye_lid_targets"] = scene["eye_lid_targets"] + eyes["lid_targets"]
+        for name in eyes["materials"]:
+            if name not in scene["added_materials"]:
+                scene["added_materials"].append(name)
     for x in appended:
         mesh["unskinned"] += x["unskinned"]
         over = crowded_vertices(x["object"], bone_index)
