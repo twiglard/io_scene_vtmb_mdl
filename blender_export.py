@@ -80,6 +80,11 @@ PER_ACTION = "per_action"
 MODE_ATTR = "vtmb_root_motion_mode"
 
 
+class SceneRefused(build_mod.Refused, ValueError):
+    """A refusal of what the scene holds: `Refused`, so both operators report it as one
+    with no traceback, and ValueError, so a caller that catches one still does."""
+
+
 def root_motion_mode(action, chosen, donor=True, default="keep"):
     """Which of the four writes this action's travel takes.
 
@@ -104,8 +109,8 @@ def root_motion_mode(action, chosen, donor=True, default="keep"):
         mode = default if nmv is None else ("keep" if nmv else "none")
     mode = str(mode)
     if mode not in ROOT_MOTION_MODES:
-        raise ValueError("action %r carries %s %r, which is none of %s"
-                         % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)))
+        raise SceneRefused("action %r carries %s %r, which is none of %s"
+                           % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)))
     return "extract" if (mode == "keep" and not donor) else mode
 
 
@@ -288,8 +293,8 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_key
     bmap = bone_map(m, arm_obj)
     missing = [b.name for b in m.bones if b.name not in bmap]
     if missing:
-        raise ValueError("armature has no bone %s (and %d more)"
-                         % (missing[0], len(missing) - 1))
+        raise SceneRefused("armature has no bone %s (and %d more)"
+                           % (missing[0], len(missing) - 1))
     pbs = [arm_obj.pose.bones[bmap[b.name]] for b in m.bones]
     scene = context.scene
     out = []
@@ -366,7 +371,7 @@ def reparented(m, k, db, file_of):
     name = db.parent.name if db.parent is not None else None
     now = -1 if name is None else file_of.get(name)
     if now is None:
-        raise ValueError(
+        raise SceneRefused(
             "bone %r is parented to %r, which the file has no bone for -- parent it to "
             "one the file carries, or let the export add %r first"
             % (b.name, name, name))
@@ -374,7 +379,7 @@ def reparented(m, k, db, file_of):
         return None
     if now >= k:
         was = m.bones[b.parent].name if b.parent >= 0 else "nothing"
-        raise ValueError(
+        raise SceneRefused(
             "bone %r was reparented from %s to %r, which sits at index %d against its own "
             "%d -- the engine builds each bone's world matrix off its parent's while "
             "walking the array in order, so a parent must come first, and nothing here "
@@ -400,8 +405,8 @@ def read_bones(m, arm_obj, scale, blind=None):
     bmap = bone_map(m, arm_obj)
     missing = [b.name for b in m.bones if b.name not in bmap]
     if missing:
-        raise ValueError("armature has no bone %s (and %d more)"
-                         % (missing[0], len(missing) - 1))
+        raise SceneRefused("armature has no bone %s (and %d more)"
+                           % (missing[0], len(missing) - 1))
     file_of = {bmap[b.name]: k for k, b in enumerate(m.bones)}
     out = {}
     for k, b in enumerate(m.bones):
@@ -543,8 +548,8 @@ def add_surplus_bones(d, m, arm_obj, scale):
         if len(left) == len(todo):
             # Blender cannot hold a parent cycle, so this is a reader that stopped
             # agreeing with `data.bones` rather than a scene the user can build.
-            raise ValueError("cannot place %s: no bone of it has a parent that resolves"
-                             % ", ".join(sorted(b.name for b in left)[:4]))
+            raise SceneRefused("cannot place %s: no bone of it has a parent that resolves"
+                               % ", ".join(sorted(b.name for b in left)[:4]))
         todo = left
     return out
 
@@ -924,10 +929,10 @@ def _one_uv(me, count, uv_layer):
     split = [i for i, vs in enumerate(per)
              if any(max(abs(a - b) for a, b in zip(vs[0], v)) > UV_TOL for v in vs)]
     if split:
-        raise ValueError("%s: %d vertices carry more than one UV (first is vertex %d), "
-                         "which the format can only store by splitting the vertex and "
-                         "that would change the vertex count"
-                         % (me.name, len(split), split[0]))
+        raise SceneRefused("%s: %d vertices carry more than one UV (first is vertex %d), "
+                           "which the format can only store by splitting the vertex and "
+                           "that would change the vertex count"
+                           % (me.name, len(split), split[0]))
     return [vs[0] if vs else None for vs in per]
 
 
@@ -1124,16 +1129,16 @@ def read_mesh(obj, model, bone_index, fields):
     """
     me = obj.data
     if len(me.vertices) != model.numvertices:
-        raise ValueError("%s: %d vertices in the scene, %d in %s -- a mesh write cannot "
-                         "change the count"
-                         % (obj.name, len(me.vertices), model.numvertices, model.name))
+        raise SceneRefused("%s: %d vertices in the scene, %d in %s -- a mesh write cannot "
+                           "change the count"
+                           % (obj.name, len(me.vertices), model.numvertices, model.name))
     n = model.numvertices
     uvs = normals = [None] * n
     edited = blind = unskinned = 0
     if "uvs" in fields:
         uv_layer = uv_layer_of(obj)[0]
         if uv_layer is None:
-            raise ValueError("%s has no UV layer" % obj.name)
+            raise SceneRefused("%s has no UV layer" % obj.name)
         uvs = _one_uv(me, n, uv_layer)
     if "normals" in fields:
         normals, edited, blind = _one_normal(
@@ -1872,7 +1877,7 @@ def resolve_target(m, action, name):
     names = [a.name for a in m.anims]
     if name:
         if name not in names:
-            raise ValueError("%s has no animation named %r" % (m.path, name))
+            raise SceneRefused("%s has no animation named %r" % (m.path, name))
         return names.index(name)
     i = name_index(names, action)
     if i is None:
@@ -2023,8 +2028,8 @@ def skin_family(m, arm_obj):
     """
     fam = int(arm_obj.get("vtmb_skin_family") or 0)
     if m.skins and not 0 <= fam < len(m.skins):
-        raise ValueError("the armature's skin family is %d, but %s carries %d"
-                         % (fam, os.path.basename(m.path), len(m.skins)))
+        raise SceneRefused("the armature's skin family is %d, but %s carries %d"
+                           % (fam, os.path.basename(m.path), len(m.skins)))
     return fam
 
 
@@ -2124,8 +2129,8 @@ def read_materials(m, source, family=0):
                 ref = row[ref]
             name = mats[slot].name
             if out.get(ref, name) != name:
-                raise ValueError("texture %d is named both %r and %r by the scene's "
-                                 "materials" % (ref, out[ref], name))
+                raise SceneRefused("texture %d is named both %r and %r by the scene's "
+                                   "materials" % (ref, out[ref], name))
             out[ref] = name
     return out, moved, gone
 
@@ -3506,8 +3511,8 @@ def _apply_mouth(d, m, arm_obj, out):
     if bone:
         bi = next((b.index for b in m.bones if b.name == bone), None)
         if bi is None:
-            raise ValueError("the mouth is on bone %r, which is not one this model "
-                             "carries" % bone)
+            raise SceneRefused("the mouth is on bone %r, which is not one this model "
+                               "carries" % bone)
     fwd = (tuple(float(c) for c in mouth["forward"])
            if mouth.get("forward") is not None else have[1:4])
     flex = str(mouth.get("flex") or "")
@@ -3541,8 +3546,8 @@ def _add_mouth(d, m, arm_obj, mouth, out):
     if bi is None:
         bi = next((b.index for b in m.bones if bmap.get(b.name) == bone), None)
     if bi is None:
-        raise ValueError("the mouth is on bone %r, which is not one this model carries"
-                         % bone)
+        raise SceneRefused("the mouth is on bone %r, which is not one this model carries"
+                           % bone)
     raw = bytearray(20)
     struct.pack_into("<i3fi", raw, 0, bi, *[float(c) for c in fwd],
                      build_mod.flexdesc_index(d, flex))
@@ -3895,11 +3900,12 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
 
     The list itself is the scene's as well. `vtmb_seqs_removed` names what a removal
     tombstoned, by `src` where it carries one and else by label, `src` on an entry is the
-    file ordinal it came from and is what a reorder is resolved through, and a trailing entry marked `new` is one the scene authored, which
-    `add_sequence` appends. All three are positive marks rather than absences, the
-    spring-chain rule: a stash shorter than the file with nothing tombstoned leaves the
-    trailing records alone. A stash with no `src` is one an import before it made, which
-    `old_imports` refuses, so a `src` past the file's list is what matches by position.
+    file ordinal it came from and is what a reorder is resolved through, and a trailing
+    entry marked `new` is one the scene authored, which `add_sequence` appends. All three
+    are positive marks rather than absences, the spring-chain rule: a stash shorter than
+    the file with nothing tombstoned leaves the trailing records alone. A stash with no
+    `src` is one an import before it made, which `old_imports` refuses, so a `src` past
+    the file's list is what matches by position.
 
     Returns (what moved, those cells, what the list edits did).
     """
@@ -3943,13 +3949,13 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     head = stash[:len(stash) - fresh]
     for k, x in enumerate(head):
         if x.get("new"):
-            raise ValueError("the armature's sequence %d of %d is one the scene added, and "
-                             "an added sequence is appended, so it has to be the last"
-                             % (k, len(stash)))
+            raise SceneRefused("the armature's sequence %d of %d is one the scene added, and "
+                               "an added sequence is appended, so it has to be the last"
+                               % (k, len(stash)))
     if len(head) > len(d.seqs):
-        raise ValueError("the armature carries %d sequence%s the file is supposed to already "
-                         "have, %d of them marked as added, and the file has %d"
-                         % (len(head), "" if len(head) == 1 else "s", fresh, len(d.seqs)))
+        raise SceneRefused("the armature carries %d sequence%s the file is supposed to already "
+                           "have, %d of them marked as added, and the file has %d"
+                           % (len(head), "" if len(head) == 1 else "s", fresh, len(d.seqs)))
 
     live = {id(r): k for k, r in enumerate(d.seqs)}
     want, keyed = [], bool(head)
@@ -3971,8 +3977,8 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
         cells = [list(col) for col in x.get("blends") or ()]
         first = str(cells[0][0]) if cells and cells[0] else ""
         if first not in index:
-            raise ValueError("the sequence the scene added blends animation %r, which the "
-                             "file does not have" % first)
+            raise SceneRefused("the sequence the scene added blends animation %r, which the "
+                               "file does not have" % first)
         build_mod.add_sequence(d, str(x.get("label") or first), index[first],
                                x.get("activity"), int(x.get("flags") or 0))
         moves["added"].append(str(x.get("label") or first))
@@ -4026,8 +4032,8 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
                     continue
                 a = index.get(name, -1)
                 if a < 0:
-                    raise ValueError("sequence %r blends animation %r, which the file does "
-                                     "not have" % (rec.name, name))
+                    raise SceneRefused("sequence %r blends animation %r, which the file does "
+                                       "not have" % (rec.name, name))
                 if name in carried_twice:
                     # The name cannot say which copy, and `index` holds the last: the
                     # stash's own index where it still names this animation, else the
@@ -4040,7 +4046,7 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
                     elif 0 <= w < len(anim_names) and anim_names[w] == name:
                         a = w
                     else:
-                        raise ValueError(
+                        raise SceneRefused(
                             "sequence %r blends animation %r, which the file carries %d "
                             "times, and neither the stash nor the record says which"
                             % (rec.name, name, anim_names.count(name)))
@@ -4515,8 +4521,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     if verify:
         bad = verify_writer(bytes(m.d))
         if bad:
-            raise ValueError("the writer does not reproduce %s, so nothing was written: %s"
-                             % (os.path.basename(source), "; ".join(bad)))
+            raise SceneRefused("the writer does not reproduce %s, so nothing was written: %s"
+                               % (os.path.basename(source), "; ".join(bad)))
     old = old_imports(m, source, arm_obj)
     if old:
         raise build_mod.Refused(_old_import_text(old))
@@ -4607,7 +4613,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     ad = arm_obj.animation_data
     if actions and ad is None:
-        raise ValueError("%s has no animation data" % arm_obj.name)
+        raise SceneRefused("%s has no animation data" % arm_obj.name)
     restore = ad.action if ad else None
 
     edits, wrote, pending, unfitted, unkeepable = {}, [], [], [], []
@@ -4621,7 +4627,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             b = int(round(hi)) if frame_end is None else frame_end
             frames = list(range(a, b + 1))
             if not frames:
-                raise ValueError("%s: empty frame range" % action.name)
+                raise SceneRefused("%s: empty frame range" % action.name)
 
             mode = root_motion_mode(action, root_motion)
             # "extract" wants the motion still in the poses, so it is only taken back out
@@ -4661,7 +4667,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             b = int(round(hi)) if frame_end is None else frame_end
             frames = list(range(a, b + 1))
             if not frames:
-                raise ValueError("%s: empty frame range" % action.name)
+                raise SceneRefused("%s: empty frame range" % action.name)
             # No donor animation behind this one, so there is no root motion to take back
             # out and nothing for "keep" to keep: an appended animation either has the
             # blocks fitted here or has none.
@@ -4782,8 +4788,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     if drop:
         names = [r.name for r in d.anims]
         if drop not in names:
-            raise ValueError("%s has no animation %r to remove"
-                             % (os.path.basename(source), drop))
+            raise SceneRefused("%s has no animation %r to remove"
+                               % (os.path.basename(source), drop))
         seqs, _left = build_mod.remove_animation(d, names.index(drop))
         dropped = {"anim": drop, "seqs": seqs}
 
@@ -4828,7 +4834,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         # Only where a field was asked for: with none, an untouched scene reaches neither
         # list and that is the whole of a default export rather than a scene that belongs
         # to another file.
-        raise ValueError("no scene mesh belongs to %s" % os.path.basename(source))
+        raise SceneRefused("no scene mesh belongs to %s" % os.path.basename(source))
     for (bi, mi), verts in sorted(cells.items()):
         rec = d.bodyparts[bi].kids[mi]
         mo = m.bodyparts[bi].models[mi]
@@ -5000,7 +5006,7 @@ def export_action(context, arm_obj, source, dest, anim_name="", **kw):
     ad = arm_obj.animation_data
     action = ad.action if ad else None
     if action is None:
-        raise ValueError("%s has no action assigned" % arm_obj.name)
+        raise SceneRefused("%s has no action assigned" % arm_obj.name)
     index = resolve_target(mdl_mod.Mdl(source), action, anim_name)
     r = export_actions(context, arm_obj, source, dest, {index: action}, **kw)
     i, name, _, frames, movements = r["wrote"][0]
