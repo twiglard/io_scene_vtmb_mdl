@@ -1409,6 +1409,8 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     if face["meshless"]:
         faces = list(d.faces)
     # Before the eyeballs, whose iris records append a column to every row.
+    if len(export_mod.skin_table(arm_obj)[0]) > 1:
+        export_mod.sync_skin_table(arm_obj, mesh_objs, bpy.data.materials)
     face["skin_families"] = export_mod.scratch_skin_rows(d, arm_obj, mesh_objs)
     # Keys first, then rules, then lids and the mouth: each appends the flexdescs it names
     # and the file lacks, and a lid or mouth flex no key or rule made is refused.

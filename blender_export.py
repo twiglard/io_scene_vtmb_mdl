@@ -2090,6 +2090,80 @@ def skin_edited(arm_obj):
     return bool(arm_obj.get("vtmb_skin_edited"))
 
 
+def armature_meshes(scene, arm_obj):
+    """The mesh objects this armature owns, parented or bound by an Armature modifier."""
+    return [o for o in scene.objects if o.type == "MESH" and (
+        o.parent is arm_obj or any(getattr(mo, "object", None) is arm_obj
+                                   for mo in o.modifiers))]
+
+
+def skin_slots(objs):
+    """[(object, slot it is in now, skinref)] for every slot an import or export stamped."""
+    out = []
+    for o in objs:
+        refs = [int(x) for x in (o.get("vtmb_skinrefs") or ())]
+        # Through the import's stamp, since a reordered slot holds a different material
+        # and writing by the stamped index would put a family's picture on the wrong mesh.
+        moves = slot_moves(o)[0]
+        for slot, r in enumerate(refs):
+            at = slot if moves is None else moves.get(slot)
+            if at is not None and at < len(o.data.materials):
+                out.append((o, at, r))
+    return out
+
+
+def write_skin_table(arm_obj, rows, names=None):
+    if "vtmb_skin_textures" not in arm_obj:
+        arm_obj["vtmb_skin_textures"] = len(arm_obj.get("vtmb_skin_materials") or ())
+    arm_obj["vtmb_skin_table"] = [r for row in rows for r in row]
+    arm_obj["vtmb_skin_families"] = len(rows)
+    if names is not None:
+        arm_obj["vtmb_skin_materials"] = names
+    arm_obj["vtmb_skin_edited"] = True
+
+
+def sync_skin_table(arm_obj, objs, materials):
+    """Take what each shown slot holds into the skin table, before anything re-points it.
+
+    A material renamed while its family showed renames its texture record in every family
+    that draws it; the record's old name is then on no material in the blend. On a model
+    of more than one family, any other material put into a slot is the shown family's
+    choice at that position, as the panel's picker makes it, so the other families keep
+    theirs. On a model of one family the slot renames the record, as the export always
+    has. `vtmb_skin_was` keeps the file's names, which is what lets the export tell a
+    rename from another donor's record. Returns how many positions changed.
+    """
+    rows, names, nfile = skin_table(arm_obj)
+    fam = int(arm_obj.get("vtmb_skin_family") or 0)
+    if not 0 <= fam < len(rows):
+        return 0
+    many = len(rows) > 1
+    renamed, picked, done = 0, 0, set()
+    for o, at, r in skin_slots(objs):
+        mat = o.data.materials[at]
+        if mat is None or not 0 <= r < len(rows[fam]) or r in done:
+            continue
+        done.add(r)
+        rec = rows[fam][r]
+        if not 0 <= rec < len(names) or names[rec] == mat.name:
+            continue
+        if not many or (materials.get(names[rec]) is None and mat.name not in names):
+            if "vtmb_skin_was" not in arm_obj:
+                arm_obj["vtmb_skin_was"] = names[:nfile]
+            names[rec] = mat.name
+            renamed += 1
+            continue
+        if mat.name not in names:
+            names.append(mat.name)
+        rows[fam][r] = names.index(mat.name)
+        picked += 1
+    if picked:
+        write_skin_table(arm_obj, rows, names)
+    elif renamed:
+        arm_obj["vtmb_skin_materials"] = names
+    return renamed + picked
+
+
 def resolve_skin_table(d, arm_obj):
     """The armature's skin table with every record index resolved against `d`, and the
     names of the records it had to add.
@@ -2244,11 +2318,18 @@ def slot_moves(obj):
     if not stamp:
         return None, []
     mats = obj.data.materials
+    # One slot per stamped slot, and a slot still holding its own stamped name keeps it:
+    # a family drawing one material at two positions stamps the name twice, and the
+    # slot that lost it must not be read as having moved onto the other.
+    out = {slot: slot for slot, name in enumerate(stamp) if slot < len(mats)
+           and mats[slot] is not None and mats[slot].name == name}
     here = {}
     for j, mm in enumerate(mats):
-        if mm is not None:
-            here.setdefault(mm.name, j)
-    out = {slot: here.get(name) for slot, name in enumerate(stamp)}
+        if mm is not None and j not in out:
+            here.setdefault(mm.name, []).append(j)
+    for slot, name in enumerate(stamp):
+        if slot not in out:
+            out[slot] = here[name].pop(0) if here.get(name) else None
     left = [slot for slot in sorted(out) if out[slot] is None]
     idle = [j for j in range(len(mats))
             if mats[j] is not None and j not in set(out.values())]
@@ -5126,6 +5207,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The table before the renames, so a slot showing a record a cell added reads through
     # the row that names it, and before new_materials, whose records append a column to
     # every row this replaces.
+    if len(skin_table(arm_obj)[0]) > 1:
+        sync_skin_table(arm_obj, armature_meshes(context.scene, arm_obj), bpy.data.materials)
     if skin_edited(arm_obj):
         d.skin, added = resolve_skin_table(d, arm_obj)
         scene["skin_families"] = len(d.skin)

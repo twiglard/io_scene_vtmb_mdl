@@ -224,14 +224,7 @@ def _content(context, obj):
 
 def arm_meshes(context, arm_obj):
     """The mesh objects this armature owns, parented or bound by an Armature modifier."""
-    out = []
-    for o in context.scene.objects:
-        if o.type != "MESH":
-            continue
-        if o.parent is arm_obj or any(getattr(mo, "object", None) is arm_obj
-                                      for mo in o.modifiers):
-            out.append(o)
-    return out
+    return blender_export.armature_meshes(context.scene, arm_obj)
 
 
 def mesh_owner(obj):
@@ -295,48 +288,13 @@ def skin_family_names(arm_obj, family):
 
 def skin_slots(context, arm_obj):
     """[(object, slot it is in now, skinref)] for every slot an import or export stamped."""
-    out = []
-    for o in arm_meshes(context, arm_obj):
-        refs = [int(x) for x in (o.get("vtmb_skinrefs") or ())]
-        # Through the import's stamp, since a reordered slot holds a different material
-        # and writing by the stamped index would put a family's picture on the wrong mesh.
-        moves = blender_export.slot_moves(o)[0]
-        for slot, r in enumerate(refs):
-            at = slot if moves is None else moves.get(slot)
-            if at is not None and at < len(o.data.materials):
-                out.append((o, at, r))
-    return out
+    return blender_export.skin_slots(arm_meshes(context, arm_obj))
 
 
 def sync_skin_names(context, arm_obj):
-    """Copy each shown slot's material name into the record the shown row names there.
-
-    Run before anything re-points the slots: a material renamed while its family showed
-    is otherwise looked up under its old name, and a record only that family reaches is
-    exported under it. `vtmb_skin_was` keeps the file's names, which is what lets the
-    export tell a rename from another donor's record.
-    """
-    rows, names, nfile = blender_export.skin_table(arm_obj)
-    fam = int(arm_obj.get("vtmb_skin_family") or 0)
-    if not 0 <= fam < len(rows):
-        return 0
-    seen, changed = set(), 0
-    for o, at, r in skin_slots(context, arm_obj):
-        mat = o.data.materials[at]
-        if mat is None or not 0 <= r < len(rows[fam]):
-            continue
-        rec = rows[fam][r]
-        if not 0 <= rec < len(names) or rec in seen:
-            continue
-        seen.add(rec)
-        if names[rec] != mat.name:
-            if "vtmb_skin_was" not in arm_obj:
-                arm_obj["vtmb_skin_was"] = names[:nfile]
-            names[rec] = mat.name
-            changed += 1
-    if changed:
-        arm_obj["vtmb_skin_materials"] = names
-    return changed
+    """`blender_export.sync_skin_table` over this armature's meshes."""
+    return blender_export.sync_skin_table(arm_obj, arm_meshes(context, arm_obj),
+                                          bpy.data.materials)
 
 
 def show_skin_family(context, arm_obj, family):
@@ -389,13 +347,7 @@ def _skin_armature(op, context):
 
 
 def _write_skin_rows(arm_obj, rows, names=None):
-    if "vtmb_skin_textures" not in arm_obj:
-        arm_obj["vtmb_skin_textures"] = len(arm_obj.get("vtmb_skin_materials") or ())
-    arm_obj["vtmb_skin_table"] = [r for row in rows for r in row]
-    arm_obj["vtmb_skin_families"] = len(rows)
-    if names is not None:
-        arm_obj["vtmb_skin_materials"] = names
-    arm_obj["vtmb_skin_edited"] = True
+    blender_export.write_skin_table(arm_obj, rows, names)
 
 
 class VTMB_OT_set_skin_family(bpy.types.Operator):
