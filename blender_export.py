@@ -802,7 +802,7 @@ def stamp_appended(d, rows, arm_obj=None):
         # A copy keeps the import's, which numbers the vertices its `vtmb_orig` tags name.
         if obj.get("vtmb_meshes") is None:
             obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
-        obj["vtmb_slot_mats"] = [x.name if x else "" for x in me.materials]
+        stamp_slots(obj)
         # The model was written with no eyeball record, so an eye stamp no empty on it
         # claims is a copy's, naming its original's eyeball, which this model has not got.
         mine = {int(o["vtmb_eyeball"]) for o in eyes.get(obj.name + ".smd", ())}
@@ -2292,6 +2292,44 @@ def skin_family(m, arm_obj):
     return fam
 
 
+def slot_faces(me):
+    """(x, y, z, face count) for each material slot of `me`, xyz its first face's centre;
+    (0, 0, 0, 0) where no face uses it. A position and not an index, since deleting faces
+    renumbers every later one."""
+    idx = array.array("i", [0]) * len(me.polygons)
+    me.polygons.foreach_get("material_index", idx)
+    counts = collections.Counter(idx)
+    out = []
+    for j in range(len(me.materials)):
+        if counts[j]:
+            c = me.polygons[idx.index(j)].center
+            out.append((c[0], c[1], c[2], float(counts[j])))
+        else:
+            out.append((0.0, 0.0, 0.0, 0.0))
+    return out
+
+
+def stamp_slots(obj, moves=None):
+    """What each slot holds and which faces use it, which is what `slot_moves` reads.
+
+    `moves` is `slot_moves`' map from before the slots were re-pointed: the stamp stays in
+    the import's slot order, which `vtmb_skinrefs`, `vtmb_meshes` and `vtmb_eye_slots`
+    are indexed by, so a reordered slot is stamped where it came from. A stamped slot no
+    slot holds keeps its name and no faces.
+    """
+    me = obj.data
+    names = [m.name if m else "" for m in me.materials]
+    now = slot_faces(me)
+    if moves is None:
+        obj["vtmb_slot_mats"] = names
+        obj["vtmb_slot_faces"] = [x for pair in now for x in pair]
+        return
+    old = [str(x) for x in (obj.get("vtmb_slot_mats") or ())]
+    at = [moves.get(k) for k in range(len(old))]
+    obj["vtmb_slot_mats"] = [old[k] if j is None else names[j] for k, j in enumerate(at)]
+    obj["vtmb_slot_faces"] = [x for j in at for x in ((0.0,) * 4 if j is None else now[j])]
+
+
 def slot_moves(obj):
     """({slot the import stamped: the slot it is in now}, [names no slot holds any more]).
 
@@ -2310,6 +2348,13 @@ def slot_moves(obj):
     a deletion and a rename are the same evidence and neither is guessed at, so the
     unmatched names are reported and a rename made in the same edit is lost with them.
 
+    Names come second. Blender's Move up/down takes a slot's faces with it, and a material
+    put into a slot moves none, so names alone read two slots given each other's materials
+    as a reorder (BUGS 179). `obj["vtmb_slot_faces"]` holds each slot's first face's centre
+    and face count, and the one slot now matching both is that slot. A slot with no face, a
+    file mesh whose triangles all sit in a lower LOD, and any slot an edit has given or
+    taken faces or whose first face it moved, go by name.
+
     None rather than a map where the object carries no stamp -- a `.blend` saved before
     2026-09-09 -- since the index is then all there is and reading every slot as deleted
     would be worse than the defect.
@@ -2318,14 +2363,28 @@ def slot_moves(obj):
     if not stamp:
         return None, []
     mats = obj.data.materials
+    out = {}
+    faces = [float(x) for x in (obj.get("vtmb_slot_faces") or ())]
+    if len(faces) == 4 * len(stamp):
+        at = {}
+        for j, key in enumerate(slot_faces(obj.data)):
+            if key[3]:
+                at.setdefault(key, []).append(j)
+        for slot in range(len(stamp)):
+            key = tuple(faces[4 * slot:4 * slot + 4])
+            if key[3] and len(at.get(key, ())) == 1:
+                out[slot] = at[key][0]
     # One slot per stamped slot, and a slot still holding its own stamped name keeps it:
-    # a family drawing one material at two positions stamps the name twice, and the
-    # slot that lost it must not be read as having moved onto the other.
-    out = {slot: slot for slot, name in enumerate(stamp) if slot < len(mats)
-           and mats[slot] is not None and mats[slot].name == name}
+    # a family drawing one material at two positions stamps the name twice.
+    taken = set(out.values())
+    for slot, name in enumerate(stamp):
+        if (slot not in out and slot not in taken and slot < len(mats)
+                and mats[slot] is not None and mats[slot].name == name):
+            out[slot] = slot
+            taken.add(slot)
     here = {}
     for j, mm in enumerate(mats):
-        if mm is not None and j not in out:
+        if mm is not None and j not in taken:
             here.setdefault(mm.name, []).append(j)
     for slot, name in enumerate(stamp):
         if slot not in out:

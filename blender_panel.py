@@ -306,6 +306,8 @@ def show_skin_family(context, arm_obj, family):
     rows = skin_rows(arm_obj)
     mats = list(arm_obj.get("vtmb_skin_materials") or ())
     plan, missing = [], []
+    # Read before any slot is re-pointed, since a slot with no face is found by its name.
+    moves = {o.name: blender_export.slot_moves(o)[0] for o in arm_meshes(context, arm_obj)}
     # Every mesh in one pass: the export inverts one row for the whole model, so a
     # half-switched scene names one texture record two ways and is refused outright.
     for o, at, r in skin_slots(context, arm_obj):
@@ -326,7 +328,7 @@ def show_skin_family(context, arm_obj, family):
     # Re-stamped because this is the one thing that replaces a slot's material on
     # purpose: leaving the old stamp would make the next export read every slot as renamed.
     for o in {id(o): o for o, _at, _m in plan}.values():
-        o["vtmb_slot_mats"] = [mm.name if mm else "" for mm in o.data.materials]
+        blender_export.stamp_slots(o, moves.get(o.name))
     arm_obj["vtmb_skin_family"] = family
     return moved, []
 
@@ -393,7 +395,7 @@ def new_skin_table(context, arm_obj):
     for o in arm_meshes(context, arm_obj):
         if all(m is not None for m in o.data.materials):
             o["vtmb_skinrefs"] = [names.index(m.name) for m in o.data.materials]
-            o["vtmb_slot_mats"] = [m.name for m in o.data.materials]
+            blender_export.stamp_slots(o)
     arm_obj["vtmb_skin_refs"] = len(names)
     arm_obj["vtmb_skin_textures"] = 0
     arm_obj["vtmb_skin_family"] = 0

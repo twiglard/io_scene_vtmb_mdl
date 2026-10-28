@@ -1033,7 +1033,7 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # What sits in each slot, so the export can find a material the user moved. The
         # slot index alone is stale the moment a slot is reordered or deleted, and 1686 of
         # the corpus's 4567 models carry two or more.
-        obj["vtmb_slot_mats"] = [mm.name if mm else "" for mm in me.materials]
+        export_mod.stamp_slots(obj)
         # The + button in the UV Maps panel makes the layer it adds active, so reading the
         # active layer on export wrote whichever one was selected.
         obj["vtmb_uv_layer"] = uv.name
