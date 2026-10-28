@@ -2041,6 +2041,136 @@ def describe_unwritten(unwritten, limit=3):
         len(unwritten), "" if len(unwritten) == 1 else "s", head, more)
 
 
+def skin_table(arm_obj):
+    """(rows, names, nfile): the armature's skin table as rows of record indices, the name
+    of each record, and how many of those records the imported file carried.
+
+    A record at or past `nfile` is one a skin-family cell named and the file had not got,
+    so the export finds or adds it by name.
+    """
+    flat = [int(x) for x in arm_obj.get("vtmb_skin_table") or ()]
+    nref = int(arm_obj.get("vtmb_skin_refs") or 0)
+    rows = ([flat[f:f + nref] for f in range(0, len(flat), nref)]
+            if flat and nref > 0 else [])
+    names = [str(x) for x in arm_obj.get("vtmb_skin_materials") or ()]
+    return rows, names, int(arm_obj.get("vtmb_skin_textures", len(names)))
+
+
+def skin_edited(arm_obj):
+    """Whether a skin-family operator has edited the table, which is what makes the export
+    write the armature's table over the file's."""
+    return bool(arm_obj.get("vtmb_skin_edited"))
+
+
+def resolve_skin_table(d, arm_obj):
+    """The armature's skin table with every record index resolved against `d`, and the
+    names of the records it had to add.
+
+    A file record keeps its index; a record a cell added is found by name, else appended
+    with no skinref of its own, the form 648 shipped models carry. A file wider than the
+    table is one an earlier export appended a model to, and the appended column draws
+    one record in every family, so row 0's tail extends each row.
+    """
+    rows, names, nfile = skin_table(arm_obj)
+    have = {t.name: k for k, t in enumerate(d.textures)}
+    added, out = [], []
+    width = len(d.skin[0]) if d.skin else 0
+    if rows and len(rows[0]) > width:
+        raise SceneRefused("the armature's skin table has %d texture positions and the file "
+                           "has %d, so its families do not fit this file"
+                           % (len(rows[0]), width))
+    for f, row in enumerate(rows):
+        new = []
+        for r, idx in enumerate(row):
+            if 0 <= idx < nfile:
+                if idx >= len(d.textures):
+                    raise SceneRefused("skin family %d draws texture record %d at position "
+                                       "%d, and the file has %d" % (f, idx, r, len(d.textures)))
+                new.append(idx)
+                continue
+            name = names[idx] if 0 <= idx < len(names) else ""
+            if not name:
+                raise SceneRefused("skin family %d names no material at position %d" % (f, r))
+            if name not in have:
+                have[name] = build_mod.add_texture(d, name)
+                added.append(name)
+            new.append(have[name])
+        out.append(new + list(d.skin[0][len(new):]))
+    return out, added
+
+
+def skin_renames(d, arm_obj, reached):
+    """{record: name} for the records no slot reaches now that a slot renamed while another
+    family was showing.
+
+    `vtmb.set_skin_family` copies each shown slot's name into `vtmb_skin_materials` before
+    it switches, and `vtmb_skin_was` keeps what the file called each record. A record
+    whose file name is no longer the donor's is another file's and is left alone.
+    """
+    was = [str(x) for x in arm_obj.get("vtmb_skin_was") or ()]
+    _rows, names, nfile = skin_table(arm_obj)
+    out = {}
+    for k in range(min(nfile, len(was), len(names), len(d.textures))):
+        if k in reached or not names[k] or names[k] == was[k]:
+            continue
+        if d.textures[k].name == was[k]:
+            out[k] = names[k]
+    return out
+
+
+def scratch_skin_rows(d, arm_obj, mesh_objs):
+    """The armature's skin families laid over a no-donor file, whose one row the scratch
+    writer built as identity. Returns how many families the file then carries.
+
+    Each column of that row is a texture named after a slot's material, and the slot's
+    `vtmb_skinrefs` stamp says which position of the armature's table it shows. The
+    family on screen is the identity row itself; another family's record there is found
+    by name or added with no skinref. A column no stamped slot shows, or one the families
+    agree on, draws the same record in every family.
+    """
+    rows, names, _nfile = skin_table(arm_obj)
+    if len(rows) < 2 or not d.skin:
+        return len(d.skin)
+    fam = int(arm_obj.get("vtmb_skin_family") or 0)
+    if not 0 <= fam < len(rows):
+        raise SceneRefused("the armature's skin family is %d, but its skin table holds %d"
+                           % (fam, len(rows)))
+    have = {t.name: k for k, t in enumerate(d.textures)}
+    col_ref = {}
+    for obj in mesh_objs:
+        refs = [int(x) for x in obj.get("vtmb_skinrefs") or ()]
+        moves = slot_moves(obj)[0]
+        mats = obj.data.materials
+        for slot, r in enumerate(refs):
+            at = slot if moves is None else moves.get(slot)
+            if at is None or not 0 <= at < len(mats) or mats[at] is None:
+                continue
+            t = have.get(mats[at].name)
+            if t is None or not 0 <= r < len(rows[0]):
+                continue
+            was = col_ref.setdefault(t, r)
+            if was != r and any(row[was] != row[r] for row in rows):
+                raise SceneRefused("material %r shows skin positions %d and %d, which the "
+                                   "other skin families paint differently"
+                                   % (mats[at].name, was, r))
+    width = len(d.skin[0])
+    out = []
+    for f, row in enumerate(rows):
+        new = []
+        for t in range(width):
+            r = col_ref.get(t)
+            name = names[row[r]] if r is not None and 0 <= row[r] < len(names) else ""
+            if f == fam or not name:
+                new.append(d.skin[0][t])
+                continue
+            if name not in have:
+                have[name] = build_mod.add_texture(d, name)
+            new.append(have[name])
+        out.append(new)
+    d.skin = out
+    return len(out)
+
+
 def skin_family(m, arm_obj):
     """Which row of the skin table the scene's material slots are showing.
 
@@ -2048,6 +2178,12 @@ def skin_family(m, arm_obj):
     rename read back through the wrong row renames every mstudiotexture_t in the file.
     """
     fam = int(arm_obj.get("vtmb_skin_family") or 0)
+    if skin_edited(arm_obj):
+        n = len(skin_table(arm_obj)[0])
+        if not 0 <= fam < n:
+            raise SceneRefused("the armature's skin family is %d, but its skin table holds %d"
+                               % (fam, n))
+        return fam
     if m.skins and not 0 <= fam < len(m.skins):
         raise SceneRefused("the armature's skin family is %d, but %s carries %d"
                            % (fam, os.path.basename(m.path), len(m.skins)))
@@ -2116,8 +2252,10 @@ def slot_of(stash, moves, j):
     return moves.get(slot)
 
 
-def read_materials(m, source, family=0):
+def read_materials(m, source, family=0, rows=None):
     """({file texture index: name}, slots reordered, [slots deleted]).
+
+    `rows` is the skin table the slots show where the scene edited it, else the file's.
 
     `obj["vtmb_meshes"]` records which slot each file mesh landed in, and it is the only
     thing that maps a material back: Blender's per-face slot cannot speak for a mesh whose
@@ -2145,7 +2283,8 @@ def read_materials(m, source, family=0):
             if slot != int(stash[j][0]):
                 moved += 1
             ref = mesh.material
-            row = m.skins[family] if 0 <= family < len(m.skins) else None
+            table = m.skins if rows is None else rows
+            row = table[family] if 0 <= family < len(table) else None
             if row and 0 <= ref < len(row):
                 ref = row[ref]
             name = mats[slot].name
@@ -4933,7 +5072,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
              "stale": 0,
              "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
-             "added_materials": [],
+             "added_materials": [], "skin_families": 0,
              "slots_moved": 0, "slots_gone": [],
              "renamed_anims": [],
              "seqlist": {},
@@ -4956,8 +5095,20 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         scene["rebased"] = rebase["anims"]
         scene["requantised"] = rebase["widened"]
         scene["root_turned"] = [d.bones[k].name for k in rebase["root_turned"]]
-    named, scene["slots_moved"], scene["slots_gone"] = read_materials(
-        m, source, skin_family(m, arm_obj))
+    # The table before the renames, so a slot showing a record a cell added reads through
+    # the row that names it, and before new_materials, whose records append a column to
+    # every row this replaces.
+    if skin_edited(arm_obj):
+        d.skin, added = resolve_skin_table(d, arm_obj)
+        scene["skin_families"] = len(d.skin)
+        scene["added_materials"] += added
+    if skin_edited(arm_obj):
+        named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+            m, source, skin_family(m, arm_obj), rows=d.skin)
+    else:
+        named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+            m, source, skin_family(m, arm_obj))
+    named.update(skin_renames(d, arm_obj, set(named)))
     for ref, name in sorted(named.items()):
         if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
             d.textures[ref].name = name

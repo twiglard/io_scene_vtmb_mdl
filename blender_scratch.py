@@ -1408,6 +1408,8 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     face["meshless"] = meshless_model(d, no_mesh)
     if face["meshless"]:
         faces = list(d.faces)
+    # Before the eyeballs, whose iris records append a column to every row.
+    face["skin_families"] = export_mod.scratch_skin_rows(d, arm_obj, mesh_objs)
     # Keys first, then rules, then lids and the mouth: each appends the flexdescs it names
     # and the file lacks, and a lid or mouth flex no key or rule made is refused.
     face["controllers"], face["rules"], face["rule_flexdescs"] = export_mod.apply_flex(
@@ -1565,4 +1567,5 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, before_wr
             "unskinned": unskinned, "dropped": dict(d.dropped),
             "cloths": cloths, "stray_groups": stray,
             "scene_hitboxes": hbox[0:2], "refit_hitboxes": hbox[2],
-            "lods": st["lods"], "meshless": face["meshless"], "seams": face["seams"]}
+            "lods": st["lods"], "meshless": face["meshless"], "seams": face["seams"],
+            "skin_families": face["skin_families"]}

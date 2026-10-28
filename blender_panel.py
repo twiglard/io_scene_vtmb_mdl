@@ -281,11 +281,7 @@ def scene_material_names(context, arm_obj):
 
 def skin_rows(arm_obj):
     """The skin table as rows, back out of the flattened `vtmb_skin_table` stamp."""
-    flat = list(arm_obj.get("vtmb_skin_table") or ())
-    nref = int(arm_obj.get("vtmb_skin_refs") or 0)
-    if not flat or nref <= 0:
-        return []
-    return [[int(x) for x in flat[f:f + nref]] for f in range(0, len(flat), nref)]
+    return blender_export.skin_table(arm_obj)[0]
 
 
 def skin_family_names(arm_obj, family):
@@ -295,6 +291,111 @@ def skin_family_names(arm_obj, family):
     if not 0 <= family < len(rows):
         return []
     return [str(mats[r]) if 0 <= r < len(mats) else "" for r in rows[family]]
+
+
+def skin_slots(context, arm_obj):
+    """[(object, slot it is in now, skinref)] for every slot an import or export stamped."""
+    out = []
+    for o in arm_meshes(context, arm_obj):
+        refs = [int(x) for x in (o.get("vtmb_skinrefs") or ())]
+        # Through the import's stamp, since a reordered slot holds a different material
+        # and writing by the stamped index would put a family's picture on the wrong mesh.
+        moves = blender_export.slot_moves(o)[0]
+        for slot, r in enumerate(refs):
+            at = slot if moves is None else moves.get(slot)
+            if at is not None and at < len(o.data.materials):
+                out.append((o, at, r))
+    return out
+
+
+def sync_skin_names(context, arm_obj):
+    """Copy each shown slot's material name into the record the shown row names there.
+
+    Run before anything re-points the slots: a material renamed while its family showed
+    is otherwise looked up under its old name, and a record only that family reaches is
+    exported under it. `vtmb_skin_was` keeps the file's names, which is what lets the
+    export tell a rename from another donor's record.
+    """
+    rows, names, nfile = blender_export.skin_table(arm_obj)
+    fam = int(arm_obj.get("vtmb_skin_family") or 0)
+    if not 0 <= fam < len(rows):
+        return 0
+    seen, changed = set(), 0
+    for o, at, r in skin_slots(context, arm_obj):
+        mat = o.data.materials[at]
+        if mat is None or not 0 <= r < len(rows[fam]):
+            continue
+        rec = rows[fam][r]
+        if not 0 <= rec < len(names) or rec in seen:
+            continue
+        seen.add(rec)
+        if names[rec] != mat.name:
+            if "vtmb_skin_was" not in arm_obj:
+                arm_obj["vtmb_skin_was"] = names[:nfile]
+            names[rec] = mat.name
+            changed += 1
+    if changed:
+        arm_obj["vtmb_skin_materials"] = names
+    return changed
+
+
+def show_skin_family(context, arm_obj, family):
+    """Point every stamped slot at `family`'s material. (slots moved, [names not found]).
+
+    Nothing moves when a name is not found: a slot left on another family's material
+    would be read back by the export as this family's record renamed.
+    """
+    rows = skin_rows(arm_obj)
+    mats = list(arm_obj.get("vtmb_skin_materials") or ())
+    plan, missing = [], []
+    # Every mesh in one pass: the export inverts one row for the whole model, so a
+    # half-switched scene names one texture record two ways and is refused outright.
+    for o, at, r in skin_slots(context, arm_obj):
+        ref = rows[family][r] if 0 <= r < len(rows[family]) else r
+        name = str(mats[ref]) if 0 <= ref < len(mats) else ""
+        mat = bpy.data.materials.get(name) if name else None
+        if mat is None:
+            missing.append(name or "record %d" % ref)
+        else:
+            plan.append((o, at, mat))
+    if missing:
+        return 0, sorted(set(missing))
+    moved = 0
+    for o, at, mat in plan:
+        if o.data.materials[at] is not mat:
+            o.data.materials[at] = mat
+            moved += 1
+    # Re-stamped because this is the one thing that replaces a slot's material on
+    # purpose: leaving the old stamp would make the next export read every slot as renamed.
+    for o in {id(o): o for o, _at, _m in plan}.values():
+        o["vtmb_slot_mats"] = [mm.name if mm else "" for mm in o.data.materials]
+    arm_obj["vtmb_skin_family"] = family
+    return moved, []
+
+
+def _missing_text(family, missing):
+    more = " and %d more" % (len(missing) - 3) if len(missing) > 3 else ""
+    return ("family %d names a material the blend does not have: %s%s. Nothing was moved; "
+            "add or rename a material to that name, or re-import"
+            % (family, ", ".join(missing[:3]), more))
+
+
+def _skin_armature(op, context):
+    arm_obj = context.object
+    if arm_obj is None or arm_obj.type != "ARMATURE":
+        op.report({"ERROR"}, "select the model's armature")
+        return None
+    return arm_obj
+
+
+def _write_skin_rows(arm_obj, rows, names=None):
+    if "vtmb_skin_textures" not in arm_obj:
+        arm_obj["vtmb_skin_textures"] = len(arm_obj.get("vtmb_skin_materials") or ())
+    arm_obj["vtmb_skin_table"] = [r for row in rows for r in row]
+    arm_obj["vtmb_skin_families"] = len(rows)
+    if names is not None:
+        arm_obj["vtmb_skin_materials"] = names
+    arm_obj["vtmb_skin_edited"] = True
 
 
 class VTMB_OT_set_skin_family(bpy.types.Operator):
@@ -310,9 +411,8 @@ class VTMB_OT_set_skin_family(bpy.types.Operator):
     family: bpy.props.IntProperty(name="Skin family", default=0, min=0)
 
     def execute(self, context):
-        arm_obj = context.object
-        if arm_obj is None or arm_obj.type != "ARMATURE":
-            self.report({"ERROR"}, "select the model's armature")
+        arm_obj = _skin_armature(self, context)
+        if arm_obj is None:
             return {"CANCELLED"}
         rows = skin_rows(arm_obj)
         if not 0 <= self.family < len(rows):
@@ -321,54 +421,185 @@ class VTMB_OT_set_skin_family(bpy.types.Operator):
                                                   "y" if len(rows) == 1 else "ies",
                                                   self.family))
             return {"CANCELLED"}
-        mats = list(arm_obj.get("vtmb_skin_materials") or ())
-        moved, missing = 0, []
-        # Every mesh in one pass: the export inverts one row for the whole model, so a
-        # half-switched scene names one texture record two ways and is refused outright.
-        for o in arm_meshes(context, arm_obj):
-            refs = [int(x) for x in (o.get("vtmb_skinrefs") or ())]
-            # Through the import's stamp, since a reordered slot holds a different
-            # material and writing by the stamped index would put this family's picture
-            # on the wrong mesh.
-            moves = blender_export.slot_moves(o)[0]
-            for slot, r in enumerate(refs):
-                at = slot if moves is None else moves.get(slot)
-                if at is None or at >= len(o.data.materials):
-                    continue
-                ref = rows[self.family][r] if 0 <= r < len(rows[self.family]) else r
-                name = str(mats[ref]) if 0 <= ref < len(mats) else ""
-                mat = bpy.data.materials.get(name) if name else None
-                if mat is None:
-                    missing.append(name or "record %d" % ref)
-                    continue
-                if o.data.materials[at] is not mat:
-                    o.data.materials[at] = mat
-                    moved += 1
-            # Re-stamped because this is the one thing that replaces a slot's material on
-            # purpose: leaving the old stamp would make the next export read every slot
-            # as renamed.
-            o["vtmb_slot_mats"] = [mm.name if mm else "" for mm in o.data.materials]
-        arm_obj["vtmb_skin_family"] = self.family
+        sync_skin_names(context, arm_obj)
+        moved, missing = show_skin_family(context, arm_obj, self.family)
         if missing:
-            self.report({"WARNING"}, "family %d: %d slot(s) moved, and no material in "
-                                     "the blend is named %s"
-                        % (self.family, moved, ", ".join(sorted(set(missing))[:3])))
-        else:
-            self.report({"INFO"}, "skin family %d, %d slot(s) moved"
-                                  % (self.family, moved))
+            self.report({"ERROR"}, _missing_text(self.family, missing))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "skin family %d, %d slot(s) moved" % (self.family, moved))
         return {"FINISHED"}
 
 
-def draw_skin_families(lay, arm_obj):
-    """One row per skin family, the one on screen marked.
+def new_skin_table(context, arm_obj):
+    """A one-family table over the scene's own materials, for an armature no import gave
+    one. Each slot is stamped with its position, which is what the family switch reads."""
+    names = []
+    for o in arm_meshes(context, arm_obj):
+        for m in o.data.materials:
+            if m is not None and m.name not in names:
+                names.append(m.name)
+    for o in arm_meshes(context, arm_obj):
+        if all(m is not None for m in o.data.materials):
+            o["vtmb_skinrefs"] = [names.index(m.name) for m in o.data.materials]
+            o["vtmb_slot_mats"] = [m.name for m in o.data.materials]
+    arm_obj["vtmb_skin_refs"] = len(names)
+    arm_obj["vtmb_skin_textures"] = 0
+    arm_obj["vtmb_skin_family"] = 0
+    return [list(range(len(names)))], names
 
-    Drawn only above one family, which is 201 of the 4445 shipped models.
+
+class VTMB_OT_add_skin_family(bpy.types.Operator):
+    bl_idname = "vtmb.add_skin_family"
+    bl_label = "Add skin family"
+    bl_description = ("Append a skin family copied from the one showing, and show it. "
+                      "Pick a material per texture position below to make it differ; a map "
+                      "selects it by number, through the entity's skin key")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm_obj = _skin_armature(self, context)
+        if arm_obj is None:
+            return {"CANCELLED"}
+        rows = skin_rows(arm_obj)
+        names = None
+        if not rows:
+            if arm_obj.get("vtmb_skin_materials"):
+                self.report({"ERROR"}, "the import stamped materials but no skin table; "
+                                       "re-import the model")
+                return {"CANCELLED"}
+            rows, names = new_skin_table(context, arm_obj)
+            if not names:
+                self.report({"ERROR"}, "no mesh of this armature has a material")
+                return {"CANCELLED"}
+        else:
+            sync_skin_names(context, arm_obj)
+        fam = int(arm_obj.get("vtmb_skin_family") or 0)
+        fam = fam if 0 <= fam < len(rows) else 0
+        rows.append(list(rows[fam]))
+        _write_skin_rows(arm_obj, rows, names)
+        arm_obj["vtmb_skin_family"] = len(rows) - 1
+        self.report({"INFO"}, "skin family %d added, a copy of family %d"
+                              % (len(rows) - 1, fam))
+        return {"FINISHED"}
+
+
+class VTMB_OT_remove_skin_family(bpy.types.Operator):
+    bl_idname = "vtmb.remove_skin_family"
+    bl_label = "Remove skin family"
+    bl_description = ("Remove one skin family. Every later family's number drops by one, "
+                      "so a map entity that selected one of them now shows the family "
+                      "after the one it chose, and one that selected the last falls back "
+                      "to family 0")
+    bl_options = {"REGISTER", "UNDO"}
+
+    family: bpy.props.IntProperty(name="Skin family", default=0, min=0)
+
+    def execute(self, context):
+        arm_obj = _skin_armature(self, context)
+        if arm_obj is None:
+            return {"CANCELLED"}
+        rows = skin_rows(arm_obj)
+        if len(rows) < 2 or not 0 <= self.family < len(rows):
+            self.report({"ERROR"}, "this model carries %d skin famil%s, and the last one "
+                                   "cannot be removed" % (len(rows),
+                                                          "y" if len(rows) == 1 else "ies"))
+            return {"CANCELLED"}
+        sync_skin_names(context, arm_obj)
+        fam = int(arm_obj.get("vtmb_skin_family") or 0)
+        rows.pop(self.family)
+        show = fam - 1 if fam > self.family else fam
+        if fam == self.family:
+            show = max(0, fam - 1)
+            names = [str(x) for x in arm_obj.get("vtmb_skin_materials") or ()]
+            gone = sorted({names[r] for r in rows[show] if 0 <= r < len(names)
+                           and names[r] and bpy.data.materials.get(names[r]) is None})
+            if gone:
+                self.report({"ERROR"}, _missing_text(show, gone))
+                return {"CANCELLED"}
+        _write_skin_rows(arm_obj, rows)
+        arm_obj["vtmb_skin_family"] = show
+        if fam == self.family:
+            show_skin_family(context, arm_obj, show)
+        self.report({"INFO"}, "skin family %d removed, showing %d" % (self.family, show))
+        return {"FINISHED"}
+
+
+_SKIN_MATERIAL_ITEMS = []
+
+
+def _skin_material_items(self, context):
+    # Kept in a module list: Blender reads the strings after this returns.
+    _SKIN_MATERIAL_ITEMS[:] = [(m.name, m.name, "") for m in bpy.data.materials]
+    return _SKIN_MATERIAL_ITEMS
+
+
+class VTMB_OT_set_skin_cell(bpy.types.Operator):
+    bl_idname = "vtmb.set_skin_cell"
+    bl_label = "Set skin family material"
+    bl_description = ("Pick the material one skin family draws at this texture position. "
+                      "Only this family changes; renaming a material in a mesh slot "
+                      "instead renames it in every family that draws it")
+    bl_options = {"REGISTER", "UNDO"}
+    bl_property = "material"
+
+    family: bpy.props.IntProperty(name="Skin family", default=0, min=0)
+    ref: bpy.props.IntProperty(name="Texture position", default=0, min=0)
+    material: bpy.props.EnumProperty(name="Material", items=_skin_material_items)
+
+    def invoke(self, context, event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        arm_obj = _skin_armature(self, context)
+        if arm_obj is None:
+            return {"CANCELLED"}
+        rows = skin_rows(arm_obj)
+        if not 0 <= self.family < len(rows) or not 0 <= self.ref < len(rows[self.family]):
+            self.report({"ERROR"}, "no skin family %d with a texture position %d"
+                        % (self.family, self.ref))
+            return {"CANCELLED"}
+        if not self.material or bpy.data.materials.get(self.material) is None:
+            self.report({"ERROR"}, "no material named %r" % self.material)
+            return {"CANCELLED"}
+        sync_skin_names(context, arm_obj)
+        rows, names, _nfile = blender_export.skin_table(arm_obj)
+        rec = next((k for k, n in enumerate(names) if n == self.material), None)
+        if rec is None:
+            rec = len(names)
+            names.append(self.material)
+        was = rows[self.family][self.ref]
+        rows[self.family][self.ref] = rec
+        _write_skin_rows(arm_obj, rows, names)
+        if self.family == int(arm_obj.get("vtmb_skin_family") or 0):
+            show_skin_family(context, arm_obj, self.family)
+        self.report({"INFO"}, "skin family %d draws %s at position %d, was %s"
+                              % (self.family, self.material, self.ref,
+                                 names[was] if 0 <= was < len(names) else "nothing"))
+        return {"FINISHED"}
+
+
+def _ref_users(context, arm_obj):
+    """{skinref: [object name]} for the slots that show each position."""
+    out = {}
+    for o, _at, r in skin_slots(context, arm_obj):
+        if o.name not in out.setdefault(r, []):
+            out[r].append(o.name)
+    return out
+
+
+def draw_skin_families(lay, arm_obj, context=None):
+    """One row per skin family with the one on screen marked, then the shown family's
+    material at each position a mesh draws, each a picker. A position no mesh shows is
+    left out: on temple_guard skinrefs 9 to 11 are in every row and no mesh uses one.
     """
     rows = skin_rows(arm_obj)
-    if len(rows) < 2:
-        lay.label(text="one skin family", icon="INFO")
-        return
     active = int(arm_obj.get("vtmb_skin_family") or 0)
+    if not rows:
+        lay.label(text="no skin table yet; Add skin family makes one from the materials",
+                  icon="INFO")
+        lay.operator("vtmb.add_skin_family", icon="ADD")
+        return
     box = lay.box()
     for f in range(len(rows)):
         row = box.row(align=True)
@@ -377,6 +608,26 @@ def draw_skin_families(lay, arm_obj):
         op.family = f
         row.label(text="skin %d" % f)
         row.label(text=", ".join(n for n in skin_family_names(arm_obj, f) if n)[:64])
+        if len(rows) > 1:
+            op = row.operator("vtmb.remove_skin_family", text="", icon="X")
+            op.family = f
+    if context is not None and 0 <= active < len(rows):
+        users = _ref_users(context, arm_obj)
+        named = len({n for v in users.values() for n in v}) > 1
+        names = skin_family_names(arm_obj, active)
+        col = lay.box().column(align=True)
+        col.label(text="skin %d draws" % active)
+        for r in sorted(users):
+            if not 0 <= r < len(names):
+                continue
+            row = col.row(align=True)
+            op = row.operator("vtmb.set_skin_cell", text=names[r] or "(none)",
+                              icon="MATERIAL")
+            op.family = active
+            op.ref = r
+            if named:
+                row.label(text=", ".join(users[r])[:48])
+    lay.operator("vtmb.add_skin_family", icon="ADD")
 
 
 class VTMB_PT_skin_families(bpy.types.Panel):
@@ -392,7 +643,7 @@ class VTMB_PT_skin_families(bpy.types.Panel):
 
     def draw(self, context):
         self.layout.use_property_split = False
-        draw_skin_families(self.layout, context.object)
+        draw_skin_families(self.layout, context.object, context)
 
 
 CLOTH = "vtmb_cloth"
@@ -3430,7 +3681,8 @@ class VTMB_PT_material(bpy.types.Panel):
 CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
-           VTMB_OT_set_skin_family, VTMB_PT_skin_families,
+           VTMB_OT_set_skin_family, VTMB_OT_add_skin_family, VTMB_OT_remove_skin_family,
+           VTMB_OT_set_skin_cell, VTMB_PT_skin_families,
            VTMB_PT_cloth, VTMB_PT_material,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_OT_add_cloth_capsule,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,

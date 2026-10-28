@@ -2091,6 +2091,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             extra += _write_tths(context, dirs, self.filepath,
                                  scene["added_materials"], self.write_tth,
                                  self.tth_format)
+        if scene.get("skin_families"):
+            extra += "; wrote the scene's %d skin famil%s" % (
+                scene["skin_families"], "y" if scene["skin_families"] == 1 else "ies")
         if scene.get("slots_moved"):
             extra += ("; followed %d material slot%s that had moved since the import"
                       % (scene["slots_moved"],
@@ -2590,6 +2593,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
         _report_placed(self, moved, None, set())
+        if (r.get("skin_families") or 0) > 1:
+            self.report({"INFO"}, "wrote %d skin families" % r["skin_families"])
         if r.get("meshless"):
             self.report({"WARNING"}, "the armature owns no mesh, so one bodypart holding "
                                      "one model of no mesh was written, as null.mdl ships: "

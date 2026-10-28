@@ -2112,6 +2112,18 @@ def add_cdtexture(d, path):
     return True
 
 
+def add_texture(d, name):
+    """One `mstudiotexture_t` and no skinref: a record only a skin family's row names.
+
+    648 shipped models carry a record no strip group reaches, so one no mesh draws in the
+    first family is legal. Returns its index.
+    """
+    if not d.cdtextures:
+        set_cdtextures(d, "models/")
+    d.textures.append(Rec(bytearray(20), name))
+    return len(d.textures) - 1
+
+
 def add_material(d, name, cdtexture=None):
     """One `mstudiotexture_t`, with the one-family skin table rebuilt around it.
 
