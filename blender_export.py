@@ -4141,7 +4141,8 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
     """
     stash = list(arm_obj.get("vtmb_sequences") or ())
     moves = {"added": [], "removed": [], "reordered": 0, "orphans": [],
-             "autolayers_lost": [], "dangling": [], "missing": [], "twice": []}
+             "autolayers_lost": [], "dangling": [], "missing": [], "twice": [],
+             "scene_label": {}}
     index = {n: k for k, n in enumerate(anim_names)}
     seen, carried_twice = set(), set()
     for name in anim_names:
@@ -4168,6 +4169,8 @@ def apply_sequences(d, m, arm_obj, anim_names, actions=None):
             continue
         was, lost, orphans, naming = build_mod.remove_sequence(d, at[0])
         moves["removed"].append(was)
+        if label and label != was:
+            moves["scene_label"][was] = label
         moves["autolayers_lost"] += lost
         moves["dangling"] += naming
         moves["orphans"] = [a for a in orphans if a not in was_orphan]

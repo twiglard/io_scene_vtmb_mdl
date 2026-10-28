@@ -1862,9 +1862,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         stamped = _restamp_sequences(obj, self.filepath, src, r["added"],
                                      gone["seqs"], sl)
         if sl.get("removed"):
+            renamed = sl.get("scene_label") or {}
             self.report({"INFO"}, "removed %d sequence%s: %s"
                         % (len(sl["removed"]), "" if len(sl["removed"]) == 1 else "s",
-                           ", ".join(sl["removed"])))
+                           ", ".join(n + (" (%s in the scene)" % renamed[n] if n in renamed
+                                          else "") for n in sl["removed"])))
         if sl.get("added"):
             self.report({"INFO"}, "appended %d sequence%s: %s"
                         % (len(sl["added"]), "" if len(sl["added"]) == 1 else "s",
