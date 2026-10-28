@@ -819,6 +819,34 @@ def stamp_appended(d, rows, arm_obj=None):
         me["vtmb_model_name"] = obj.name + ".smd"
         me["vtmb_model_label"] = me.name
         row["stamped"] = True
+    if arm_obj is not None and rows:
+        widen_skin_table(d, arm_obj)
+
+
+def widen_skin_table(d, arm_obj):
+    """The columns an append added to the file's skin table, added to the armature's.
+
+    A slot stamped with a position past the armature's table was otherwise read by the
+    family switch as a record index, which put another record's material on the new mesh
+    and the export then renamed its record to match. `_skin_ref` appends each column
+    drawing one record in every family, so row 0 names it.
+    """
+    table, names, _nfile = skin_table(arm_obj)
+    if not table or not d.skin or len(d.skin[0]) <= len(table[0]):
+        return 0
+    if "vtmb_skin_textures" not in arm_obj:
+        arm_obj["vtmb_skin_textures"] = len(names)
+    w = len(table[0])
+    for c in range(w, len(d.skin[0])):
+        name = d.textures[d.skin[0][c]].name
+        if name not in names:
+            names.append(name)
+        for row in table:
+            row.append(names.index(name))
+    arm_obj["vtmb_skin_table"] = [r for row in table for r in row]
+    arm_obj["vtmb_skin_refs"] = len(table[0])
+    arm_obj["vtmb_skin_materials"] = names
+    return len(d.skin[0]) - w
 
 
 def renamed_models(m, source):
