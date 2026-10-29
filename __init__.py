@@ -1335,7 +1335,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     hull=(blender_scratch.fit_hull(objs, arm_scale) if self.fit_hull
                           else None),
                     frame_start=context.scene.frame_start if self.use_range and one else None,
-                    frame_end=context.scene.frame_end if self.use_range and one else None)
+                    frame_end=context.scene.frame_end if self.use_range and one else None,
+                    content=blender_import.Content(paths.roots(src, *_prefs(context))))
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -1577,12 +1578,24 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                      "geometry and was not rewritten" % name)
         phy = r.get("phy")
         if phy is not None:
-            if phy["missing"]:
+            if phy["copied"]:
+                self.report({"INFO"}, "%s copied beside the model from %s"
+                            % (phy["file"], phy["copied"]))
+            if phy["dropped"]:
+                self.report({"INFO"},
+                            "%s: the solid%s of %s dropped with the bone%s, so that part "
+                            "of the body has no collision and no ragdoll segment of its own"
+                            % (phy["file"], "" if len(phy["dropped"]) == 1 else "s",
+                               ", ".join(repr(n) for n in phy["dropped"]),
+                               "" if len(phy["dropped"]) == 1 else "s"))
+            if phy["orphaned"]:
                 self.report({"WARNING"},
-                            "no %s beside the file just written, and the donor had one. "
-                            "A model with no .phy is not hit by traces at all, which is "
-                            "worse than being hit at the wrong shape -- copy it across"
-                            % phy["file"])
+                            "%s: %s lost every solid above %s, so %s no ragdoll joint and "
+                            "will move on %s own"
+                            % (phy["file"], ", ".join(repr(n) for n in phy["orphaned"]),
+                               "it" if len(phy["orphaned"]) == 1 else "them",
+                               "it has" if len(phy["orphaned"]) == 1 else "they have",
+                               "its" if len(phy["orphaned"]) == 1 else "their"))
             if phy["rewritten"]:
                 self.report({"INFO"},
                             "%s rewritten for the renamed bones: %s"
@@ -1590,7 +1603,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                ", ".join("%r -> %r" % p for p in phy["rewritten"])))
             if phy["error"]:
                 self.report({"ERROR"},
-                            "%s was not rewritten for the renamed bones: %s"
+                            "%s was not written beside the model: %s"
                             % (phy["file"], phy["error"]))
             # A rename or a delete is the only failure that is not merely geometric: the
             # solid is looked up by name and an unmatched one is not created at all.

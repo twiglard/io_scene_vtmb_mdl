@@ -1548,6 +1548,30 @@ def _check_blocks(d):
                              "%d records fewer than the block holds" % (was - nb)))
 
 
+def set_physicsbones(d, solids):
+    """Every bone's physicsbone +0x94 from the `.phy`'s solid names, in solid order, by
+    studiomdl's rule (`FixCollisionHierarchy`, collisionmodel.cpp:1910): the ordinal of the
+    solid named for it, else its nearest ancestor's, else 0. The engine finds a solid's
+    bone with `stricmp`, first match winning. Every shipped bone but the 545 of nine files
+    that carry 0 throughout follows it (plans/phy-corpus-measure.py)."""
+    first = {}
+    for k, r in enumerate(d.bones):
+        first.setdefault(r.name.lower(), k)
+    own = {}
+    for i, name in enumerate(solids):
+        k = first.get(name.lower())
+        if k is not None:
+            own[k] = i
+    for k, r in enumerate(d.bones):
+        p, got = k, 0
+        while p >= 0:
+            if p in own:
+                got = own[p]
+                break
+            p = struct.unpack_from("<i", d.bones[p].raw, 0x04)[0]
+        struct.pack_into("<i", r.raw, 0x94, got)
+
+
 def add_bone(d, name, parent=-1, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0),
              flags=BONE_USED, surfaceprop="flesh"):
     """Append one bone, return its index.  A parent must already be in `d.bones`: the

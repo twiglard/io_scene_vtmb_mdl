@@ -493,6 +493,198 @@ def text_start(data):
     return pos
 
 
+def _close(t):
+    """Where the token `t` ends, past its closing quote when it has one."""
+    return t[2] + (1 if t[3] else 0)
+
+
+def _open(t):
+    return t[1] - (1 if t[3] else 0)
+
+
+def block_spans(text):
+    """`blocks`, with each block's byte span and each pair's: [(name, [(key, value,
+    (start, end))], (start, end))], start at the block's name and end past its `}`."""
+    t = tokens(text)
+    out = []
+    i = 0
+    while i < len(t):
+        key = t[i]
+        if key[0] == b"}":
+            i += 1
+            continue
+        if i + 1 >= len(t):
+            break
+        value = t[i + 1]
+        i += 2
+        if value[0] != b"{":
+            continue
+        pairs = []
+        end = _close(value)
+        while i < len(t):
+            k = t[i]
+            if k[0] == b"}":
+                end = _close(k)
+                i += 1
+                break
+            v = t[i + 1] if i + 1 < len(t) else None
+            i += 2
+            end = _close(v if v is not None else k)
+            if k[0][:1] == b"}":
+                break
+            pairs.append((k, v, (_open(k), end)))
+        out.append((key, pairs, (_open(key), end)))
+    return out
+
+
+def _line(text, lo, hi):
+    """[lo, hi) widened over the whitespace after it, through the first newline, so a
+    removed line leaves no blank one."""
+    while hi < len(text) and text[hi] in b" \t\r":
+        hi += 1
+    if hi < len(text) and text[hi] == 0x0a:
+        hi += 1
+    return lo, hi
+
+
+def drop_solids(data, names):
+    """`data` with every solid named for one of `names` taken out, and what that did.
+
+    The engine matches a solid to its bone with `stricmp`, so `names` match case-blind. Each
+    dropped solid's binary record and `solid` block go; the survivors' `index` values close
+    up; a survivor whose `parent` named a dropped solid takes that solid's parent, up the
+    chain to the first that survives, and loses the key when none does. A
+    `ragdollconstraint` whose child was dropped goes; one whose parent was dropped moves to
+    that same surviving ancestor, or goes when there is none. A `jointmerge` pair naming a
+    dropped solid goes and a `rootname` naming one takes its surviving ancestor. Everything
+    else, the other surfaces included, is copied as it was.
+
+    Returns (bytes, {old ordinal: new ordinal or None}, [dropped solid names], [names of
+    solids left with no parent]). Dropping every solid raises `PhyError`: `phyheader_t`
+    with no solid is a file `Phy` itself refuses to read.
+    """
+    start = text_start(data)
+    size, ident, count, checksum = HEADER.unpack_from(data)
+    records, pos = [], size
+    for _ in range(count):
+        n, = struct.unpack_from("<i", data, pos)
+        records.append(bytes(data[pos:pos + 4 + n]))
+        pos += 4 + n
+    text = bytes(data[start:])
+    spans = block_spans(text)
+
+    solids = []
+    for name, pairs, span in spans:
+        if name[0].lower() != b"solid":
+            continue
+        kv = {k[0].lower(): (v, s) for k, v, s in pairs if v is not None}
+        solids.append((kv, span))
+    if len(solids) != count:
+        raise PhyError(f"{len(solids)} solid blocks for {count} solids")
+    for k, (kv, _) in enumerate(solids):
+        got = kv.get(b"index", (None,))[0]
+        if got is None or got[0] != str(k).encode():
+            raise PhyError(f"solid block {k} carries index "
+                           f"{got[0].decode('latin-1') if got else 'none'}")
+
+    low = [kv.get(b"name", ((b"",),))[0][0].lower() for kv, _ in solids]
+    drop = {n.lower().encode("latin-1") for n in names}
+    gone = [k for k in range(count) if low[k] in drop]
+    if not gone:
+        return bytes(data), {k: k for k in range(count)}, [], []
+    keep = [k for k in range(count) if k not in gone]
+    if not keep:
+        raise PhyError("every solid would be dropped, and a .phy holds at least one")
+    remap = {k: None for k in gone}
+    remap.update((k, i) for i, k in enumerate(keep))
+    by_name = {}
+    for k in range(count):
+        by_name.setdefault(low[k], k)
+
+    def parent_of(k):
+        v = solids[k][0].get(b"parent")
+        return by_name.get(v[0][0].lower()) if v else None
+
+    def survivor(k):
+        """The nearest solid up `k`'s parent chain that survives, `k` included."""
+        seen = set()
+        while k is not None and remap[k] is None and k not in seen:
+            seen.add(k)
+            k = parent_of(k)
+        return k if k is not None and remap[k] is not None else None
+
+    edits = []
+    orphaned = []
+    for k in gone:
+        edits.append(_line(text, *solids[k][1]))
+    for k in keep:
+        kv = solids[k][0]
+        v = kv[b"index"][0]
+        if remap[k] != k:
+            edits.append((v[1], v[2], str(remap[k]).encode()))
+        p = parent_of(k)
+        if p is not None and remap[p] is None:
+            s = survivor(p)
+            if s is None:
+                edits.append(_line(text, *kv[b"parent"][1]))
+                orphaned.append(kv[b"name"][0][0].decode("latin-1"))
+            else:
+                v = kv[b"parent"][0]
+                name = solids[s][0][b"name"][0][0]
+                edits.append((v[1], v[2], name if v[3] else b'"' + name + b'"'))
+
+    for name, pairs, span in spans:
+        n = name[0].lower()
+        kv = {k[0].lower(): (v, s) for k, v, s in pairs if v is not None}
+        if n == b"ragdollconstraint":
+            try:
+                parent = int(kv[b"parent"][0][0])
+                child = int(kv[b"child"][0][0])
+            except (KeyError, ValueError):
+                continue
+            if not (0 <= child < count and 0 <= parent < count):
+                continue
+            if remap[child] is None:
+                edits.append(_line(text, *span))
+                continue
+            if remap[parent] is None:
+                parent = survivor(parent)
+                if parent is None:
+                    edits.append(_line(text, *span))
+                    continue
+            for key, now in ((b"parent", remap[parent]), (b"child", remap[child])):
+                v = kv[key][0]
+                if v[0] != str(now).encode():
+                    edits.append((v[1], v[2], str(now).encode()))
+        elif n == b"editparams":
+            for k, v, s in pairs:
+                if v is None:
+                    continue
+                key = k[0].lower()
+                if key == b"jointmerge":
+                    if any(p.lower() in drop for p in v[0].split(b",")):
+                        edits.append(_line(text, *s))
+                elif key == b"rootname" and v[0].lower() in drop:
+                    r = survivor(by_name[v[0].lower()]) if v[0].lower() in by_name else None
+                    name = solids[r][0][b"name"][0][0] if r is not None else b""
+                    edits.append((v[1], v[2], name if v[3] else b'"' + name + b'"'))
+
+    edits.sort(reverse=True)
+    for lo, hi, *b in edits:
+        text = text[:lo] + (b[0] if b else b"") + text[hi:]
+    head = HEADER.pack(size, ident, len(keep), checksum)
+    out = head + b"".join(records[k] for k in keep) + text
+    return out, remap, [solids[k][0][b"name"][0][0].decode("latin-1") for k in gone], orphaned
+
+
+def solid_names(data):
+    """Each solid's `name` in the text half, in solid order."""
+    return [dict((k[0].lower(), v[0]) for k, v in kv if v is not None).get(b"name", b"")
+            .decode("latin-1")
+            for name, kv in blocks(bytes(data[text_start(data):]))
+            if name[0].lower() == b"solid"]
+
+
 def rename_bones(data, pairs):
     """`data` with every bone name in its text half following its bone, and what changed.
 

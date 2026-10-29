@@ -19,6 +19,7 @@ import math
 import os
 import re
 import struct
+import types
 
 import bpy
 import mathutils
@@ -4935,8 +4936,29 @@ def phy_path(p):
     return (p[:-4] if p[-4:].lower() == ".mdl" else p) + ".phy"
 
 
-def phy_bone_names(path, names):
-    """Which of `names` the sibling `.phy` cites, or None when there is no `.phy`.
+def donor_phy(source, content=None):
+    """(where, bytes) of the donor's `.phy`, or (None, None) when it has none.
+
+    Beside the donor first, then with `content` the same relative path on every root and in
+    its packs, as the engine finds it: 102 of the 505 loose models in the shipped install
+    keep their `.phy` only in a pack or under another root.
+    """
+    src = phy_path(source)
+    if not os.path.isfile(src):
+        if content is None:
+            return None, None
+        src, blob = content.companion(types.SimpleNamespace(path=source), (".phy",))
+        if src is None:
+            return None, None
+        if blob is not None:
+            return src, blob
+    with open(src, "rb") as f:
+        return src, f.read()
+
+
+def phy_bone_names(path, names, data=None):
+    """Which of `names` the sibling `.phy` cites, or None when there is no `.phy`. `data` is
+    that file's bytes when they were read elsewhere, from a pack.
 
     Collision and ragdoll live in that file, which nothing here writes but `rewrite_phy`'s
     bone rename. It references the model by bone name and by nothing else -- over 2929
@@ -4948,11 +4970,13 @@ def phy_bone_names(path, names):
     cannot hide a reference from this.
     """
     ph = phy_path(path)
-    if not os.path.exists(ph):
+    if data is None and not os.path.exists(ph):
         return None
     try:
-        with open(ph, "rb") as f:
-            b = f.read()
+        if data is None:
+            with open(ph, "rb") as f:
+                data = f.read()
+        b = data
         size, _, nsolid, _ = struct.unpack_from("<4i", b, 0)
         o = size
         for _ in range(nsolid):
@@ -4965,54 +4989,85 @@ def phy_bone_names(path, names):
     return set(n for n in names if n in quoted)
 
 
-def rewrite_phy(source, dest, pairs):
-    """Write the donor's `.phy` beside `dest` with its bone names following `pairs`, every
-    bone's (file name, name now) in file order.
+def rewrite_phy(source, dest, pairs, content=None, removed=()):
+    """The donor's `.phy` as this export leaves it: every solid named for a bone in
+    `removed` dropped (the user, 2026-10-29), then its bone names following `pairs`, every
+    remaining bone's (file name, name now) in file order. `write_phy` puts it beside `dest`
+    once the `.mdl` is written.
 
-    None when no bone was renamed, the donor has no `.phy`, or no value in it follows a
-    renamed bone; else {"renamed": [(old, new)], "error"}, and on an error nothing is written.
+    It is written when it changed, and on a save-as whether or not it did: the new model has
+    no collision and no ragdoll without it (the user, 2026-10-29). None when the donor has
+    no `.phy`, or an export in place changes nothing in it; else {"data": the bytes, None on
+    an error, "renamed": [(old, new)], "dropped": [solid names], "orphaned": [solids whose
+    parent chain lost every solid], "copied": where it came from when nothing changed,
+    "error"}.
     """
-    src = phy_path(source)
-    if all(a == b for a, b in pairs) or not os.path.exists(src):
-        return None
     try:
-        with open(src, "rb") as f:
-            out, changed = phy_mod.rename_bones(f.read(), pairs)
-        if not changed:
+        where, data = donor_phy(source, content)
+        if data is None:
             return None
-        with open(phy_path(dest), "wb") as f:
-            f.write(out)
+        out, _remap, dropped, orphaned = phy_mod.drop_solids(data, removed)
+        out, changed = (phy_mod.rename_bones(out, pairs) if any(a != b for a, b in pairs)
+                        else (out, []))
     except (OSError, phy_mod.PhyError) as e:
-        return {"renamed": [], "error": str(e)}
-    return {"renamed": sorted(set(changed)), "error": None}
+        return {"data": None, "renamed": [], "dropped": [], "orphaned": [], "copied": None,
+                "error": str(e)}
+    if not changed and not dropped and same_file(source, dest):
+        return None
+    return {"data": out, "renamed": sorted(set(changed)), "dropped": dropped,
+            "orphaned": orphaned, "copied": None if changed or dropped else where,
+            "error": None}
 
 
-def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None):
-    """What the sibling `.phy` no longer describes, or None when it has nothing to say.
+def write_phy(dest, rewrite):
+    """`rewrite_phy`'s bytes beside `dest`, and its result with any write error in it."""
+    if rewrite is None or rewrite["data"] is None:
+        return rewrite
+    try:
+        with open(phy_path(dest), "wb") as f:
+            f.write(rewrite["data"])
+    except OSError as e:
+        return dict(rewrite, data=None, renamed=[], dropped=[], orphaned=[], copied=None,
+                    error=str(e))
+    return rewrite
 
-    `rewrite` is `rewrite_phy`'s result. Once it has written, the renames are its to report:
-    a swap of two names leaves each old name cited in the file, now for the other bone."""
+
+def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, content=None):
+    """What the `.phy` the engine will load for `dest` no longer describes, or None when
+    there is nothing to say.
+
+    `rewrite` is `write_phy`'s result. Once it has written, the renames are its to report:
+    a swap of two names leaves each old name cited in the file, now for the other bone. With
+    nothing beside `dest`, the donor's `.phy` out of a pack is the one in force."""
     done = rewrite is not None and rewrite["error"] is None
     extra = {"rewritten": rewrite["renamed"] if done else [],
+             "dropped": rewrite["dropped"] if done else [],
+             "orphaned": rewrite["orphaned"] if done else [],
+             "copied": rewrite["copied"] if done else None,
              "error": rewrite["error"] if rewrite is not None else None}
     if done:
         renamed = []
     old_names = [g["name"] for g in removed or ()] + [a for a, _ in renamed or ()]
     cited = phy_bone_names(dest, old_names)
+    if cited is None and same_file(source, dest):
+        try:
+            _where, data = donor_phy(source, content)
+        except OSError:
+            data = None
+        if data is not None:
+            cited = phy_bone_names(dest, old_names, data)
     if cited is None:
-        # Nothing beside the file just written. Deleting a `.phy` is worse than leaving one
-        # stale: `CBaseAnimating::TestCollision` returns false with no solid, so the model
-        # stops being hit by traces at all rather than being hit at the wrong shape.
-        if os.path.exists(phy_path(source)) and os.path.abspath(source) != os.path.abspath(dest):
-            return dict({"file": os.path.basename(phy_path(dest)), "missing": True,
-                         "removed": [], "renamed": [], "geometry": geometry_moved}, **extra)
+        if extra["error"]:
+            return dict({"file": os.path.basename(phy_path(dest)), "removed": [],
+                         "renamed": [], "geometry": geometry_moved}, **extra)
         return None
     gone = sorted(g["name"] for g in removed or () if g["name"] in cited)
     moved = sorted((a, b) for a, b in renamed or () if a in cited)
-    if not (gone or moved or geometry_moved or extra["rewritten"] or extra["error"]):
+    if not (gone or moved or geometry_moved or extra["rewritten"] or extra["dropped"]
+            or extra["copied"] or extra["error"]):
         return None
-    return dict({"file": os.path.basename(phy_path(dest)), "missing": False,
-                 "removed": gone, "renamed": moved, "geometry": geometry_moved}, **extra)
+    return dict({"file": os.path.basename(phy_path(dest)), "removed": gone, "renamed": moved,
+                 "geometry": geometry_moved}, **extra)
 
 
 def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
@@ -5051,7 +5106,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
                    write_cloth=True, vtx_flavours=("dx80",), placed=None,
-                   before_write=None):
+                   before_write=None, content=None):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -5089,6 +5144,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     `before_write(d, added)` runs on the finished model before the `.vtx` or the `.mdl` is
     written, so a caller that refuses over what the edit produced leaves nothing on disk.
     `added` is the material names the export added, the list the `.vmt` writer reads.
+
+    `content` is a `blender_import.Content` over the donor's roots, where `donor_phy` looks
+    for a `.phy` that is not beside it.
     """
     m = mdl_mod.Mdl(source)
     if verify:
@@ -5575,6 +5633,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.drop_meshes(d, bi, mi, ks)
     if before_write is not None:
         before_write(d, scene["added_materials"])
+    phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
+                              [g["name"] for g in removed])
+    if phy_rewrite is not None and phy_rewrite["dropped"]:
+        build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)
@@ -5594,7 +5656,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     with open(dest, "wb") as f:
         f.write(data)
     # After the .mdl, so a write that fails there leaves the donor's `.phy` as it was.
-    phy_rewrite = rewrite_phy(source, dest, bone_pairs)
+    phy_rewrite = write_phy(dest, phy_rewrite)
     # A save-as leaves the armature describing the donor, which has no such model.
     if same_file(source, dest):
         stamp_appended(d, appended, arm_obj)
@@ -5623,7 +5685,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                       if (revised or removed or added_bones or cloth_removed) else []),
             "cloth": cloth, "cloth_edits": cloth_was, "cloth_removed": cloth_removed,
             "lods": lods, "no_vtx": no_vtx, "vtx_eye_flags": eye_flags,
-            "phy": phy_report(source, dest, removed, renamed, bool(revised), phy_rewrite)}
+            "phy": phy_report(source, dest, removed, renamed, bool(revised), phy_rewrite,
+                              content)}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):
