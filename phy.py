@@ -53,6 +53,10 @@ class PhyError(ValueError):
     pass
 
 
+class RagdollSplit(PhyError):
+    """`drop_solids` would leave more solids with no parent than the file had."""
+
+
 class Edge:
     __slots__ = ("start", "opposite", "virtual")
 
@@ -1019,21 +1023,58 @@ def _line(text, lo, hi):
     return lo, hi
 
 
-def drop_solids(data, names):
-    """`data` with every solid named for one of `names` taken out, and what that did.
+def matrix_angles(m):
+    """(pitch, yaw, roll) in degrees of a 3x4's rotation, as mathlib's `MatrixAngles` gives
+    them (source-2003 `public/mathlib.cpp:1108`), roll 0 when the x axis is nearly vertical."""
+    fx, fy, fz = m[0][0], m[1][0], m[2][0]
+    xy = math.sqrt(fx * fx + fy * fy)
+    pitch = math.degrees(math.atan2(-fz, xy))
+    if xy > 0.001:
+        return pitch, math.degrees(math.atan2(fy, fx)), math.degrees(math.atan2(m[2][1], m[2][2]))
+    return pitch, math.degrees(math.atan2(-m[0][1], m[1][1])), 0.0
 
-    The engine matches a solid to its bone with `stricmp`, so `names` match case-blind. Each
-    dropped solid's binary record and `solid` block go; the survivors' `index` values close
-    up; a survivor whose `parent` named a dropped solid takes that solid's parent, up the
-    chain to the first that survives, and loses the key when none does. A
-    `ragdollconstraint` whose child was dropped goes; one whose parent was dropped moves to
-    that same surviving ancestor, or goes when there is none. A `jointmerge` pair naming a
-    dropped solid goes and a `rootname` naming one takes its surviving ancestor. Everything
-    else, the other surfaces included, is copied as it was.
 
-    Returns (bytes, {old ordinal: new ordinal or None}, [dropped solid names], [names of
-    solids left with no parent]). Dropping every solid raises `PhyError`: `phyheader_t`
-    with no solid is a file `Phy` itself refuses to read.
+def move_surface(s, m):
+    """`s` rebuilt with every point taken through `m`, a 3x4 in HL inches, its ledges and
+    triangles in their order and its `dummy` words kept."""
+    det = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+           - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+           + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+    if not det > 0:
+        raise PhyError(f"a matrix of determinant {det} would turn the hull inside out")
+
+    def go(p):
+        x, y, z = ivp_to_hl(p)
+        return hl_to_ivp([r[0] * x + r[1] * y + r[2] * z + r[3] for r in m])
+
+    out = build_surface([[tuple(go(s.points[i]) for i in tri) for tri in ledge_triangles(l)]
+                         for l in s.ledges])
+    out.dummy = s.dummy
+    return out
+
+
+def drop_solids(data, names, moves=None):
+    """`data` with every solid named for one of `names` taken out or moved, and what that did.
+
+    The engine matches a solid to its bone with `stricmp`, so `names` match case-blind. A
+    solid with no parent and more than one child solid moves when `moves` names its bone:
+    {bone: (the bone taking it, the 3x4 from the old bone's space to its in HL inches, its
+    rest transform in model space)}, unless a solid already carries that name. Its points go
+    through the matrix, and its `name` and every `parent`, `rootname` and `jointmerge` part
+    naming it take the new name, its `origin`/`angles` the rest transform. A joint's limits
+    are about its child's own bone axes (source-2003 `ragdoll_shared.cpp:83`), so the joints
+    are copied.
+
+    Every other named solid is dropped: its binary record and `solid` block go; the
+    survivors' `index` values close up; a survivor whose `parent` named a dropped solid takes
+    that solid's parent, up the chain to the first that survives. A `ragdollconstraint` whose
+    child was dropped goes; one whose parent was dropped moves to that same surviving
+    ancestor. A `jointmerge` pair naming a dropped solid goes and a `rootname` naming one
+    takes its surviving ancestor. Everything else, the other surfaces included, is copied.
+
+    Returns (bytes, {old ordinal: new ordinal or None}, [dropped solid names], [(moved solid
+    name, name now)]). Raises `PhyError` when every solid would be dropped, and its
+    `RagdollSplit` when a drop would leave more solids with no parent than the file had.
     """
     start = text_start(data)
     size, ident, count, checksum = HEADER.unpack_from(data)
@@ -1061,14 +1102,9 @@ def drop_solids(data, names):
 
     low = [kv.get(b"name", ((b"",),))[0][0].lower() for kv, _ in solids]
     drop = {n.lower().encode("latin-1") for n in names}
-    gone = [k for k in range(count) if low[k] in drop]
-    if not gone:
+    named = [k for k in range(count) if low[k] in drop]
+    if not named:
         return bytes(data), {k: k for k in range(count)}, [], []
-    keep = [k for k in range(count) if k not in gone]
-    if not keep:
-        raise PhyError("every solid would be dropped, and a .phy holds at least one")
-    remap = {k: None for k in gone}
-    remap.update((k, i) for i, k in enumerate(keep))
     by_name = {}
     for k in range(count):
         by_name.setdefault(low[k], k)
@@ -1076,6 +1112,32 @@ def drop_solids(data, names):
     def parent_of(k):
         v = solids[k][0].get(b"parent")
         return by_name.get(v[0][0].lower()) if v else None
+
+    kids = [0] * count
+    for k in range(count):
+        if parent_of(k) is not None:
+            kids[parent_of(k)] += 1
+    to = {}
+    taken = set(low)
+    want = {b.lower().encode("latin-1"): v for b, v in (moves or {}).items()}
+    for k in named:
+        if parent_of(k) is not None or kids[k] < 2 or low[k] not in want:
+            continue
+        p = want[low[k]][0].encode("latin-1")
+        if p.lower() in taken:
+            continue
+        taken.add(p.lower())
+        to[k] = p
+    drop -= {low[k] for k in to}
+    gone = [k for k in named if k not in to]
+    keep = [k for k in range(count) if k not in gone]
+    if not keep:
+        raise PhyError("every solid would be dropped, and a .phy holds at least one")
+    remap = {k: None for k in gone}
+    remap.update((k, i) for i, k in enumerate(keep))
+
+    def name_of(k):
+        return to.get(k, solids[k][0][b"name"][0][0])
 
     def survivor(k):
         """The nearest solid up `k`'s parent chain that survives, `k` included."""
@@ -1085,8 +1147,11 @@ def drop_solids(data, names):
             k = parent_of(k)
         return k if k is not None and remap[k] is not None else None
 
+    def put(v, b):
+        return v[1], v[2], b if v[3] else b'"' + b + b'"'
+
     edits = []
-    orphaned = []
+    loose = []
     for k in gone:
         edits.append(_line(text, *solids[k][1]))
     for k in keep:
@@ -1094,16 +1159,29 @@ def drop_solids(data, names):
         v = kv[b"index"][0]
         if remap[k] != k:
             edits.append((v[1], v[2], str(remap[k]).encode()))
+        if k in to:
+            edits.append(put(kv[b"name"][0], to[k]))
+            rest = want[low[k]][2]
+            if b"origin" in kv and b"angles" in kv:
+                edits.append(put(kv[b"origin"][0], " ".join(
+                    float_text(r[3]) for r in rest).encode()))
+                edits.append(put(kv[b"angles"][0], " ".join(
+                    float_text(a) for a in matrix_angles(rest)).encode()))
         p = parent_of(k)
-        if p is not None and remap[p] is None:
-            s = survivor(p)
-            if s is None:
-                edits.append(_line(text, *kv[b"parent"][1]))
-                orphaned.append(kv[b"name"][0][0].decode("latin-1"))
-            else:
-                v = kv[b"parent"][0]
-                name = solids[s][0][b"name"][0][0]
-                edits.append((v[1], v[2], name if v[3] else b'"' + name + b'"'))
+        if p is None:
+            continue
+        s = survivor(p)
+        if s is None:
+            edits.append(_line(text, *kv[b"parent"][1]))
+            loose.append(name_of(k).decode("latin-1"))
+        elif s != p or s in to:
+            edits.append(put(kv[b"parent"][0], name_of(s)))
+    had = sum(parent_of(k) is None for k in range(count))
+    if sum(parent_of(k) is None for k in keep) + len(loose) > had:
+        raise RagdollSplit(
+            "dropping %s would leave %s with no parent solid, a ragdoll in pieces"
+            % (", ".join(repr(solids[k][0][b"name"][0][0].decode("latin-1")) for k in gone),
+               ", ".join(repr(n) for n in loose)))
 
     for name, pairs, span in spans:
         n = name[0].lower()
@@ -1134,19 +1212,39 @@ def drop_solids(data, names):
                     continue
                 key = k[0].lower()
                 if key == b"jointmerge":
-                    if any(p.lower() in drop for p in v[0].split(b",")):
+                    parts = v[0].split(b",")
+                    if any(p.lower() in drop for p in parts):
                         edits.append(_line(text, *s))
+                        continue
+                    now = [name_of(by_name[p.lower()]) if p.lower() in by_name
+                           and by_name[p.lower()] in to else p for p in parts]
+                    if now != parts:
+                        edits.append(put(v, b",".join(now)))
+                elif key == b"rootname" and v[0].lower() in by_name:
+                    r = by_name[v[0].lower()]
+                    if r in to:
+                        edits.append(put(v, to[r]))
+                    elif v[0].lower() in drop:
+                        r = survivor(r)
+                        edits.append(put(v, name_of(r) if r is not None else b""))
                 elif key == b"rootname" and v[0].lower() in drop:
-                    r = survivor(by_name[v[0].lower()]) if v[0].lower() in by_name else None
-                    name = solids[r][0][b"name"][0][0] if r is not None else b""
-                    edits.append((v[1], v[2], name if v[3] else b'"' + name + b'"'))
+                    edits.append(put(v, b""))
 
     edits.sort(reverse=True)
     for lo, hi, *b in edits:
         text = text[:lo] + (b[0] if b else b"") + text[hi:]
-    head = HEADER.pack(size, ident, len(keep), checksum)
-    out = head + b"".join(records[k] for k in keep) + text
-    return out, remap, [solids[k][0][b"name"][0][0].decode("latin-1") for k in gone], orphaned
+    out = [HEADER.pack(size, ident, len(keep), checksum)]
+    surfaces = Phy(data).solids if to else None
+    for k in keep:
+        if k in to:
+            b = surface_bytes(move_surface(surfaces[k], want[low[k]][1]))
+            out.append(struct.pack("<i", len(b)) + b)
+        else:
+            out.append(records[k])
+    return (b"".join(out) + text, remap,
+            [solids[k][0][b"name"][0][0].decode("latin-1") for k in gone],
+            [(solids[k][0][b"name"][0][0].decode("latin-1"), to[k].decode("latin-1"))
+             for k in sorted(to)])
 
 
 def solid_names(data):

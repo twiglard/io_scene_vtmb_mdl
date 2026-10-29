@@ -1588,14 +1588,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             % (phy["file"], "" if len(phy["dropped"]) == 1 else "s",
                                ", ".join(repr(n) for n in phy["dropped"]),
                                "" if len(phy["dropped"]) == 1 else "s"))
-            if phy["orphaned"]:
-                self.report({"WARNING"},
-                            "%s: %s lost every solid above %s, so %s no ragdoll joint and "
-                            "will move on %s own"
-                            % (phy["file"], ", ".join(repr(n) for n in phy["orphaned"]),
-                               "it" if len(phy["orphaned"]) == 1 else "them",
-                               "it has" if len(phy["orphaned"]) == 1 else "they have",
-                               "its" if len(phy["orphaned"]) == 1 else "their"))
+            for a, b in phy["moved"]:
+                self.report({"INFO"},
+                            "%s: the solid of %r moved to %r, which its child bones now "
+                            "hang from, so the ragdoll stays in one piece"
+                            % (phy["file"], a, b))
             if phy["rewritten"]:
                 self.report({"INFO"},
                             "%s rewritten for the renamed bones: %s"

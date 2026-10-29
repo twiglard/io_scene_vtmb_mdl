@@ -4989,33 +4989,58 @@ def phy_bone_names(path, names, data=None):
     return set(n for n in names if n in quoted)
 
 
-def rewrite_phy(source, dest, pairs, content=None, removed=()):
+def phy_moves(d, m, donor_pose):
+    """`phy.drop_solids`' `moves` for the bones this export removed: {removed bone: (the
+    parent it is followed up to, the first that survives; the 3x4 from the removed bone's
+    donor space to that bone's space as written; that bone's rest transform in model space)},
+    file names throughout. `donor_pose` is every donor bone's `posetobone`, read before the
+    removal restamped `d`'s."""
+    at = {b.name: k for k, b in enumerate(m.bones)}
+    out = {}
+    for b in getattr(m, "gone", {}):
+        p = m.gone[b]
+        while p in m.gone:
+            p = m.gone[p]
+        if p not in at:
+            continue
+        flat = struct.unpack_from("<12f", d.bones[at[p]].raw, 0x58)
+        p2b = [list(flat[0:4]), list(flat[4:8]), list(flat[8:12])]
+        out[b] = (p, mdl_mod.mat_mul(p2b, mdl_mod.mat_inverse(donor_pose[b])),
+                  mdl_mod.mat_inverse(p2b))
+    return out
+
+
+def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None):
     """The donor's `.phy` as this export leaves it: every solid named for a bone in
-    `removed` dropped (the user, 2026-10-29), then its bone names following `pairs`, every
-    remaining bone's (file name, name now) in file order. `write_phy` puts it beside `dest`
-    once the `.mdl` is written.
+    `removed` dropped (the user, 2026-10-29), or moved by `moves` when it has no parent and
+    more than one child solid (the user, the same day), then its bone names following
+    `pairs`, every remaining bone's (file name, name now) in file order. `write_phy` puts it
+    beside `dest` once the `.mdl` is written.
 
     It is written when it changed, and on a save-as whether or not it did: the new model has
     no collision and no ragdoll without it (the user, 2026-10-29). None when the donor has
     no `.phy`, or an export in place changes nothing in it; else {"data": the bytes, None on
-    an error, "renamed": [(old, new)], "dropped": [solid names], "orphaned": [solids whose
-    parent chain lost every solid], "copied": where it came from when nothing changed,
-    "error"}.
+    an error, "renamed": [(old, new)], "dropped": [solid names], "moved": [(solid name, bone
+    now)], "copied": where it came from when nothing changed, "error"}. A drop that would
+    leave the ragdoll in pieces raises `SceneRefused`, so nothing is written.
     """
     try:
         where, data = donor_phy(source, content)
         if data is None:
             return None
-        out, _remap, dropped, orphaned = phy_mod.drop_solids(data, removed)
+        out, _remap, dropped, moved = phy_mod.drop_solids(data, removed, moves)
         out, changed = (phy_mod.rename_bones(out, pairs) if any(a != b for a, b in pairs)
                         else (out, []))
+    except phy_mod.RagdollSplit as e:
+        raise SceneRefused("%s: %s. Nothing was written"
+                           % (os.path.basename(phy_path(dest)), e)) from None
     except (OSError, phy_mod.PhyError) as e:
-        return {"data": None, "renamed": [], "dropped": [], "orphaned": [], "copied": None,
+        return {"data": None, "renamed": [], "dropped": [], "moved": [], "copied": None,
                 "error": str(e)}
-    if not changed and not dropped and same_file(source, dest):
+    if not changed and not dropped and not moved and same_file(source, dest):
         return None
     return {"data": out, "renamed": sorted(set(changed)), "dropped": dropped,
-            "orphaned": orphaned, "copied": None if changed or dropped else where,
+            "moved": moved, "copied": None if changed or dropped or moved else where,
             "error": None}
 
 
@@ -5027,7 +5052,7 @@ def write_phy(dest, rewrite):
         with open(phy_path(dest), "wb") as f:
             f.write(rewrite["data"])
     except OSError as e:
-        return dict(rewrite, data=None, renamed=[], dropped=[], orphaned=[], copied=None,
+        return dict(rewrite, data=None, renamed=[], dropped=[], moved=[], copied=None,
                     error=str(e))
     return rewrite
 
@@ -5042,7 +5067,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
     done = rewrite is not None and rewrite["error"] is None
     extra = {"rewritten": rewrite["renamed"] if done else [],
              "dropped": rewrite["dropped"] if done else [],
-             "orphaned": rewrite["orphaned"] if done else [],
+             "moved": rewrite["moved"] if done else [],
              "copied": rewrite["copied"] if done else None,
              "error": rewrite["error"] if rewrite is not None else None}
     if done:
@@ -5064,7 +5089,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
     gone = sorted(g["name"] for g in removed or () if g["name"] in cited)
     moved = sorted((a, b) for a, b in renamed or () if a in cited)
     if not (gone or moved or geometry_moved or extra["rewritten"] or extra["dropped"]
-            or extra["copied"] or extra["error"]):
+            or extra["moved"] or extra["copied"] or extra["error"]):
         return None
     return dict({"file": os.path.basename(phy_path(dest)), "removed": gone, "renamed": moved,
                  "geometry": geometry_moved}, **extra)
@@ -5183,6 +5208,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # and refuse by name on one the armature does not have, so a bone deleted in Blender has
     # to leave the description here or it never reaches the writer.
     d = build_mod.from_bytes(bytes(m.d))
+    donor_pose = {b.name: b.posetobone for b in m.bones}
     removed = drop_missing_bones(d, m, arm_obj)
     if removed:
         m = _EditedBones(m, d)
@@ -5634,8 +5660,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     if before_write is not None:
         before_write(d, scene["added_materials"])
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
-                              [g["name"] for g in removed])
-    if phy_rewrite is not None and phy_rewrite["dropped"]:
+                              [g["name"] for g in removed], phy_moves(d, m, donor_pose))
+    if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]):
         build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
