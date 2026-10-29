@@ -329,6 +329,13 @@ def show_skin_family(context, arm_obj, family):
     # purpose: leaving the old stamp would make the next export read every slot as renamed.
     for o in {id(o): o for o, _at, _m in plan}.values():
         blender_export.stamp_slots(o, moves.get(o.name))
+    if moved:
+        # A write to Mesh.materials sends no notifier, so a 3D view would go on drawing
+        # the old material until something else redrew it.
+        for win in context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
     arm_obj["vtmb_skin_family"] = family
     return moved, []
 
