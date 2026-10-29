@@ -35,6 +35,7 @@ a slot: edge e of triangle t is word 4t + 1 + e of the triangle array. Points ar
 IVP's axes, HL = (x, z, -y) / 0.0254.
 """
 
+import decimal
 import math
 import struct
 
@@ -379,6 +380,477 @@ def phy_bytes(f):
         out.append(struct.pack("<i", len(b)))
         out.append(b)
     out.append(f.text)
+    return b"".join(out)
+
+
+INCH = 0.0254
+
+
+def ivp_to_hl(p):
+    """IVP metres in IVP's axes to HL inches."""
+    return (p[0] / INCH, p[2] / INCH, -p[1] / INCH)
+
+
+def hl_to_ivp(p):
+    return (p[0] * INCH, -p[2] * INCH, p[1] * INCH)
+
+
+def ledge_triangles(ledge):
+    """Each triangle's three start point indices, edge 0 first."""
+    return [tuple(e.start for e in t.edges) for t in ledge.triangles]
+
+
+def _cross(p0, p1, p2):
+    """(p1 - p0) x (p2 - p0) in doubles: IVP's `calc_hesse(p0, p2, p1)`, outward on a ledge."""
+    a0, a1, a2 = p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]
+    b0, b1, b2 = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+    return (b1 * a2 - a1 * b2, b2 * a0 - a2 * b0, b0 * a1 - a0 * b1)
+
+
+PIERCE_MAX = _f32(-1e-6)    # IVP_MAX_SCAL_VAL
+
+
+def pierce_indices(points, tris):
+    """`IVP_Object_Polygon_Tetra::insert_pierce_info` over `tris` in order: each triangle not
+    yet paired takes the first whose unit normal has the least dot with its own, below
+    -1e-6, and that one takes it back, overwriting whatever it held."""
+    hesse = []
+    for i0, i1, i2 in tris:
+        n = _cross(points[i0], points[i1], points[i2])
+        q = n[0] * n[0] + n[1] * n[1] + n[2] * n[2]
+        if q <= 0.0:
+            raise PhyError(f"triangle {len(hesse)} has no area")
+        f = 1.0 / math.sqrt(q)
+        hesse.append((n[0] * f, n[1] * f, n[2] * f))
+    pierced = [None] * len(tris)
+    for i, (h0, h1, h2) in enumerate(hesse):
+        if pierced[i] is not None:
+            continue
+        best, found = PIERCE_MAX, None
+        for j, (g0, g1, g2) in enumerate(hesse):
+            s = h0 * g0 + h1 * g1 + h2 * g2
+            if s < best:
+                best, found = s, j
+        if found is None:
+            raise PhyError(f"triangle {i} faces no other: the ledge is not a closed hull")
+        pierced[i] = found
+        pierced[found] = i
+    return pierced
+
+
+MAX_TRIANGLES = 8192    # IVP_MAX_TRIANGLES_PER_LEDGE
+
+
+def opposite_indices(tris):
+    """Each edge's `opposite_index`: the word of the edge running the other way, counted
+    from this one, a triangle's header taking a word (`IVP_Compact_Ledge_Generator`)."""
+    at = {}
+    for i, t in enumerate(tris):
+        for j in range(3):
+            e = (t[j], t[(j + 1) % 3])
+            if e in at:
+                raise PhyError(f"edge {e} is used twice the same way")
+            at[e] = i * 4 + j + 1
+    out = []
+    for i, t in enumerate(tris):
+        row = []
+        for j in range(3):
+            o = at.get((t[(j + 1) % 3], t[j]))
+            if o is None:
+                raise PhyError(f"triangle {i} edge {j} has no opposite: the ledge is not closed")
+            rel = o - (i * 4 + j + 1)
+            if not -0x4000 <= rel < 0x4000:
+                raise PhyError(f"triangle {i} edge {j}: opposite {rel} words away does not "
+                               f"fit 15 bits")
+            row.append(rel)
+        out.append(row)
+    return out
+
+
+def _new_ledge(points, tris):
+    """A compact ledge over `tris`, start point indices into the surface's pooled `points`."""
+    if not 2 <= len(tris) <= MAX_TRIANGLES:
+        raise PhyError(f"a ledge of {len(tris)} triangles")
+    opp = opposite_indices(tris)
+    pierce = pierce_indices(points, tris)
+    l = Ledge.__new__(Ledge)
+    l.point_offset = l.node_offset = 0
+    l.offset = None
+    l.children, l.compact, l.dummy, l.future = 0, 1, 0, 0
+    l.n_triangles = len(tris)
+    l.size = 16 + 16 * len(tris) + 16 * len({i for t in tris for i in t})
+    l.triangles = []
+    for k, t in enumerate(tris):
+        tri = Triangle.__new__(Triangle)
+        tri.index, tri.pierce, tri.material, tri.virtual = k, pierce[k], 0, 0
+        tri.edges = []
+        for j in range(3):
+            e = Edge.__new__(Edge)
+            e.start, e.opposite, e.virtual = t[j], opp[k][j], 0
+            tri.edges.append(e)
+        l.triangles.append(tri)
+    return l
+
+
+def _terminals(n):
+    return [m.ledge for m in _preorder(n) if m.ledge is not None]
+
+
+def surface_header(points, ledges):
+    """(mass_center, rotation_inertia, upper_limit_radius, max_factor_surface_deviation) as
+    `insert_radius_in_compact_surface` sets them; `ledges` in the tree's terminal order,
+    which `get_all_ledges` returns and every loop here walks backwards."""
+    pts = [p[:3] for p in points]
+    order = list(reversed(ledges))
+    sum_det = qsum = 0.0
+    sm = [0.0, 0.0, 0.0]
+    for l in order:
+        for t in l.triangles:
+            p0, p1, p2 = (pts[e.start] for e in t.edges)
+            n = tuple(_f32(c) for c in _cross(p0, p1, p2))     # an IVP_U_Float_Point
+            det = n[0] * p0[0] + n[1] * p0[1] + n[2] * p0[2]
+            qsum += n[0] * n[0] + n[1] * n[1] + n[2] * n[2]
+            sum_det += det
+            for p in (p0, p1, p2):
+                for k in range(3):
+                    sm[k] += p[k] * det * 0.25
+    surface = math.sqrt(qsum)
+    if sum_det > surface * surface * surface * 1e-9:
+        center = [c / sum_det for c in sm]
+        a, b, c = (v * v for v in _second_moments(pts, order, center))
+        inertia = (math.sqrt(b + c), math.sqrt(a + c), math.sqrt(a + b))
+    else:
+        used = [pts[e.start] for l in ledges for t in l.triangles for e in t.edges]
+        lo = [min(p[k] for p in used) for k in range(3)]
+        hi = [max(p[k] for p in used) for k in range(3)]
+        center = [(lo[k] + hi[k]) * 0.5 for k in range(3)]
+        r = 0.5 * math.sqrt(sum((hi[k] - lo[k]) ** 2 for k in range(3)))
+        inertia = (r * r * 0.5,) * 3
+    q_max = dev_max = 0.0
+    for l in order:
+        for t in l.triangles:
+            p0, p1, p2 = (pts[e.start] for e in t.edges)
+            h = _cross(p0, p1, p2)
+            ih = 1.0 / (h[0] * h[0] + h[1] * h[1] + h[2] * h[2])
+            for p in (p0, p1, p2):
+                d = (p[0] - center[0], p[1] - center[1], p[2] - center[2])
+                q_max = max(q_max, d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+                c = (d[1] * h[2] - d[2] * h[1], d[2] * h[0] - d[0] * h[2],
+                     d[0] * h[1] - d[1] * h[0])
+                dev_max = max(dev_max, (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) * ih)
+    radius, dev = math.sqrt(q_max), math.sqrt(dev_max)
+    return (tuple(_f32(c) for c in center), tuple(_f32(c) for c in inertia), _f32(radius),
+            int(1.0 + dev / (radius * _f32(1.0 / 250.0))))
+
+
+def _second_moments(pts, ledges, center):
+    """The volume's mean squared distance from `center` along each axis, what
+    `IVP_Rot_Inertia_Solver::find_center_given_xyz` integrates edge by edge. Summed here
+    over the tetrahedra the triangles make with the centre, exactly. The stored inertia
+    differs from this by over 1e-5 on 464 of the 7353 shipped surfaces, up to 0.52; the
+    2003 code ported line by line misses as often, mostly on the same ones, so what made
+    those values is unknown."""
+    vol, m = 0.0, [0.0, 0.0, 0.0]
+    for l in ledges:
+        for t in l.triangles:
+            a, b, d = ([pts[e.start][i] - center[i] for i in range(3)] for e in t.edges)
+            v = (a[0] * (b[1] * d[2] - b[2] * d[1]) - a[1] * (b[0] * d[2] - b[2] * d[0])
+                 + a[2] * (b[0] * d[1] - b[1] * d[0])) / 6.0
+            vol += v
+            for k in range(3):
+                m[k] += v / 10.0 * (a[k] * a[k] + b[k] * b[k] + d[k] * d[k]
+                                    + a[k] * b[k] + a[k] * d[k] + b[k] * d[k])
+    return [x / vol if vol >= 1e-19 else 1.0 for x in m]
+
+
+def build_surface(ledges, tag=IVPS):
+    """A compact surface over `ledges`, each a list of triangles, each three (x, y, z) points
+    in IVP metres wound counter-clockwise seen from outside, as a ledge must be closed and
+    convex. Points pool across the ledges in first-use order, equal coordinates shared, as
+    `IVP_SurfaceBuilder_Ledge_Soup` pools them; triangles keep the order given."""
+    points, at, tri_sets = [], {}, []
+    for tris in ledges:
+        rows = []
+        for tri in tris:
+            row = []
+            for p in tri:
+                key = (_f32(p[0]), _f32(p[1]), _f32(p[2]))
+                if key not in at:
+                    at[key] = len(points)
+                    points.append(key + (0,))
+                row.append(at[key])
+            rows.append(tuple(row))
+        tri_sets.append(rows)
+    if len(points) > 0x10000:
+        raise PhyError(f"{len(points)} points do not fit a 16-bit start index")
+    s = Surface.__new__(Surface)
+    s.points = points
+    s.ledges = [_new_ledge(points, rows) for rows in tri_sets]
+    s.root = build_tree(points, s.ledges)
+    (s.mass_center, s.rotation_inertia, s.upper_limit_radius,
+     s.max_deviation) = surface_header(points, _terminals(s.root))
+    if not 0 < s.max_deviation < 256:
+        raise PhyError(f"surface deviation step {s.max_deviation} does not fit a byte")
+    s.dummy = bytes(8) + tag
+    return s
+
+
+def surface_volume(s):
+    """The surface's volume in cubic inches, summed over its ledges' triangles."""
+    v = 0.0
+    for l in s.ledges:
+        for t in l.triangles:
+            a, b, c = (ivp_to_hl(s.points[e.start]) for e in t.edges)
+            v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                  + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+    return v
+
+
+def convex_hull(points):
+    """Triangles (i, j, k) indexing `points`, counter-clockwise seen from outside, over their
+    hull; a point inside or on it is left out, and of equal points the first is used.
+
+    Quickhull in exact integer arithmetic (each float scaled by one common power of two), so
+    every side-of-plane test is exact; hull the coordinates the file will hold. A face whose
+    plane holds the new point is replaced too, so no triangle has a point on the line
+    through a hull edge. A flat set gives IVP's two-sided ledge (`_flat_hull`). Raises on
+    fewer than three distinct points, a set on one line, or a result some point lies outside
+    of."""
+    first, pts = {}, []
+    for i, p in enumerate(points):
+        key = (float(p[0]), float(p[1]), float(p[2]))
+        if key not in first:
+            first[key] = i
+            pts.append(key)
+    index = list(first.values())
+    if len(pts) < 3:
+        raise PhyError(f"{len(pts)} distinct points make no hull")
+    ratios = [x.as_integer_ratio() for p in pts for x in p]
+    den = max(d for _, d in ratios)
+    flat = [n * (den // d) for n, d in ratios]
+    P = [tuple(flat[3 * i:3 * i + 3]) for i in range(len(pts))]
+
+    def sub(a, b):
+        return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+    def crs(a, b):
+        return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+    def dot(a, b):
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+    ax = max(range(3), key=lambda k: max(q[k] for q in P) - min(q[k] for q in P))
+    i0 = min(range(len(P)), key=lambda i: P[i][ax])
+    i1 = max(range(len(P)), key=lambda i: P[i][ax])
+    d01 = sub(P[i1], P[i0])
+    i2 = max(range(len(P)), key=lambda i: dot(crs(d01, sub(P[i], P[i0])),
+                                              crs(d01, sub(P[i], P[i0]))))
+    n = crs(d01, sub(P[i2], P[i0]))
+    if n == (0, 0, 0):
+        raise PhyError("every point is on one line")
+    i3 = max(range(len(P)), key=lambda i: abs(dot(n, sub(P[i], P[i0]))))
+    if dot(n, sub(P[i3], P[i0])) == 0:
+        return [tuple(index[i] for i in t) for t in _flat_hull(P, n)]
+
+    # faces[f] = [(a, b, c), normal, offset, outside points]; a point q is outside when
+    # dot(normal, q) > offset.
+    faces = {}
+    edge_face = {}
+    serial = [0]
+
+    def make(a, b, c):
+        nn = crs(sub(P[b], P[a]), sub(P[c], P[a]))
+        f = serial[0]
+        serial[0] += 1
+        faces[f] = [(a, b, c), nn, dot(nn, P[a]), []]
+        for e in ((a, b), (b, c), (c, a)):
+            edge_face[e] = f
+        return f
+
+    def outward(a, b, c, d):
+        if dot(crs(sub(P[b], P[a]), sub(P[c], P[a])), sub(P[d], P[a])) < 0:
+            return a, b, c
+        return a, c, b
+
+    new = [make(*outward(i0, i1, i2, i3)), make(*outward(i0, i1, i3, i2)),
+           make(*outward(i0, i2, i3, i1)), make(*outward(i1, i2, i3, i0))]
+
+    def assign(idx, cands):
+        for i in idx:
+            for f in cands:
+                fc = faces[f]
+                if dot(fc[1], P[i]) > fc[2]:
+                    fc[3].append(i)
+                    break
+
+    assign([i for i in range(len(P)) if i not in (i0, i1, i2, i3)], new)
+    todo = list(new)
+    while todo:
+        f = todo.pop()
+        if f not in faces or not faces[f][3]:
+            continue
+        fc = faces[f]
+        p = max(fc[3], key=lambda i: dot(fc[1], P[i]))
+        visible, stack = {f}, [f]
+        while stack:
+            a, b, c = faces[stack.pop()][0]
+            for e in ((b, a), (c, b), (a, c)):
+                h = edge_face[e]
+                if h not in visible and dot(faces[h][1], P[p]) >= faces[h][2]:
+                    visible.add(h)
+                    stack.append(h)
+        horizon, orphans = [], []
+        for g in visible:
+            a, b, c = faces[g][0]
+            for e in ((a, b), (b, c), (c, a)):
+                if edge_face[(e[1], e[0])] not in visible:
+                    horizon.append(e)
+            orphans += faces[g][3]
+        if len({a for a, _ in horizon}) != len(horizon):
+            raise PhyError(f"the faces point {index[p]} sees do not make one patch")
+        for g in visible:
+            a, b, c = faces[g][0]
+            for e in ((a, b), (b, c), (c, a)):
+                if edge_face.get(e) == g:
+                    del edge_face[e]
+            del faces[g]
+        new = [make(a, b, p) for a, b in horizon]
+        assign([i for i in orphans if i != p], new)
+        todo += new
+    out = []
+    for f in sorted(faces):
+        fc = faces[f]
+        if fc[1] == (0, 0, 0):
+            raise PhyError(f"hull face {fc[0]} has no area")
+        for e in ((fc[0][0], fc[0][1]), (fc[0][1], fc[0][2]), (fc[0][2], fc[0][0])):
+            if (e[1], e[0]) not in edge_face:
+                raise PhyError(f"hull edge {e} has no face across it")
+        for i, q in enumerate(P):
+            if dot(fc[1], q) > fc[2]:
+                raise PhyError(f"point {index[i]} lies outside hull face {fc[0]}")
+        out.append(tuple(index[i] for i in fc[0]))
+    return out
+
+
+def _flat_hull(P, n):
+    """IVP's ledge for a flat set: qhull fails on it, the retry with `QJ` joggles the points
+    into a hull, and the ledge keeps the points unjoggled, so it is the outline triangulated
+    once facing `n` and once facing away, 2V - 4 triangles. Three points give the same two
+    triangles `convert_triangle_to_compace_ledge` writes. Exact: the outline is taken in
+    the two axes `n` leans least along, where the turn of three points keeps its sign."""
+    k = max(range(3), key=lambda m: abs(n[m]))
+    u, v = (k + 1) % 3, (k + 2) % 3
+
+    def turn(o, a, b):
+        return ((P[a][u] - P[o][u]) * (P[b][v] - P[o][v])
+                - (P[a][v] - P[o][v]) * (P[b][u] - P[o][u]))
+
+    order = sorted(range(len(P)), key=lambda i: (P[i][u], P[i][v]))
+    ring = []
+    for seq in (order, order[::-1]):
+        c = []
+        for i in seq:
+            while len(c) >= 2 and turn(c[-2], c[-1], i) <= 0:
+                c.pop()
+            c.append(i)
+        ring += c[:-1]
+    if n[k] < 0:
+        ring.reverse()
+    # The far side fans from the next corner, so the two sides share no diagonal and every
+    # edge is used once each way, as on the joggled hull.
+    far = ring[1:] + ring[:1]
+    return ([(ring[0], ring[m], ring[m + 1]) for m in range(1, len(ring) - 1)]
+            + [(far[0], far[m + 1], far[m]) for m in range(1, len(far) - 1)])
+
+
+SIX_PLACES = decimal.Decimal("0.000001")
+
+
+def float_text(x):
+    """A value as studiomdl's `KeyWriteFloat` prints it: a float through `%f`. A float exactly
+    halfway between two sixth decimals rounds away from zero, as the shipped text does
+    (4610.9765625 is 4610.976563) and Python's `%f` does not."""
+    return format(decimal.Decimal(_f32(x)).quantize(SIX_PLACES, decimal.ROUND_HALF_UP), "f")
+
+
+def keyvalues(blocks):
+    """The text half from (block name, [(key, value)]) pairs, each line as studiomdl's
+    `fprintf` writes it, then the NUL `VCollideLoad` stops at."""
+    out = []
+    for name, pairs in blocks:
+        out.append(f"{name} {{\n")
+        for k, v in pairs:
+            if '"' in k or '"' in v or "\0" in k or "\0" in v:
+                raise PhyError(f"a quote or NUL in {k!r} {v!r}")
+            out.append(f'"{k}" "{v}"\n')
+        out.append("}\n")
+    return "".join(out).encode("latin-1") + b"\0"
+
+
+def masses(volumes, massbiases, totalmass):
+    """studiomdl's `WriteCollisionModel`: each solid's share of `totalmass` by volume times
+    massbias, at least 1."""
+    total = sum(v * b for v, b in zip(volumes, massbiases))
+    if total <= 0:
+        total = 1.0
+    return [max(1.0, v * b / total * totalmass) for v, b in zip(volumes, massbiases)]
+
+
+AXES = ("x", "y", "z")
+
+
+def text_half(solids, joints=(), rootname="", totalmass=1.0, concave=False, jointmerge=()):
+    """The text half of a new `.phy`, in the key order of every shipped one.
+
+    `solids`: dicts with `name`, `surfaceprop`, `volume` (cubic inches), and optionally
+    `parent`, `origin` and `angles` (three floats each, written together or not at all),
+    `massbias`, and `mass`, `damping`, `rotdamping`, `inertia`, which default to `masses`'
+    share and studiomdl's 0, 0, 1. `joints`: (parent ordinal, child ordinal, limits), the
+    limits x, y, z each min, max, friction; studiomdl's memset leaves all nine 0, rigid."""
+    if solids and "mass" in solids[0]:
+        mass = [s["mass"] for s in solids]
+    else:
+        mass = masses([s["volume"] for s in solids], [s.get("massbias", 1.0) for s in solids],
+                      totalmass)
+    out = []
+    for i, s in enumerate(solids):
+        kv = [("index", str(i)), ("name", s["name"])]
+        if s.get("parent") is not None:
+            kv.append(("parent", s["parent"]))
+        if s.get("origin") is not None:
+            kv.append(("origin", " ".join(float_text(x) for x in s["origin"])))
+            kv.append(("angles", " ".join(float_text(x) for x in s["angles"])))
+        kv += [("mass", float_text(mass[i])), ("surfaceprop", s["surfaceprop"]),
+               ("damping", float_text(s.get("damping", 0.0))),
+               ("rotdamping", float_text(s.get("rotdamping", 0.0))),
+               ("inertia", float_text(s.get("inertia", 1.0))),
+               ("volume", float_text(s["volume"]))]
+        if s.get("massbias") is not None:
+            kv.append(("massbias", float_text(s["massbias"])))
+        out.append(("solid", kv))
+    for parent, child, limits in joints:
+        kv = [("parent", str(parent)), ("child", str(child))]
+        for a, k in enumerate(AXES):
+            for m, key in enumerate(("min", "max", "friction")):
+                kv.append((k + key, float_text(limits[3 * a + m])))
+        out.append(("ragdollconstraint", kv))
+    kv = [("rootname", rootname), ("totalmass", float_text(totalmass))]
+    if concave:
+        kv.append(("concave", "1"))
+    kv += [("jointmerge", "%s,%s" % pair) for pair in jointmerge]
+    out.append(("editparams", kv))
+    return keyvalues(out)
+
+
+def phy_file(checksum, surfaces, text):
+    """A whole `.phy` from surfaces made by `build_surface` (or read), and `keyvalues`'
+    text."""
+    out = [HEADER.pack(HEADER.size, 0, len(surfaces), checksum)]
+    for s in surfaces:
+        b = surface_bytes(s)
+        out.append(struct.pack("<i", len(b)))
+        out.append(b)
+    out.append(text)
     return b"".join(out)
 
 
