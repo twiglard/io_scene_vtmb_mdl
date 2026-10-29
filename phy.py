@@ -1124,10 +1124,20 @@ def break_count(text):
     return sum(1 for name, _p, _l in walk_collision_text(text)[0] if name == "break")
 
 
+def break_model(pairs):
+    """The `model` a `break` block's pairs leave in `CBreakParser`'s `modelName`, or None with
+    no `model` key: each one overwrites it, so the last (source-2003 `dlls/props.cpp:1330`)."""
+    out = None
+    for k, v in pairs:
+        if k == "model":
+            out = v
+    return out
+
+
 def check_collision_text(s):
     """What stops `s` going in as `collision_text`: [message]. `walk_collision_text`'s, then a
     `break` block, one piece the prop breaks into (`CBreakParser`, source-2003
-    `dlls/props.cpp:1330`), with no `model` or an empty one, which the engine spawns as
+    `dlls/props.cpp:1330`), whose `model` is missing or empty, which the engine spawns as
     `models/.mdl`."""
     if "\0" in s:
         return ["a NUL, which ends the text there"]
@@ -1137,7 +1147,7 @@ def check_collision_text(s):
         return ["%r has no latin-1 form" % s[e.start:e.end]]
     out, errs = walk_collision_text(b)
     for name, pairs, line in out:
-        if name == "break" and not any(k == "model" and v for k, v in pairs):
+        if name == "break" and not break_model(pairs):
             errs.append("the break block on line %d has no model" % line)
     return errs
 
