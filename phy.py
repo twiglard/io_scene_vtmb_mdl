@@ -1013,6 +1013,135 @@ def block_spans(text):
     return out
 
 
+# What studiomdl writes from the collision model. Anything after them is its `$collisiontext`,
+# copied in after `editparams` (source-2003 `collisionmodel.cpp:1708`).
+OWN_BLOCKS = (b"solid", b"ragdollconstraint", b"editparams")
+MAX_KEYVALUE = 1024     # vcollide_parse_private.h: a token this long leaves the last key
+
+
+def _tail(text):
+    """[lo, hi) of the text after the last `OWN_BLOCKS` block's line, up to the NUL."""
+    lo = 0
+    for name, _p, span in block_spans(text):
+        if name[0].lower() in OWN_BLOCKS:
+            lo = _line(text, *span)[1]
+    hi = text.find(b"\0", lo)
+    return lo, len(text) if hi < 0 else hi
+
+
+def collision_text(data):
+    """The text half after its last `solid`, `ragdollconstraint` or `editparams` block, up to
+    the NUL, latin-1: studiomdl's `$collisiontext`, the `break` blocks of 132 shipped files."""
+    text = bytes(data[text_start(data):])
+    lo, hi = _tail(text)
+    return text[lo:hi].decode("latin-1")
+
+
+def with_collision_text(data, new):
+    """`data` with `collision_text` replaced by the bytes `new`."""
+    start = text_start(data)
+    text = bytes(data[start:])
+    lo, hi = _tail(text)
+    return bytes(data[:start]) + text[:lo] + new + text[hi:]
+
+
+def walk_collision_text(text):
+    """`collision_text` as the engine reads it after `editparams` (`CVPhysicsParse::NextBlock`
+    and `ParseCustom`, source-2003 `vphysics/vcollide_parse.cpp`): ([(name, [(key, value)],
+    line)], [what is wrong]), names and keys lowercased as the engine lowercases them, values
+    as written. A `{` inside a block opens no block of its own, so the blocks after it are
+    read as part of it, and a pair outside any block can swallow the next block's name."""
+    t = tokens(text)
+
+    def line(tok):
+        return text.count(b"\n", 0, tok[1]) + 1
+
+    out, errs = [], []
+    for tok in t:
+        if len(tok[0]) >= MAX_KEYVALUE:
+            errs.append("line %d has a %d-character token, and the engine reads none of %d "
+                        "or more" % (line(tok), len(tok[0]), MAX_KEYVALUE))
+    i, stray = 0, None
+    while i < len(t):
+        key = t[i]
+        if key[0] == b"}":
+            i += 1
+            continue
+        value = t[i + 1] if i + 1 < len(t) else None
+        i += 2
+        if value is None or value[0] != b"{":
+            if line(key) != stray:
+                stray = line(key)
+                errs.append("line %d, from %r on, is outside any block, and the engine skips "
+                            "it up to a name followed by {" % (stray, key[0].decode("latin-1")))
+            continue
+        pairs, depth, closed = [], 0, False
+        while i < len(t):
+            k = t[i]
+            if k[0] == b"}":
+                i += 1
+                depth -= 1
+                if depth < 0:
+                    closed = True
+                    break
+                continue
+            if k[0] == b"{":
+                i += 1
+                depth += 1
+                errs.append("the %s block on line %d has a { on line %d" % (
+                    key[0].decode("latin-1"), line(key), line(k)))
+                continue
+            v = t[i + 1] if i + 1 < len(t) else None
+            i += 2
+            if v is not None and v[0] == b"{":
+                depth += 1
+                errs.append("the %s block on line %d has a %r { on line %d, so what follows "
+                            "is read as part of it: a key before it has no value, or a } is "
+                            "missing" % (key[0].decode("latin-1"), line(key),
+                                         k[0].decode("latin-1"), line(k)))
+                continue
+            if k[0][:1] == b"}":
+                depth -= 1
+                if depth < 0:
+                    closed = True
+                    break
+                continue
+            pairs.append((k[0].lower().decode("latin-1"),
+                          v[0].decode("latin-1") if v is not None else None))
+        name = key[0].lower()
+        if not closed:
+            errs.append("the %s block on line %d has no closing }" % (name.decode("latin-1"),
+                                                                     line(key)))
+        if name in OWN_BLOCKS:
+            errs.append("the %s block on line %d is written from the collision hulls, and a "
+                        "second one here would be read as another" % (name.decode(), line(key)))
+        out.append((name.decode("latin-1"), pairs, line(key)))
+    return out, errs
+
+
+def break_count(text):
+    """How many `break` blocks the engine reads in `collision_text` bytes `text`."""
+    return sum(1 for name, _p, _l in walk_collision_text(text)[0] if name == "break")
+
+
+def check_collision_text(s):
+    """What stops `s` going in as `collision_text`: [message]. `walk_collision_text`'s, then a
+    `break` block, one piece the prop breaks into (`CBreakParser`, source-2003
+    `dlls/props.cpp:1330`), with no `model` or an empty one, which the engine spawns as
+    `models/.mdl`."""
+    if "\0" in s:
+        return ["a NUL, which ends the text there"]
+    try:
+        b = s.encode("latin-1")
+    except UnicodeEncodeError as e:
+        return ["%r has no latin-1 form" % s[e.start:e.end]]
+    out, errs = walk_collision_text(b)
+    for name, pairs, line in out:
+        if name == "break" and not any(k == "model" and v for k, v in pairs):
+            errs.append("the break block on line %d has no model" % line)
+    return errs
+
+
 def _line(text, lo, hi):
     """[lo, hi) widened over the whitespace after it, through the first newline, so a
     removed line leaves no blank one."""

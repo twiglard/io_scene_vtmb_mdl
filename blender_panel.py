@@ -1146,6 +1146,53 @@ class VTMB_OT_check_hull(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# Keys `CBreakParser` reads beside `model` (source-2003 `dlls/props.cpp:1330`): health 1,
+# offset 0 0 0, fadetime 0, burst and debris the prop's when unset.
+BREAK_BLOCK = 'break {\n"model" ""\n"health" "1"\n}\n'
+
+
+class VTMB_OT_add_break(bpy.types.Operator):
+    bl_idname = "vtmb.add_break"
+    bl_label = "Add break piece"
+    bl_description = ("A break block in the armature's collision text, the Text written into "
+                      "the .phy after editparams: one model the prop breaks into, its path "
+                      "under models/ to be filled in. An empty one stops the export")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj is not None and obj.type == "ARMATURE"
+
+    def execute(self, context):
+        arm_obj = context.object
+        t = arm_obj.get("vtmb_phy_collisiontext")
+        if not isinstance(t, bpy.types.Text):
+            t = bpy.data.texts.new("%s.collisiontext" % arm_obj.name)
+            arm_obj["vtmb_phy_collisiontext"] = t
+        s = t.as_string()
+        t.from_string(s + ("\n" if s and not s.endswith("\n") else "") + BREAK_BLOCK)
+        shown = 0
+        for area in context.screen.areas if context.screen else ():
+            if area.type == "TEXT_EDITOR":
+                area.spaces.active.text = t
+                shown += 1
+        self.report({"INFO"}, "a break block added to %s: %s fill in its model" % (
+            t.name, "in the Text Editor," if shown else "open it in a Text Editor and"))
+        return {"FINISHED"}
+
+
+def break_line(arm_obj):
+    """What the panel says of the armature's collision text."""
+    if "vtmb_phy_collisiontext" not in arm_obj:
+        return "no break piece"
+    t = arm_obj["vtmb_phy_collisiontext"]
+    if not isinstance(t, bpy.types.Text):
+        return "no break piece: its Text was deleted, so the export writes none"
+    n = phy_mod.break_count(t.as_string().encode("latin-1", "replace"))
+    return "%d break piece%s, in %s" % (n, "" if n == 1 else "s", t.name)
+
+
 # What the export writes for a `solid` value the object does not carry: studiomdl's
 # (source-2003 `collisionmodel.cpp:246`, `:523`), or the file's where it edits one.
 HULL_DEFAULTS = {"mass": "a share of the total mass by volume", "surfaceprop": "the model's",
@@ -1258,6 +1305,9 @@ def draw_accessories(lay, context, arm_obj):
     hulls = blender_export.hull_objects(arm_obj)
     lay.label(text="%d collision hull%s" % (len(hulls), "" if len(hulls) == 1 else "s"),
               icon="INFO")
+    row = lay.row(align=True)
+    row.operator("vtmb.add_break", icon="MOD_EXPLODE")
+    row.label(text=break_line(arm_obj))
     line, over = cloth_volume_line(arm_obj)
     lay.label(text=line, icon="INFO")
     if over:
@@ -3832,7 +3882,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_PT_cloth, VTMB_PT_material,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_OT_add_cloth_capsule,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
-           VTMB_OT_add_hull_from_weights, VTMB_OT_check_hull, VTMB_PT_hull,
+           VTMB_OT_add_hull_from_weights, VTMB_OT_check_hull, VTMB_OT_add_break, VTMB_PT_hull,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,

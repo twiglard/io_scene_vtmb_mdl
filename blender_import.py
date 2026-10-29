@@ -858,8 +858,11 @@ def build_hulls(context, m, arm_obj, name, scale, content):
     parents to the armature object. Its `solid` values and, on a joint's child, the nine
     `ragdollconstraint` limits are properties of the object. `vtmb_phy_solids` on the
     armature says every solid got its object, so a missing one was deleted, and
-    `editparams`' `totalmass` and `rootname` go on it for an export with no donor `.phy`."""
+    `editparams`' `totalmass` and `rootname` go on it for an export with no donor `.phy`,
+    with the text after `editparams`, the `break` blocks, as a Text in
+    `vtmb_phy_collisiontext`, stamped `vtmb_phy_crc` so the export checks only an edit."""
     arm_obj.pop("vtmb_phy_solids", None)
+    arm_obj.pop("vtmb_phy_collisiontext", None)
     try:
         _where, data = export_mod.donor_phy(m.path, content)
         if data is None:
@@ -876,6 +879,12 @@ def build_hulls(context, m, arm_obj, name, scale, content):
         pass
     if "rootname" in edit:
         arm_obj["vtmb_phy_rootname"] = edit["rootname"]
+    tail = phy_mod.collision_text(data)
+    if tail.strip():
+        t = bpy.data.texts.new("%s.collisiontext" % name)
+        t.from_string(tail)
+        t["vtmb_phy_crc"] = export_mod.collision_crc(tail)
+        arm_obj["vtmb_phy_collisiontext"] = t
     coll = None
     made = []
     every = True

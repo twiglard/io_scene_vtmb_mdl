@@ -20,6 +20,7 @@ import os
 import re
 import struct
 import types
+import zlib
 
 import bpy
 import mathutils
@@ -5327,27 +5328,72 @@ def _dents_text(dents):
                         for o, n, c in dents))
 
 
-def hulls_phy(arm_obj, d, scale, surfaceprop, stem):
-    """A `.phy` of the armature's collision hulls alone, for a model with no donor `.phy`,
-    as studiomdl writes one (source-2003 `collisionmodel.cpp:2100`), or None when it has no
-    hull. A hull parented to a bone of `d`, named as Blender names it, is a solid named for
-    it; the solids go in bone order, each one's parent the solid of its bone's nearest
-    ancestor that owns one, with a joint carrying the object's nine limits, 0 (rigid) where
-    unset, and `origin`/`angles` the bone's rest transform, as on 7297 of the 7321 shipped
-    solids. A hull parented to the armature is a single-body prop's one solid, in model
-    space, `origin`/`angles` zero as on 2535 of the 2564 shipped, named `vtmb_phy_name` or
-    else `<stem>_phy`, the name 1082 of the 2605 shipped single-solid files carry. The
-    `solid` values come off the object, else studiomdl's: a share of the armature's
-    `vtmb_phy_totalmass` (1.0, its default) by volume, `surfaceprop`, damping 0,
-    rotdamping 0, inertia 1. Raises `SceneRefused` on a dent, a hull on a bone the
-    armature has not got, two on one bone, a hull on the armature beside any other, or
-    more than one solid with no parent.
+def collision_crc(s):
+    """What the import stamps on the collision text's Text as `vtmb_phy_crc`, or None for
+    text with no latin-1 form, which no import made."""
+    try:
+        return "%08x" % zlib.crc32(s.encode("latin-1"))
+    except UnicodeEncodeError:
+        return None
+
+
+def scene_collision_text(arm_obj, source=None, content=None):
+    """The text to write after `editparams`, out of the Text the import put on the armature
+    as `vtmb_phy_collisiontext` (`phy.collision_text`, the `break` blocks): its bytes, b""
+    when that Text was deleted, or None when the import made none, which keeps the donor's.
+    Raises `SceneRefused` when text that is neither the import's nor, with `source`, the
+    donor `.phy`'s fails `phy.check_collision_text`; text as shipped is never checked, and
+    two shipped files fail it."""
+    if "vtmb_phy_collisiontext" not in arm_obj:
+        return None
+    t = arm_obj["vtmb_phy_collisiontext"]
+    if not isinstance(t, bpy.types.Text):
+        return b""
+    s = t.as_string()
+    was = None
+    if source is not None:
+        try:
+            _where, data = donor_phy(source, content)
+            was = phy_mod.collision_text(data) if data is not None else None
+        except (OSError, phy_mod.PhyError):
+            pass
+    crc = collision_crc(s)
+    if s != was and (crc is None or t.get("vtmb_phy_crc") != crc):
+        errs = phy_mod.check_collision_text(s)
+        if errs:
+            raise SceneRefused(
+                "the collision text %r, the break blocks written after editparams: %s. Fix it "
+                "in the Text Editor, or delete the Text to write none. Nothing was written"
+                % (t.name, "; ".join(errs)))
+    return s.encode("latin-1")
+
+
+def hulls_phy(arm_obj, d, scale, stem):
+    """A `.phy` of the armature's collision hulls alone, for a model with no donor, or a
+    donor with no `.phy`, as studiomdl writes one (source-2003 `collisionmodel.cpp:2100`),
+    or None when it has no hull. A hull parented to a bone of `d`, named as Blender names
+    it, is a solid named for it; the solids go in bone order, each one's parent the solid of
+    its bone's nearest ancestor that owns one, with a joint carrying the object's nine
+    limits, 0 (rigid) where unset, and `origin`/`angles` the bone's rest transform, as on
+    7297 of the 7321 shipped solids. A hull parented to the armature is a single-body prop's
+    one solid, in model space, `origin`/`angles` zero as on 2535 of the 2564 shipped, named
+    `vtmb_phy_name` or else `<stem>_phy`, the name 1082 of the 2605 shipped single-solid
+    files carry. The `solid` values come off the object, else studiomdl's: a share of the
+    armature's `vtmb_phy_totalmass` (1.0, its default) by volume, damping 0, rotdamping 0,
+    inertia 1, and the surfaceprop of the solid's bone record, or the header's for the
+    prop's solid, since studiomdl writes all three from one `GetSurfaceProp`
+    (`write.cpp:195`): 4727 of the 4757 shipped solids named for a bone carry their bone's,
+    and 2268 of the 2564 others the header's. `scene_collision_text` goes after
+    `editparams`. Raises `SceneRefused` on a dent, a hull on a bone the armature has not
+    got, two on one bone, a hull on the armature beside any other, more than one solid with
+    no parent, or collision text that fails its check.
 
     {"surfaces": [Surface], "text": bytes, "solids": [bone names], "joints": count,
-    "totalmass": float, "parts": loose parts written}"""
+    "totalmass": float, "parts": loose parts written, "breaks": `break` blocks written}"""
     objs = hull_objects(arm_obj)
     if not objs:
         return None
+    tail = scene_collision_text(arm_obj) or b""
     at = {r.name: k for k, r in enumerate(d.bones)}
     whole = [o for o in objs if o.parent_type != "BONE"]
     if whole and len(objs) > 1:
@@ -5371,15 +5417,16 @@ def hulls_phy(arm_obj, d, scale, surfaceprop, stem):
         name = str(o.get("vtmb_phy_name") or "%s_phy" % stem)
         solid = {"name": name, "origin": (0.0, 0.0, 0.0), "angles": (0.0, 0.0, 0.0),
                  "mass": num1("mass", phy_mod.masses([vol], [1.0], totalmass)[0]),
-                 "surfaceprop": _text_prop(o, "surfaceprop", surfaceprop),
+                 "surfaceprop": _text_prop(o, "surfaceprop", d.surfaceprop or ""),
                  "damping": num1("damping", 0.0), "rotdamping": num1("rotdamping", 0.0),
                  "inertia": num1("inertia", 1.0), "volume": vol,
                  "massbias": (None if o.get("vtmb_phy_massbias") is None
                               else num1("massbias", 1.0))}
         text = phy_mod.text_half([solid], (), str(arm_obj.get("vtmb_phy_rootname", "")),
                                  totalmass, concave=len(surf.ledges) > 1)
-        return {"surfaces": [surf], "text": text, "solids": [name], "joints": 0,
-                "totalmass": totalmass, "parts": len(surf.ledges)}
+        return {"surfaces": [surf], "text": text[:-1] + tail + b"\0", "solids": [name],
+                "joints": 0, "totalmass": totalmass, "parts": len(surf.ledges),
+                "breaks": phy_mod.break_count(tail)}
     owner, dents = {}, []
     for o in objs:
         k = at.get(o.parent_bone)
@@ -5433,7 +5480,9 @@ def hulls_phy(arm_obj, d, scale, surfaceprop, stem):
                        "origin": [r[3] for r in rest],
                        "angles": phy_mod.matrix_angles(rest),
                        "mass": num(o, "mass", share[i]),
-                       "surfaceprop": _text_prop(o, "surfaceprop", surfaceprop),
+                       "surfaceprop": _text_prop(
+                           o, "surfaceprop",
+                           d.bones[k].extra.get("surfaceprop") or d.surfaceprop or ""),
                        "damping": num(o, "damping", 0.0),
                        "rotdamping": num(o, "rotdamping", 0.0),
                        "inertia": num(o, "inertia", 1.0),
@@ -5446,17 +5495,24 @@ def hulls_phy(arm_obj, d, scale, surfaceprop, stem):
     parts = sum(len(s.ledges) for s in surfaces)
     text = phy_mod.text_half(solids, joints, str(arm_obj.get("vtmb_phy_rootname", "")),
                              totalmass, concave=parts > len(surfaces))
-    return {"surfaces": surfaces, "text": text, "solids": [s["name"] for s in solids],
-            "joints": len(joints), "totalmass": totalmass, "parts": parts}
+    return {"surfaces": surfaces, "text": text[:-1] + tail + b"\0",
+            "solids": [s["name"] for s in solids], "joints": len(joints),
+            "totalmass": totalmass, "parts": parts, "breaks": phy_mod.break_count(tail)}
 
 
 def scene_hulls(arm_obj, m, source, content, scale):
-    """`read_hulls` over the donor's `.phy`, or None when the armature has no hull object.
-    Raises `SceneRefused` when it has one and the donor no `.phy` to write it into, or an
-    import that did not give every solid its object, so no hull can be matched to its
-    solid, or when the import made the hulls and every one is gone, which would leave a
-    `.phy` of no solid."""
+    """`read_hulls` over the donor's `.phy`, or None when the armature has no hull object
+    or the donor no `.phy`, which `hulls_phy` then makes from the hull objects. Raises
+    `SceneRefused` on an import that did not give every solid its object, so no hull can be
+    matched to its solid, or when the import made the hulls and every one is gone, which
+    would leave a `.phy` of no solid."""
     objs = hull_objects(arm_obj)
+    try:
+        _where, data = donor_phy(source, content)
+    except OSError:
+        data = None
+    if data is None:
+        return None
     if not objs and arm_obj.get("vtmb_phy_solids"):
         raise SceneRefused(
             "every collision hull object the import made is gone, and a .phy of no solid "
@@ -5464,19 +5520,6 @@ def scene_hulls(arm_obj, m, source, content, scale):
             "Nothing was written")
     if not objs:
         return None
-    try:
-        _where, data = donor_phy(source, content)
-    except OSError:
-        data = None
-    if data is None:
-        raise SceneRefused(
-            "%s %s collision hull%s, and the model being written over has no .phy to "
-            "write %s into: the export with a donor edits a .phy and does not make one. "
-            "Delete %s, or export with no donor (Export > VTMB model from scene), which "
-            "writes a .phy from the hulls. Nothing was written"
-            % (", ".join(repr(o.name) for o in objs[:3]) + (" ..." if len(objs) > 3 else ""),
-               "is a" if len(objs) == 1 else "are", "" if len(objs) == 1 else "s",
-               "it" if len(objs) == 1 else "them", "it" if len(objs) == 1 else "them"))
     if not arm_obj.get("vtmb_phy_solids"):
         raise SceneRefused(
             "the armature has %d collision hull object%s and its import did not make one "
@@ -5499,21 +5542,23 @@ def bone_rests(d, m):
 
 
 def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls=None,
-                m=None, rest=None):
+                m=None, rest=None, collision=None):
     """The donor's `.phy` as this export leaves it: the edits `read_hulls` found in the
     hulls (`hulls`), then every solid named for a bone in `removed` or dropped by a hull
     taken away dropped (the user, 2026-10-29), or moved by `moves` when it has no parent and
     more than one child solid (the user, the same day), then a solid added for each new
     hull (`add_hull_solids`, with `m` and `rest`), then its bone names following `pairs`,
-    every remaining bone's (file name, name now) in file order. `write_phy` puts it beside
-    `dest` once the `.mdl` is written.
+    every remaining bone's (file name, name now) in file order, then `collision`, bytes from
+    `scene_collision_text`, as its `phy.collision_text` where it differs. `write_phy` puts
+    it beside `dest` once the `.mdl` is written.
 
     It is written when it changed, and on a save-as whether or not it did: the new model has
     no collision and no ragdoll without it (the user, 2026-10-29). None when the donor has
     no `.phy`, or an export in place changes nothing in it; else {"data": the bytes, None on
     an error, "renamed": [(old, new)], "dropped": [solid names], "moved": [(solid name, bone
     now)], "added": [bones], "rebuilt": [(solid, volume was, volume now)], "edited":
-    [(solid, key, was, now)], "copied": where it came from when nothing changed, "error"}.
+    [(solid, key, was, now)], "collision": (`break` blocks was, now) when `collision` was
+    written, "copied": where it came from when nothing changed, "error"}.
     A drop that would leave the ragdoll in pieces raises `SceneRefused`, so nothing is
     written.
     """
@@ -5530,20 +5575,38 @@ def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls
             added, out = add_hull_solids(out, h["add"], m, rest or {})
         out, changed = (phy_mod.rename_bones(out, pairs) if any(a != b for a, b in pairs)
                         else (out, []))
+        retext = None
+        if collision is not None:
+            was = phy_mod.collision_text(out).encode("latin-1")
+            if collision != was:
+                out = phy_mod.with_collision_text(out, collision)
+                retext = (phy_mod.break_count(was), phy_mod.break_count(collision))
     except phy_mod.RagdollSplit as e:
         raise SceneRefused("%s: %s. Nothing was written"
                            % (os.path.basename(phy_path(dest)), e)) from None
     except (OSError, phy_mod.PhyError) as e:
         return {"data": None, "renamed": [], "dropped": [], "moved": [], "added": [],
-                "rebuilt": [], "edited": [], "copied": None, "error": str(e)}
+                "rebuilt": [], "edited": [], "collision": None, "copied": None,
+                "error": str(e)}
     edited = bool(h.get("surfaces") or h.get("values") or h.get("joints"))
-    if not (changed or dropped or moved or added or edited) and same_file(source, dest):
+    if (not (changed or dropped or moved or added or edited or retext)
+            and same_file(source, dest)):
         return None
     return {"data": out, "renamed": sorted(set(changed)), "dropped": dropped,
             "moved": moved, "added": added, "rebuilt": list(h.get("rebuilt", ())),
-            "edited": list(h.get("edited", ())),
-            "copied": (None if changed or dropped or moved or added or edited else where),
+            "edited": list(h.get("edited", ())), "collision": retext,
+            "copied": (None if changed or dropped or moved or added or edited or retext
+                       else where),
             "error": None}
+
+
+def built_phy(checksum, built):
+    """`rewrite_phy`'s result for a `.phy` `hulls_phy` made, the donor having none."""
+    return {"data": phy_mod.phy_file(checksum, built["surfaces"], built["text"]),
+            "renamed": [], "dropped": [], "moved": [], "added": [], "rebuilt": [],
+            "edited": [], "collision": None, "copied": None, "error": None,
+            "built": {k: built[k] for k in ("solids", "joints", "totalmass", "parts",
+                                            "breaks")}}
 
 
 def write_phy(dest, rewrite):
@@ -5555,7 +5618,8 @@ def write_phy(dest, rewrite):
             f.write(rewrite["data"])
     except OSError as e:
         return dict(rewrite, data=None, renamed=[], dropped=[], moved=[], added=[],
-                    rebuilt=[], edited=[], copied=None, error=str(e))
+                    rebuilt=[], edited=[], collision=None, copied=None, built=None,
+                    error=str(e))
     return rewrite
 
 
@@ -5573,7 +5637,9 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
              "added": rewrite["added"] if done else [],
              "rebuilt": rewrite["rebuilt"] if done else [],
              "edited": rewrite["edited"] if done else [],
+             "collision": rewrite.get("collision") if done else None,
              "copied": rewrite["copied"] if done else None,
+             "built": rewrite.get("built") if done else None,
              "error": rewrite["error"] if rewrite is not None else None}
     if done:
         renamed = []
@@ -5595,7 +5661,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
     moved = sorted((a, b) for a, b in renamed or () if a in cited)
     if not (gone or moved or geometry_moved or extra["rewritten"] or extra["dropped"]
             or extra["moved"] or extra["added"] or extra["rebuilt"] or extra["edited"]
-            or extra["copied"] or extra["error"]):
+            or extra["collision"] or extra["copied"] or extra["built"] or extra["error"]):
         return None
     return dict({"file": os.path.basename(phy_path(dest)), "removed": gone, "renamed": moved,
                  "geometry": geometry_moved}, **extra)
@@ -6165,14 +6231,22 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         build_mod.drop_meshes(d, bi, mi, ks)
     # Before `before_write`, which writes `.vmt` files: a dent refuses with nothing on disk.
     hulls = scene_hulls(arm_obj, m, source, content, scale)
+    # A donor with no `.phy`: the hull objects are the whole of it (the user, 2026-10-29).
+    built = (hulls_phy(arm_obj, d, scale, os.path.splitext(os.path.basename(dest))[0])
+             if hulls is None else None)
+    collision = scene_collision_text(arm_obj, source, content) if built is None else None
     if before_write is not None:
         before_write(d, scene["added_materials"])
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
                               [g["name"] for g in removed], phy_moves(d, m, donor_pose),
-                              hulls, m, bone_rests(d, m) if hulls and hulls["add"] else None)
+                              hulls, m, bone_rests(d, m) if hulls and hulls["add"] else None,
+                              collision)
     if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]
                                     or phy_rewrite["added"]):
         build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
+    if built is not None:
+        build_mod.set_physicsbones(d, built["solids"])
+        phy_rewrite = built_phy(d.checksum, built)
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.
     data = build_mod.emit(d, checksum=d.checksum)

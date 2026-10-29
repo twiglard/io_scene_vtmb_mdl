@@ -1537,8 +1537,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, before_wr
      stray, hbox, seqs, face) = build(context, arm_obj, mesh_objs, actions,
                                       embedded_name(path), **kw)
     stem = path[:-4] if path.lower().endswith(".mdl") else path
-    phy = export_mod.hulls_phy(arm_obj, d, kw.get("scale", 1.0), kw.get("surfaceprop", "flesh"),
-                               os.path.basename(stem))
+    phy = export_mod.hulls_phy(arm_obj, d, kw.get("scale", 1.0), os.path.basename(stem))
     if phy is not None:
         build_mod.set_physicsbones(d, phy["solids"])
     if before_write is not None:
@@ -1547,7 +1546,7 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, before_wr
     if phy is not None:
         with open(stem + ".phy", "wb") as f:
             f.write(phy_mod.phy_file(checksum, phy["surfaces"], phy["text"]))
-        phy = {k: phy[k] for k in ("solids", "joints", "totalmass", "parts")}
+        phy = {k: phy[k] for k in ("solids", "joints", "totalmass", "parts", "breaks")}
     elif os.path.exists(stem + ".phy"):
         phy = {"stale": stem + ".phy"}
     return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones), "phy": phy,
