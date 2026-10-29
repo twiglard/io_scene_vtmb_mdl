@@ -2353,8 +2353,10 @@ def slot_moves(obj):
     put into a slot moves none, so names alone read two slots given each other's materials
     as a reorder (BUGS 179). `obj["vtmb_slot_faces"]` holds each slot's first face's centre
     and face count, and the one slot now matching both is that slot. A slot with no face, a
-    file mesh whose triangles all sit in a lower LOD, and any slot an edit has given or
-    taken faces or whose first face it moved, go by name.
+    file mesh whose triangles all sit in a lower LOD, any slot an edit has given or taken
+    faces or whose first face it moved, and slots stamped alike, go by name. Two meshes over
+    one surface stamp alike (`panel_cloth.mdl`'s two sides), and once an edit takes faces
+    from one, both stamps match the other alone (BUGS 181).
 
     None rather than a map where the object carries no stamp -- a `.blend` saved before
     2026-09-09 -- since the index is then all there is and reading every slot as deleted
@@ -2367,13 +2369,13 @@ def slot_moves(obj):
     out = {}
     faces = [float(x) for x in (obj.get("vtmb_slot_faces") or ())]
     if len(faces) == 4 * len(stamp):
+        keys = [tuple(faces[4 * slot:4 * slot + 4]) for slot in range(len(stamp))]
         at = {}
         for j, key in enumerate(slot_faces(obj.data)):
             if key[3]:
                 at.setdefault(key, []).append(j)
-        for slot in range(len(stamp)):
-            key = tuple(faces[4 * slot:4 * slot + 4])
-            if key[3] and len(at.get(key, ())) == 1:
+        for slot, key in enumerate(keys):
+            if key[3] and keys.count(key) == 1 and len(at.get(key, ())) == 1:
                 out[slot] = at[key][0]
     # One slot per stamped slot, and a slot still holding its own stamped name keeps it:
     # a family drawing one material at two positions stamps the name twice.
