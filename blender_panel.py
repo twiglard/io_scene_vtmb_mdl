@@ -330,12 +330,11 @@ def show_skin_family(context, arm_obj, family):
     for o in {id(o): o for o, _at, _m in plan}.values():
         blender_export.stamp_slots(o, moves.get(o.name))
     if moved:
-        # A write to Mesh.materials sends no notifier, so a 3D view would go on drawing
-        # the old material until something else redrew it.
+        # A write to Mesh.materials sends no notifier, so a 3D view, the Outliner or a
+        # Properties editor would go on drawing the old material until something redrew it.
         for win in context.window_manager.windows:
             for area in win.screen.areas:
-                if area.type == "VIEW_3D":
-                    area.tag_redraw()
+                area.tag_redraw()
     arm_obj["vtmb_skin_family"] = family
     return moved, []
 
