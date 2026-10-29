@@ -30,6 +30,7 @@ from . import mdl_rebuild as rebuild_mod
 from . import mdl_write as write_mod
 from . import mesh_write as mesh_mod
 from . import paths as paths_mod
+from . import phy as phy_mod
 from . import vtx as vtx_mod
 from . import vtx_rebuild as vtxr_mod
 from . import vtx_write as vtxw_mod
@@ -4935,11 +4936,11 @@ def phy_path(p):
 def phy_bone_names(path, names):
     """Which of `names` the sibling `.phy` cites, or None when there is no `.phy`.
 
-    Collision and ragdoll live in that file and nothing here writes it. It references the
-    model by bone name and by nothing else -- over 2929 shipped files no key names a
-    vertex, a face, a mesh or a bone index -- so a moved vertex leaves collision merely
-    wrong, while a renamed or deleted bone leaves `CRagdollProp::CreateObjects` unable to
-    look the solid up at all. Anomalies I.9.
+    Collision and ragdoll live in that file, which nothing here writes but `rewrite_phy`'s
+    bone rename. It references the model by bone name and by nothing else -- over 2929
+    shipped files no key names a vertex, a face, a mesh or a bone index -- so a moved
+    vertex leaves collision merely wrong, while a renamed or deleted bone leaves
+    `CRagdollProp::CreateObjects` unable to look the solid up at all. Anomalies I.9.
 
     Matching every quoted value rather than a key list means a key some other tool added
     cannot hide a reference from this.
@@ -4962,8 +4963,38 @@ def phy_bone_names(path, names):
     return set(n for n in names if n in quoted)
 
 
-def phy_report(source, dest, removed, renamed, geometry_moved):
-    """What the sibling `.phy` no longer describes, or None when it has nothing to say."""
+def rewrite_phy(source, dest, pairs):
+    """Write the donor's `.phy` beside `dest` with its bone names following `pairs`, every
+    bone's (file name, name now) in file order.
+
+    None when no bone was renamed, the donor has no `.phy`, or no value in it follows a
+    renamed bone; else {"renamed": [(old, new)], "error"}, and on an error nothing is written.
+    """
+    src = phy_path(source)
+    if all(a == b for a, b in pairs) or not os.path.exists(src):
+        return None
+    try:
+        with open(src, "rb") as f:
+            out, changed = phy_mod.rename_bones(f.read(), pairs)
+        if not changed:
+            return None
+        with open(phy_path(dest), "wb") as f:
+            f.write(out)
+    except (OSError, phy_mod.PhyError) as e:
+        return {"renamed": [], "error": str(e)}
+    return {"renamed": sorted(set(changed)), "error": None}
+
+
+def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None):
+    """What the sibling `.phy` no longer describes, or None when it has nothing to say.
+
+    `rewrite` is `rewrite_phy`'s result. Once it has written, the renames are its to report:
+    a swap of two names leaves each old name cited in the file, now for the other bone."""
+    done = rewrite is not None and rewrite["error"] is None
+    extra = {"rewritten": rewrite["renamed"] if done else [],
+             "error": rewrite["error"] if rewrite is not None else None}
+    if done:
+        renamed = []
     old_names = [g["name"] for g in removed or ()] + [a for a, _ in renamed or ()]
     cited = phy_bone_names(dest, old_names)
     if cited is None:
@@ -4971,15 +5002,15 @@ def phy_report(source, dest, removed, renamed, geometry_moved):
         # stale: `CBaseAnimating::TestCollision` returns false with no solid, so the model
         # stops being hit by traces at all rather than being hit at the wrong shape.
         if os.path.exists(phy_path(source)) and os.path.abspath(source) != os.path.abspath(dest):
-            return {"file": os.path.basename(phy_path(dest)), "missing": True,
-                    "removed": [], "renamed": [], "geometry": geometry_moved}
+            return dict({"file": os.path.basename(phy_path(dest)), "missing": True,
+                         "removed": [], "renamed": [], "geometry": geometry_moved}, **extra)
         return None
     gone = sorted(g["name"] for g in removed or () if g["name"] in cited)
     moved = sorted((a, b) for a, b in renamed or () if a in cited)
-    if not gone and not moved and not geometry_moved:
+    if not (gone or moved or geometry_moved or extra["rewritten"] or extra["error"]):
         return None
-    return {"file": os.path.basename(phy_path(dest)), "missing": False,
-            "removed": gone, "renamed": moved, "geometry": geometry_moved}
+    return dict({"file": os.path.basename(phy_path(dest)), "missing": False,
+                 "removed": gone, "renamed": moved, "geometry": geometry_moved}, **extra)
 
 
 def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
@@ -5107,6 +5138,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     renamed = renamed_bones(m, arm_obj)
     for k, name in renamed.items():
         d.bones[k].name = name
+    # Every bone, renamed or not: a `.phy` name follows the first bone it matches.
+    bone_pairs = [(b.name, d.bones[k].name) for k, b in enumerate(m.bones)]
     renamed = [(m.bones[k].name, name) for k, name in sorted(renamed.items())]
 
     # Both names are `char name[128]` inline, so writing either moves nothing.
@@ -5558,6 +5591,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     no_vtx =not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
     with open(dest, "wb") as f:
         f.write(data)
+    # After the .mdl, so a write that fails there leaves the donor's `.phy` as it was.
+    phy_rewrite = rewrite_phy(source, dest, bone_pairs)
     # A save-as leaves the armature describing the donor, which has no such model.
     if same_file(source, dest):
         stamp_appended(d, appended, arm_obj)
@@ -5586,7 +5621,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                       if (revised or removed or added_bones or cloth_removed) else []),
             "cloth": cloth, "cloth_edits": cloth_was, "cloth_removed": cloth_removed,
             "lods": lods, "no_vtx": no_vtx, "vtx_eye_flags": eye_flags,
-            "phy": phy_report(source, dest, removed, renamed, bool(revised))}
+            "phy": phy_report(source, dest, removed, renamed, bool(revised), phy_rewrite)}
 
 
 def export_action(context, arm_obj, source, dest, anim_name="", **kw):

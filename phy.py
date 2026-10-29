@@ -467,3 +467,76 @@ def blocks(text):
             pairs.append((k, v))
         out.append((key, pairs))
     return out
+
+
+# `jointmerge` holds two, "parent,child" (studiomdl `collisionmodel.cpp:2209`). No other value
+# in the 2897 shipped files with a `.mdl` beside them is a bone name.
+BONE_KEYS = {b"solid": (b"name", b"parent"), b"editparams": (b"rootname", b"jointmerge")}
+
+
+def text_start(data):
+    """Where the text half begins, found from the solids' sizes alone, so a surface this
+    module cannot read does not stop a rename."""
+    if len(data) < HEADER.size:
+        raise PhyError("shorter than its header")
+    size, _id, count, _sum = HEADER.unpack_from(data)
+    if size != HEADER.size or count <= 0:
+        raise PhyError(f"header size {size}, {count} solids")
+    pos = size
+    for i in range(count):
+        if pos + 4 > len(data):
+            raise PhyError(f"solid {i} starts past the end")
+        n, = struct.unpack_from("<i", data, pos)
+        if n <= 0 or pos + 4 + n > len(data):
+            raise PhyError(f"solid {i} of {n} B overruns the file")
+        pos += 4 + n
+    return pos
+
+
+def rename_bones(data, pairs):
+    """`data` with every bone name in its text half following its bone, and what changed.
+
+    `pairs` is (name in the file, name now) for every bone of the model, in file order.
+    The engine finds a solid's bone with `stricmp`, first match winning
+    (`Studio_BoneIndexByName`, source-2003 `game_shared/bone_setup.cpp:3318`), so a value
+    follows the first bone it matches that way, and one matching no bone -- a single-body
+    prop's solid is named for the model -- stays as written. Nothing is touched for a bone
+    whose name did not change, case included. The binary half is copied as it was.
+
+    Returns (bytes, [(old, new)] for each value rewritten).
+    """
+    start = text_start(data)
+    text = bytes(data[start:])
+    follow = {}
+    for old, new in pairs:
+        follow.setdefault(old.lower(), (old, new))
+    edits, changed = [], []
+    for name, kv in blocks(text):
+        keys = BONE_KEYS.get(name[0].lower())
+        if keys is None:
+            continue
+        for k, v in kv:
+            if v is None or k[0].lower() not in keys:
+                continue
+            was = v[0].decode("latin-1")
+            parts = was.split(",") if k[0].lower() == b"jointmerge" else [was]
+            now = []
+            for p in parts:
+                old, new = follow.get(p.lower(), (p, p))
+                now.append(new if old != new else p)
+                if now[-1] == p:
+                    continue
+                if '"' in new or "\0" in new or (len(parts) > 1 and "," in new):
+                    raise PhyError(f"bone {new!r} cannot be written as {k[0].decode()!r}: "
+                                   "a quote, a NUL or, in a jointmerge pair, a comma ends it")
+                changed.append((p, new))
+            if now == parts:
+                continue
+            try:
+                b = ",".join(now).encode("latin-1")
+            except UnicodeEncodeError as e:
+                raise PhyError(f"{','.join(now)!r} has no latin-1 form: {e}") from None
+            edits.append((v[1], v[2], b if v[3] else b'"' + b + b'"'))
+    for lo, hi, b in sorted(edits, reverse=True):
+        text = text[:lo] + b + text[hi:]
+    return bytes(data[:start]) + text, changed

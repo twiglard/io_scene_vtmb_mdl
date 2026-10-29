@@ -24,7 +24,7 @@ bl_info = {
 }
 
 from . import (checksum, cloth, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write,
-               normal_table, paths,
+               normal_table, paths, phy,
                relocs, sections, tth, vmt_write, vpk, vtx, vtx_rebuild, vtx_write,
                bone_templates,
                blender_import, blender_export, blender_flex_preview, blender_scratch,
@@ -1583,6 +1583,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             "A model with no .phy is not hit by traces at all, which is "
                             "worse than being hit at the wrong shape -- copy it across"
                             % phy["file"])
+            if phy["rewritten"]:
+                self.report({"INFO"},
+                            "%s rewritten for the renamed bones: %s"
+                            % (phy["file"],
+                               ", ".join("%r -> %r" % p for p in phy["rewritten"])))
+            if phy["error"]:
+                self.report({"ERROR"},
+                            "%s was not rewritten for the renamed bones: %s"
+                            % (phy["file"], phy["error"]))
             # A rename or a delete is the only failure that is not merely geometric: the
             # solid is looked up by name and an unmatched one is not created at all.
             for a, b in phy["renamed"]:
@@ -1597,9 +1606,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             "created" % (phy["file"], a))
             if phy["geometry"] and not phy["renamed"] and not phy["removed"]:
                 self.report({"WARNING"},
-                            "%s still describes the old geometry. Nothing here writes it "
-                            "and the engine never compares the two, so collision stays at "
-                            "the shape the donor had" % phy["file"])
+                            "%s still describes the old geometry. Nothing here writes its "
+                            "hulls and the engine never compares the two, so collision "
+                            "stays at the shape the donor had" % phy["file"])
         for gone in r.get("removed") or []:
             self.report({"WARNING"},
                         "%r is not in the armature and was removed from the file: "
@@ -2788,7 +2797,7 @@ def register():
     # Dependency order: a module has to be reloaded before anything that imports it, or the
     # importer keeps the old object and the reload buys nothing.
     for m in (checksum, sections, relocs, normal_table, cloth, mdl, mdl_write, mdl_build,
-              mdl_rebuild, mesh_write, paths, tth, vmt_write, vpk, vtx, vtx_write,
+              mdl_rebuild, mesh_write, paths, phy, tth, vmt_write, vpk, vtx, vtx_write,
               vtx_rebuild, bone_templates,
               blender_import, blender_export, blender_flex_preview, blender_scratch,
               blender_templates, blender_panel):
