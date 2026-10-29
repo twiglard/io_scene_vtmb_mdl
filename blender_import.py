@@ -17,6 +17,7 @@ from . import blender_export as export_mod
 from . import cloth as cloth_mod
 from . import mdl as mdl_mod
 from . import paths as paths_mod
+from . import phy as phy_mod
 from . import tth as tth_mod
 from . import vpk as vpk_mod
 from . import vtx as vtx_mod
@@ -836,6 +837,94 @@ def build_accessories(context, m, arm_obj, name, scale):
     return made
 
 
+def hull_owner(m, arm_obj, name):
+    """The armature bone a solid named `name` belongs to, or None for a solid named for no
+    bone of `m`. The engine matches with `stricmp`, first bone winning."""
+    low = name.lower()
+    b = next((b for b in m.bones if b.name.lower() == low), None)
+    if b is None:
+        return None
+    for pb in arm_obj.pose.bones:
+        if pb.get("vtmb_bone_name") == b.name:
+            return arm_obj.data.bones[pb.name]
+    return arm_obj.data.bones.get(b.name)
+
+
+def build_hulls(context, m, arm_obj, name, scale, content):
+    """Each solid of the model's `.phy` as a wire mesh object, one loose part per ledge, in
+    its bone's space, the way `build_accessories` places an empty: [objects].
+
+    A solid named for no bone is in model space (`todo-vtmb-phy.md`, measurement 1), so it
+    parents to the armature object. Its `solid` values and, on a joint's child, the nine
+    `ragdollconstraint` limits are properties of the object. `vtmb_phy_solids` on the
+    armature says every solid got its object, so a missing one was deleted, and
+    `editparams`' `totalmass` and `rootname` go on it for an export with no donor `.phy`."""
+    arm_obj.pop("vtmb_phy_solids", None)
+    try:
+        _where, data = export_mod.donor_phy(m.path, content)
+        if data is None:
+            return []
+        f = phy_mod.Phy(data)
+        solids, joints, edit = phy_mod.text_values(data)
+    except (OSError, phy_mod.PhyError):
+        return []
+    if len(solids) != len(f.solids):
+        return []
+    try:
+        arm_obj["vtmb_phy_totalmass"] = float(edit["totalmass"])
+    except (KeyError, ValueError):
+        pass
+    if "rootname" in edit:
+        arm_obj["vtmb_phy_rootname"] = edit["rootname"]
+    coll = None
+    made = []
+    every = True
+    for k, (s, kv) in enumerate(zip(f.solids, solids)):
+        label = kv.get("name", "")
+        bone = hull_owner(m, arm_obj, label)
+        if bone is None and any(b.name.lower() == label.lower() for b in m.bones):
+            every = False
+            continue
+        verts, faces, _starts = phy_mod.ledge_mesh(s, scale)
+        mesh = bpy.data.meshes.new("%s.collision.%s" % (name, label or k))
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new(mesh.name, mesh)
+        obj.display_type = "WIRE"
+        obj.hide_render = True
+        if coll is None:
+            coll = bpy.data.collections.new("%s collision" % name)
+            for c in bpy.data.collections:
+                if arm_obj.name in c.objects:
+                    c.children.link(coll)
+                    break
+            else:
+                context.scene.collection.children.link(coll)
+        coll.objects.link(obj)
+        if bone is None:
+            obj.parent = arm_obj
+        else:
+            _bone_child(obj, arm_obj, bone)
+        obj["vtmb_phy_hull"] = 1
+        obj["vtmb_phy_solid"] = k
+        obj["vtmb_phy_name"] = label
+        for key, kind in export_mod.HULL_KEYS:
+            if key in kv:
+                try:
+                    obj["vtmb_phy_" + key] = kind(kv[key])
+                except ValueError:
+                    pass
+        for key in export_mod.JOINT_KEYS if k in joints else ():
+            try:
+                obj["vtmb_phy_" + key] = float(joints[k][key])
+            except (KeyError, ValueError):
+                pass
+        made.append(obj)
+    if every:
+        arm_obj["vtmb_phy_solids"] = 1
+    return made
+
+
 def _cloth_volume_empty(m, dbs, label, bi, p, radius, scale):
     """One end of a cloth collision capsule, or one sphere, as a SPHERE empty.
 
@@ -1435,7 +1524,7 @@ def pick_animations(m, content, anim_filter, max_anims, with_chained):
 def import_mdl(context, path, anim_filter="", max_anims=0,
                scale=1.0, with_mesh=True, with_anims=True, with_chained=True,
                game_root="", mods=(), extra_roots=(), use_packs=True,
-               root_motion=True, with_flexes=True):
+               root_motion=True, with_flexes=True, with_phy=True):
     m = mdl_mod.Mdl(path)
     roots = paths_mod.roots(path, game_root, mods, extra_roots)
     content = Content(roots, use_packs)
@@ -1449,7 +1538,7 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     arm_obj["vtmb_import"] = {
         "addon_version": _addon_version(), "scale": scale,
         "with_mesh": with_mesh, "with_anims": with_anims, "with_chained": with_chained,
-        "with_flexes": with_flexes,
+        "with_flexes": with_flexes, "with_phy": with_phy,
         "use_packs": use_packs, "root_motion": root_motion, "anim_filter": anim_filter,
         "max_anims": max_anims, "game_root": game_root, "mods": list(mods),
         "extra_roots": list(extra_roots),
@@ -1457,6 +1546,7 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
     objs, warning = ([], None) if not with_mesh else \
         build_meshes(context, m, arm_obj, name, scale, content, with_flexes)
     build_accessories(context, m, arm_obj, name, scale)
+    hulls = build_hulls(context, m, arm_obj, name, scale, content) if with_phy else []
     # Only where every model with a vertex got its object does a missing one mean the user
     # deleted it, which the donor export of this same file writes as a model of no vertex.
     drawn = sum(1 for bp in m.bodyparts for mo in bp.models if mo.numvertices)
@@ -1537,7 +1627,7 @@ def import_mdl(context, path, anim_filter="", max_anims=0,
         "packs": packed, "materials": len(mats), "textured": lit,
         "bones": len(m.bones), "anims": len(wanted), "seqs": len(m.seqs),
         "chained": sum(1 for src, _ in wanted if src is not m),
-        "faces": sum(len(o.data.polygons) for o in objs),
+        "faces": sum(len(o.data.polygons) for o in objs), "hulls": len(hulls),
         "verts": sum(len(o.data.vertices) for o in objs),
         "warning": warning,
     }

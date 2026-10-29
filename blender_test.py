@@ -258,7 +258,8 @@ def main():
             ok = False
             continue
         arm = next(o for o in bpy.data.objects if o.type == "ARMATURE")
-        meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+        meshes = [o for o in bpy.data.objects
+                  if o.type == "MESH" and not o.get("vtmb_phy_hull")]
         print("  armature %r: %d bones" % (arm.name, len(arm.pose.bones)))
         opts = arm.get("vtmb_import")
         print("  vtmb_import: %s" % ({k: opts[k] for k in sorted(opts.keys())}

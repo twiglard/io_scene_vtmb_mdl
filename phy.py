@@ -1302,3 +1302,206 @@ def rename_bones(data, pairs):
     for lo, hi, b in sorted(edits, reverse=True):
         text = text[:lo] + b + text[hi:]
     return bytes(data[:start]) + text, changed
+
+
+# The deepest a shipped ledge point lies inside its own ledge's hull is 4.3e-08 of the ledge's
+# size, 5.9e-08 once the import has rounded it to a Blender float at scale 1: 105 of the 166
+# points `convex_hull` leaves out of a shipped ledge lie on a face and the rest are float
+# rounding. A point inside by more than this share of its part's size is a dent.
+DENT_TOL = 1e-5
+
+
+def part_hull(points, faces=()):
+    """(`convex_hull`'s triangles over `points`, [index of each point in a dent]). A ledge
+    is convex by format, so the written ledge would fill a dent.
+
+    A point is in one when the hull leaves it inside by more than `DENT_TOL` of the points'
+    size, or, with `faces` the triangles the mesh draws over `points`, when it is the far
+    corner of a triangle across an edge from another and lies that far in front of the
+    other's plane: a concave edge whose corners all stay on the hull. The faces are taken outward
+    by their signed volume, so a mesh drawn inside out reads the same. A point on a face,
+    or within the tolerance of one, is left out of the ledge and changes nothing."""
+    tris = convex_hull(points)
+    kept = {i for t in tris for i in t}
+    size = max(max(p[k] for p in points) - min(p[k] for p in points) for k in range(3))
+    lim = DENT_TOL * size
+
+    def plane(i, j, k, sign=1.0, thin=0.0):
+        """The triangle's plane, or None for one no higher than `thin`."""
+        a, b, c = points[i], points[j], points[k]
+        n = _cross(a, b, c)
+        m = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+        if m == 0 or m / max(math.dist(a, b), math.dist(b, c), math.dist(c, a)) <= thin:
+            return None
+        return (sign * n[0] / m, sign * n[1] / m, sign * n[2] / m), a
+
+    def front(pl, p):
+        n, a = pl
+        return n[0] * (p[0] - a[0]) + n[1] * (p[1] - a[1]) + n[2] * (p[2] - a[2])
+
+    planes = [pl for pl in (plane(*t) for t in tris) if pl is not None]
+    deep = set(q for q, p in enumerate(points)
+               if q not in kept and -max(front(pl, p) for pl in planes) > lim)
+    vol = 0.0
+    for i, j, k in faces:
+        a, b, c = points[i], points[j], points[k]
+        vol += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+    sign = -1.0 if vol < 0 else 1.0
+    across = {}
+    for f in faces:
+        for e in range(3):
+            across.setdefault((f[e], f[(e + 1) % 3]), []).append(f)
+    # A triangle under the tolerance high is no reference: three points nearly on a line
+    # tilt its plane any way, and one in grandpiano.phy reads as an edge 0.29 of its size concave.
+    for (a, b), fs in across.items():
+        for f in fs:
+            for g in across.get((b, a), ()):
+                pl = plane(*f, sign, lim)
+                far = next((v for v in g if v != a and v != b), None)
+                if pl is not None and far is not None and front(pl, points[far]) > lim:
+                    deep.add(far)
+    return tris, sorted(deep)
+
+
+def text_values(data):
+    """The text half's values: ([{key: value} per `solid` block, in order], {child ordinal:
+    {key: value}} per `ragdollconstraint`, {key: value} of `editparams`), keys lowercased
+    as the engine reads them and values as written, both latin-1."""
+    solids, joints, edit = [], {}, {}
+    for name, kv in blocks(bytes(data[text_start(data):])):
+        d = dict((k[0].lower().decode("latin-1"), v[0].decode("latin-1"))
+                 for k, v in kv if v is not None)
+        n = name[0].lower()
+        if n == b"solid":
+            solids.append(d)
+        elif n == b"ragdollconstraint":
+            try:
+                joints[int(d["child"])] = d
+            except (KeyError, ValueError):
+                pass
+        elif n == b"editparams":
+            edit = d
+    return solids, joints, edit
+
+
+def _records(data):
+    size, _ident, count, _sum = HEADER.unpack_from(data)
+    out, pos = [], size
+    for _ in range(count):
+        n, = struct.unpack_from("<i", data, pos)
+        out.append(bytes(data[pos:pos + 4 + n]))
+        pos += 4 + n
+    return out
+
+
+def _latin1(x):
+    """`x` as the text half can hold it: latin-1, and no quote or NUL, either of which ends a
+    quoted token."""
+    if '"' in x or "\0" in x:
+        raise PhyError(f"a quote or NUL in {x!r}")
+    try:
+        return x.encode("latin-1")
+    except UnicodeEncodeError as e:
+        raise PhyError(f"{x!r} has no latin-1 form: {e}") from None
+
+
+def edit_solids(data, surfaces=None, values=None, joints=None):
+    """`data` with surfaces replaced and values rewritten, every other byte copied.
+
+    `surfaces` is {ordinal: Surface}. `values` is {ordinal: {key: value}} on that solid's
+    block and `joints` {child ordinal: {key: value}} on the `ragdollconstraint` whose `child`
+    is that ordinal; a value is rewritten in its token's span, and a key the block lacks is
+    added on a line before its `}`. Raises `PhyError` naming a solid or joint not there."""
+    start = text_start(data)
+    text = bytes(data[start:])
+    want = {}
+    for k, kv in (values or {}).items():
+        want[(b"solid", k)] = kv
+    for k, kv in (joints or {}).items():
+        want[(b"ragdollconstraint", k)] = kv
+    edits, found, solid = [], set(), 0
+    for name, pairs, span in block_spans(text):
+        n = name[0].lower()
+        if n == b"solid":
+            key, solid = (n, solid), solid + 1
+        elif n == b"ragdollconstraint":
+            got = [v[0] for k, v, _s in pairs if v is not None and k[0].lower() == b"child"]
+            try:
+                key = (n, int(got[0]))
+            except (IndexError, ValueError):
+                continue
+        else:
+            continue
+        kv = want.get(key)
+        if kv is None:
+            continue
+        found.add(key)
+        have = {k[0].lower(): v for k, v, _s in pairs if v is not None}
+        add = b""
+        for k, value in kv.items():
+            v = have.get(k.lower().encode("latin-1"))
+            if v is None:
+                add += b'"%s" "%s"\n' % (_latin1(k), _latin1(value))
+                continue
+            b = _latin1(value)
+            edits.append((v[1], v[2], b if v[3] else b'"' + b + b'"'))
+        if add:
+            edits.append((span[1] - 1, span[1] - 1, add))
+    lost = set(want) - found
+    if lost:
+        raise PhyError("no %s" % ", ".join("%s %d" % (n.decode(), k) for n, k in sorted(lost)))
+    for lo, hi, b in sorted(edits, reverse=True):
+        text = text[:lo] + b + text[hi:]
+    records = _records(data)
+    for k, s in (surfaces or {}).items():
+        if not 0 <= k < len(records):
+            raise PhyError(f"no solid {k} of {len(records)}")
+        b = surface_bytes(s)
+        records[k] = struct.pack("<i", len(b)) + b
+    return bytes(data[:HEADER.size]) + b"".join(records) + text
+
+
+def add_solid(data, surface, pairs, joint=None):
+    """`data` with one solid appended, and its ordinal: the record after the last, a `solid`
+    block of `index` then `pairs` [(key, value)] after the last `solid` block, and with
+    `joint`, [(key, value)] after `parent` and `child`, a `ragdollconstraint` after the last
+    one, else after the new solid."""
+    start = text_start(data)
+    text = bytes(data[start:])
+    size, ident, count, checksum = HEADER.unpack_from(data)
+    spans = block_spans(text)
+    last = [span for name, _p, span in spans if name[0].lower() == b"solid"]
+    if not last:
+        raise PhyError("no solid block to add one after")
+    at = _line(text, *last[-1])[1]
+    block = keyvalues([("solid", [("index", str(count))] + list(pairs))])[:-1]
+    text = text[:at] + block + text[at:]
+    if joint is not None:
+        spans = block_spans(text)
+        cons = [span for name, _p, span in spans if name[0].lower() == b"ragdollconstraint"]
+        to = _line(text, *cons[-1])[1] if cons else at + len(block)
+        text = text[:to] + keyvalues([("ragdollconstraint", list(joint))])[:-1] + text[to:]
+    b = surface_bytes(surface)
+    return (HEADER.pack(size, ident, count + 1, checksum) + b"".join(_records(data))
+            + struct.pack("<i", len(b)) + b + text), count
+
+
+def ledge_mesh(s, scale=1.0):
+    """Surface `s` as the import lays it out: ([vertex], [triangle], [first vertex of each
+    ledge]). Each ledge takes its own copy of its points, in index order, HL inches times
+    `scale`, so a ledge is one loose part. A triangle on three points an earlier one of its
+    ledge already used is left out, which drops a three-point flat ledge's far side."""
+    verts, faces, starts = [], [], []
+    for l in s.ledges:
+        idx = sorted(l.point_indices())
+        at = {i: len(verts) + n for n, i in enumerate(idx)}
+        starts.append(len(verts))
+        verts += [tuple(c * scale for c in ivp_to_hl(s.points[i])) for i in idx]
+        seen = set()
+        for t in ledge_triangles(l):
+            if frozenset(t) in seen:
+                continue
+            seen.add(frozenset(t))
+            faces.append(tuple(at[i] for i in t))
+    return verts, faces, starts

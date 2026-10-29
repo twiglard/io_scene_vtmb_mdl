@@ -731,7 +731,8 @@ def new_model_objects(m, source, arm_obj):
         if got is not None:
             copies |= set(id(o) for o in objs if o is not got)
     return sorted((o for o in arm_obj.children
-                   if o.type == "MESH" and (id(o) not in claimed or id(o) in copies)),
+                   if o.type == "MESH" and not o.get("vtmb_phy_hull")
+                   and (id(o) not in claimed or id(o) in copies)),
                   key=lambda o: o.name)
 
 
@@ -2093,8 +2094,9 @@ def skin_edited(arm_obj):
 
 
 def armature_meshes(scene, arm_obj):
-    """The mesh objects this armature owns, parented or bound by an Armature modifier."""
-    return [o for o in scene.objects if o.type == "MESH" and (
+    """The mesh objects this armature owns, parented or bound by an Armature modifier, less
+    its collision hulls."""
+    return [o for o in scene.objects if o.type == "MESH" and not o.get("vtmb_phy_hull") and (
         o.parent is arm_obj or any(getattr(mo, "object", None) is arm_obj
                                    for mo in o.modifiers))]
 
@@ -2799,7 +2801,8 @@ def stray_eyeballs(m, arm_obj):
 
 # The stamp each kind of accessory empty carries, and what the message calls it.
 ACCESSORY_KEYS = (("vtmb_attachment", "attachment"), ("vtmb_hitbox_group", "hitbox"),
-                  ("vtmb_hitboxset", "hitbox set"), ("vtmb_cloth_volume_model", "cloth volume"))
+                  ("vtmb_hitboxset", "hitbox set"), ("vtmb_cloth_volume_model", "cloth volume"),
+                  ("vtmb_phy_hull", "collision hull"))
 
 
 def stray_accessories(arm_obj, eyes=False):
@@ -5010,37 +5013,536 @@ def phy_moves(d, m, donor_pose):
     return out
 
 
-def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None):
-    """The donor's `.phy` as this export leaves it: every solid named for a bone in
-    `removed` dropped (the user, 2026-10-29), or moved by `moves` when it has no parent and
-    more than one child solid (the user, the same day), then its bone names following
-    `pairs`, every remaining bone's (file name, name now) in file order. `write_phy` puts it
-    beside `dest` once the `.mdl` is written.
+# Each `solid` key a hull object carries as `vtmb_phy_<key>`, and the joint limits on a
+# joint's child. `volume` is not one: the export takes it off the hull it writes.
+HULL_KEYS = (("mass", float), ("surfaceprop", str), ("damping", float),
+             ("rotdamping", float), ("inertia", float), ("massbias", float))
+JOINT_KEYS = tuple(a + k for a in "xyz" for k in ("min", "max", "friction"))
+
+
+def hull_objects(arm_obj):
+    """The armature's collision hulls: its mesh children carrying `vtmb_phy_hull`."""
+    return sorted((o for o in arm_obj.children
+                   if o.type == "MESH" and o.get("vtmb_phy_hull")), key=lambda o: o.name)
+
+
+def hull_matrix(obj):
+    """A hull's matrix into its solid's space: its bone's for a bone child, read as
+    `bone_space` reads an empty, else the armature's."""
+    if obj.parent_type == "BONE":
+        return bone_space(obj)
+    return obj.matrix_parent_inverse @ obj.matrix_basis
+
+
+def loose_parts(mesh):
+    """Each loose part's vertex indices, ascending, the parts in order of their first."""
+    up = list(range(len(mesh.vertices)))
+
+    def find(i):
+        while up[i] != i:
+            up[i] = up[up[i]]
+            i = up[i]
+        return i
+
+    def join(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            up[max(a, b)] = min(a, b)
+
+    ev = array.array("i", [0]) * (2 * len(mesh.edges))
+    mesh.edges.foreach_get("vertices", ev)
+    for a, b in zip(ev[0::2], ev[1::2]):
+        join(a, b)
+    for p in mesh.polygons:
+        vs = p.vertices
+        for a in vs[1:]:
+            join(vs[0], a)
+    parts = {}
+    for i in range(len(up)):
+        parts.setdefault(find(i), []).append(i)
+    return [parts[k] for k in sorted(parts)]
+
+
+def _mesh_co(mesh):
+    co = array.array("f", [0.0]) * (3 * len(mesh.vertices))
+    mesh.vertices.foreach_get("co", co)
+    return co
+
+
+def hull_unchanged(obj, s, scale):
+    """Whether `obj` is still what `blender_import.build_hulls` made of surface `s`: the
+    same vertices to the bit, in the same loose parts, and no transform."""
+    verts, _faces, starts = phy_mod.ledge_mesh(s, scale)
+    me = obj.data
+    if len(me.vertices) != len(verts) or hull_matrix(obj) != mathutils.Matrix.Identity(4):
+        return False
+    if _mesh_co(me) != array.array("f", [c for v in verts for c in v]):
+        return False
+    ends = starts[1:] + [len(verts)]
+    return loose_parts(me) == [list(range(a, b)) for a, b in zip(starts, ends)]
+
+
+def hull_surface(obj, scale, tag=phy_mod.IVPS):
+    """`obj`'s loose parts as one surface, each part's convex hull one ledge, the points
+    rounded to the floats the file holds before they are hulled: (surface, [(part, vertices
+    inside its hull)]). A part with a vertex deeper inside its hull than `phy.DENT_TOL` of
+    its size is one the ledge would fill, and stays out of the surface."""
+    me = obj.data
+    co = _mesh_co(me)
+    m = [list(r) for r in hull_matrix(obj)]
+    parts = loose_parts(me)
+    at = {}
+    for n, part in enumerate(parts):
+        for j, i in enumerate(part):
+            at[i] = (n, j)
+    faces = [[] for _ in parts]
+    me.calc_loop_triangles()
+    for t in me.loop_triangles:
+        n = at[t.vertices[0]][0]
+        faces[n].append(tuple(at[i][1] for i in t.vertices))
+    ledges, dents = [], []
+    for n, part in enumerate(parts):
+        pts = []
+        for i in part:
+            x, y, z = co[3 * i:3 * i + 3]
+            hl = [(r[0] * x + r[1] * y + r[2] * z + r[3]) / scale for r in m[:3]]
+            pts.append(tuple(phy_mod._f32(c) for c in phy_mod.hl_to_ivp(hl)))
+        try:
+            tris, deep = phy_mod.part_hull(pts, faces[n])
+        except phy_mod.PhyError as e:
+            raise SceneRefused("%s: loose part %d makes no convex piece (%s). Nothing was "
+                               "written" % (obj.name, n, e)) from None
+        if deep:
+            dents.append((n, len(deep)))
+            continue
+        ledges.append([tuple(pts[i] for i in t) for t in tris])
+    if dents or not ledges:
+        return None, dents
+    try:
+        return phy_mod.build_surface(ledges, tag), dents
+    except phy_mod.PhyError as e:
+        raise SceneRefused("%s: %s. Nothing was written" % (obj.name, e)) from None
+
+
+def _float_changed(value, text):
+    try:
+        return phy_mod._f32(float(value)) != phy_mod._f32(float(text))
+    except (TypeError, ValueError):
+        return True
+
+
+def read_hulls(arm_obj, m, data, scale, names):
+    """What the armature's collision hulls change in the donor's `.phy` bytes `data`, or
+    None when the import did not give every solid its object (`vtmb_phy_solids`).
+
+    `names` is {armature bone name: file bone name} over the bones being written. A hull
+    on a bone the armature lost is left to `drop_solids`. Raises `SceneRefused` on a
+    dent, a part that makes no convex piece, two objects claiming one solid, or two
+    solids on one bone, before anything is written.
+
+    {"surfaces": {ordinal: rebuilt Surface}, "values": {ordinal: {key: text}}, "joints":
+    {child ordinal: {key: text}}, "drop": [solid names], "add": [(file bone, Surface,
+    object)], "rebuilt": [(solid, volume was, volume now)], "edited": [(solid, key, was,
+    now)]}, keys as `phy.edit_solids` takes them."""
+    if not arm_obj.get("vtmb_phy_solids"):
+        return None
+    f = phy_mod.Phy(data)
+    solids, joints, _edit = phy_mod.text_values(data)
+    low = {}
+    for b in m.bones:
+        low.setdefault(b.name.lower(), b.name)
+    claims, new, gone_bone = {}, [], set()
+    for o in hull_objects(arm_obj):
+        fb = None
+        if o.parent_type == "BONE":
+            fb = names.get(o.parent_bone)
+        k = o.get("vtmb_phy_solid")
+        k = int(k) if isinstance(k, int) and 0 <= k < len(f.solids) else None
+        if o.parent_type == "BONE" and fb is None:
+            if k is not None:
+                gone_bone.add(k)
+            continue
+        if k is None:
+            new.append((o, fb))
+        else:
+            claims.setdefault(k, []).append((o, fb))
+    for k, objs in sorted(claims.items()):
+        if len(objs) > 1:
+            raise SceneRefused(
+                "%s all carry vtmb_phy_solid %d, the solid of %r, and the file holds one "
+                "solid for it. A Shift+D copy keeps the stamp: delete the copies, or clear "
+                "vtmb_phy_solid on them to add each as a solid of its own. Nothing was "
+                "written" % (", ".join(repr(o.name) for o, _ in objs), k,
+                             solids[k].get("name", "")))
+    out = {"surfaces": {}, "values": {}, "joints": {}, "drop": [], "add": [],
+           "rebuilt": [], "edited": []}
+    dents = []
+    for k, (s, kv) in enumerate(zip(f.solids, solids)):
+        if k in gone_bone:
+            continue
+        label = kv.get("name", "")
+        if k not in claims:
+            out["drop"].append(label)
+            continue
+        o, fb = claims[k][0]
+        if fb != low.get(label.lower()):
+            out["drop"].append(label)
+            new.append((o, fb))
+            continue
+        vals = {}
+        for key, kind in HULL_KEYS:
+            v = o.get("vtmb_phy_" + key)
+            if v is None or key not in kv:
+                continue
+            if kind is float and _float_changed(v, kv[key]):
+                vals[key] = phy_mod.float_text(float(v))
+            elif kind is str and str(v) != kv[key]:
+                vals[key] = str(v)
+        if k in joints:
+            jv = {}
+            for key in JOINT_KEYS:
+                v = o.get("vtmb_phy_" + key)
+                if v is not None and key in joints[k] and _float_changed(v, joints[k][key]):
+                    jv[key] = phy_mod.float_text(float(v))
+            if jv:
+                out["joints"][k] = jv
+                out["edited"] += [(label, key, joints[k][key], t) for key, t in jv.items()]
+        if not hull_unchanged(o, s, scale):
+            surf, bad = hull_surface(o, scale, s.dummy[8:])
+            dents += [(o.name, label, n, c) for n, c in bad]
+            if surf is not None:
+                out["surfaces"][k] = surf
+                if "volume" in kv and "volume" not in vals:
+                    vals["volume"] = phy_mod.float_text(phy_mod.surface_volume(surf))
+                    out["rebuilt"].append((label, kv["volume"], vals["volume"]))
+        if vals:
+            out["values"][k] = vals
+            out["edited"] += [(label, key, kv[key], t) for key, t in vals.items()
+                              if key != "volume" or k not in out["surfaces"]]
+    taken = {n.lower() for n in (solids[k].get("name", "") for k in range(len(solids)))}
+    taken -= {n.lower() for n in out["drop"]}
+    for o, fb in new:
+        if fb is None:
+            raise SceneRefused(
+                "%s is a collision hull parented to the armature itself, and a solid is "
+                "named for its bone: parent it to one (Ctrl+P > Bone). Nothing was written"
+                % o.name)
+        if fb.lower() in taken:
+            raise SceneRefused(
+                "%s would be a second solid on bone %r, and the engine finds a bone's solid "
+                "by name, first match winning: delete one of the two hulls. Nothing was "
+                "written" % (o.name, fb))
+        taken.add(fb.lower())
+        surf, bad = hull_surface(o, scale)
+        dents += [(o.name, fb, n, c) for n, c in bad]
+        if surf is not None:
+            out["add"].append((fb, surf, o))
+    if dents:
+        raise SceneRefused(
+            "every loose part of a collision hull is written as its convex hull, and %s. "
+            "Move those vertices back out, or cut the part into convex pieces, each a loose "
+            "part of the same object. Nothing was written"
+            % "; ".join("%s (solid %r) loose part %d is concave at %d %s"
+                        % (o, label, n, c, "vertex" if c == 1 else "vertices")
+                        for o, label, n, c in dents))
+    return out
+
+
+def add_hull_solids(data, adds, m, rest):
+    """`data` with a solid appended for each of `adds`, `read_hulls`' (file bone, surface,
+    object): its parent the solid of the bone's nearest ancestor that owns one, a joint to
+    it with the object's nine limits (0 each unless set, rigid), and the `solid` values
+    off the object where it carries them, else studiomdl's: the mass `phy.masses` gives
+    it among the file's, the first solid's surfaceprop, damping 0, rotdamping 0, inertia
+    1. `rest` is {file bone: its rest transform, a 3x4 in model space}, written as
+    `origin`/`angles` when the file's solids carry them. ([solid names], bytes)."""
+    at = {b.name: k for k, b in enumerate(m.bones)}
+    added = []
+    for fb, surf, o in adds:
+        solids, _joints, edit = phy_mod.text_values(data)
+        own = {}
+        for k, kv in enumerate(solids):
+            own.setdefault(kv.get("name", "").lower(), k)
+        up = m.bones[at[fb]].parent
+        while up >= 0 and m.bones[up].name.lower() not in own:
+            up = m.bones[up].parent
+        if up < 0:
+            raise SceneRefused(
+                "%s on bone %r would be a solid with no parent solid, a ragdoll in pieces: "
+                "give one of its ancestor bones a hull first. Nothing was written"
+                % (o.name, fb))
+        parent = own[m.bones[up].name.lower()]
+        vol = phy_mod.surface_volume(surf)
+
+        def num(key, default):
+            v = o.get("vtmb_phy_" + key)
+            return float(v) if v is not None else default
+
+        def text(kv, key, default):
+            try:
+                return float(kv.get(key, default))
+            except ValueError:
+                return default
+
+        if o.get("vtmb_phy_mass") is not None:
+            mass = float(o["vtmb_phy_mass"])
+        else:
+            mass = phy_mod.masses([text(kv, "volume", 0.0) for kv in solids] + [vol],
+                                  [text(kv, "massbias", 1.0) for kv in solids] + [1.0],
+                                  text(edit, "totalmass", 1.0))[-1]
+        pairs = [("name", fb), ("parent", solids[parent].get("name", ""))]
+        if any("origin" in kv for kv in solids) and fb in rest:
+            r = rest[fb]
+            pairs += [("origin", " ".join(phy_mod.float_text(x[3]) for x in r)),
+                      ("angles", " ".join(phy_mod.float_text(a)
+                                          for a in phy_mod.matrix_angles(r)))]
+        pairs += [("mass", phy_mod.float_text(mass)),
+                  ("surfaceprop", _text_prop(o, "surfaceprop",
+                                             solids[0].get("surfaceprop", "default"))),
+                  ("damping", phy_mod.float_text(num("damping", 0.0))),
+                  ("rotdamping", phy_mod.float_text(num("rotdamping", 0.0))),
+                  ("inertia", phy_mod.float_text(num("inertia", 1.0))),
+                  ("volume", phy_mod.float_text(vol))]
+        joint = [("parent", str(parent)), ("child", str(len(solids)))]
+        joint += [(key, phy_mod.float_text(num(key, 0.0))) for key in JOINT_KEYS]
+        data, _k = phy_mod.add_solid(data, surf, pairs, joint)
+        added.append(fb)
+    return added, data
+
+
+def _text_prop(o, key, default):
+    """The object's `vtmb_phy_<key>`, an empty one included: 1309 of the 7353 shipped solids
+    carry `"surfaceprop" ""`."""
+    v = o.get("vtmb_phy_" + key)
+    return default if v is None else str(v)
+
+
+def _dents_text(dents):
+    """The error for [(object name, loose part, vertices in a dent)]."""
+    return ("every loose part of a collision hull is written as its convex hull, and %s. "
+            "Move those vertices back out, or cut the part into convex pieces, each a loose "
+            "part of the same object. Nothing was written"
+            % "; ".join("%s loose part %d is concave at %d %s"
+                        % (o, n, c, "vertex" if c == 1 else "vertices")
+                        for o, n, c in dents))
+
+
+def hulls_phy(arm_obj, d, scale, surfaceprop, stem):
+    """A `.phy` of the armature's collision hulls alone, for a model with no donor `.phy`,
+    as studiomdl writes one (source-2003 `collisionmodel.cpp:2100`), or None when it has no
+    hull. A hull parented to a bone of `d`, named as Blender names it, is a solid named for
+    it; the solids go in bone order, each one's parent the solid of its bone's nearest
+    ancestor that owns one, with a joint carrying the object's nine limits, 0 (rigid) where
+    unset, and `origin`/`angles` the bone's rest transform, as on 7297 of the 7321 shipped
+    solids. A hull parented to the armature is a single-body prop's one solid, in model
+    space, `origin`/`angles` zero as on 2535 of the 2564 shipped, named `vtmb_phy_name` or
+    else `<stem>_phy`, the name 1082 of the 2605 shipped single-solid files carry. The
+    `solid` values come off the object, else studiomdl's: a share of the armature's
+    `vtmb_phy_totalmass` (1.0, its default) by volume, `surfaceprop`, damping 0,
+    rotdamping 0, inertia 1. Raises `SceneRefused` on a dent, a hull on a bone the
+    armature has not got, two on one bone, a hull on the armature beside any other, or
+    more than one solid with no parent.
+
+    {"surfaces": [Surface], "text": bytes, "solids": [bone names], "joints": count,
+    "totalmass": float, "parts": loose parts written}"""
+    objs = hull_objects(arm_obj)
+    if not objs:
+        return None
+    at = {r.name: k for k, r in enumerate(d.bones)}
+    whole = [o for o in objs if o.parent_type != "BONE"]
+    if whole and len(objs) > 1:
+        raise SceneRefused(
+            "%s is a collision hull on the armature itself, a single-body prop's one solid, "
+            "beside %d other hull%s: parent it to a bone (Ctrl+P > Bone), or delete the "
+            "others. Nothing was written"
+            % (whole[0].name, len(objs) - 1, "" if len(objs) == 2 else "s"))
+    if whole:
+        o = whole[0]
+        surf, bad = hull_surface(o, scale)
+        if bad:
+            raise SceneRefused(_dents_text([(o.name, n, c) for n, c in bad]))
+        totalmass = float(arm_obj.get("vtmb_phy_totalmass", 1.0))
+        vol = phy_mod.surface_volume(surf)
+
+        def num1(key, default):
+            v = o.get("vtmb_phy_" + key)
+            return float(v) if v is not None else default
+
+        name = str(o.get("vtmb_phy_name") or "%s_phy" % stem)
+        solid = {"name": name, "origin": (0.0, 0.0, 0.0), "angles": (0.0, 0.0, 0.0),
+                 "mass": num1("mass", phy_mod.masses([vol], [1.0], totalmass)[0]),
+                 "surfaceprop": _text_prop(o, "surfaceprop", surfaceprop),
+                 "damping": num1("damping", 0.0), "rotdamping": num1("rotdamping", 0.0),
+                 "inertia": num1("inertia", 1.0), "volume": vol,
+                 "massbias": (None if o.get("vtmb_phy_massbias") is None
+                              else num1("massbias", 1.0))}
+        text = phy_mod.text_half([solid], (), str(arm_obj.get("vtmb_phy_rootname", "")),
+                                 totalmass, concave=len(surf.ledges) > 1)
+        return {"surfaces": [surf], "text": text, "solids": [name], "joints": 0,
+                "totalmass": totalmass, "parts": len(surf.ledges)}
+    owner, dents = {}, []
+    for o in objs:
+        k = at.get(o.parent_bone)
+        if k is None:
+            raise SceneRefused(
+                "%s is a collision hull on bone %r, which the armature has not got, and a "
+                "solid is named for its bone: parent it to one (Ctrl+P > Bone). Nothing was "
+                "written" % (o.name, o.parent_bone))
+        if k in owner:
+            raise SceneRefused(
+                "%s and %s are both collision hulls on bone %r, and the engine finds a "
+                "bone's solid by name, first match winning: delete one of the two. Nothing "
+                "was written" % (owner[k][0].name, o.name, o.parent_bone))
+        surf, bad = hull_surface(o, scale)
+        dents += [(o.name, n, c) for n, c in bad]
+        owner[k] = (o, surf)
+    if dents:
+        raise SceneRefused(_dents_text(dents))
+    order = sorted(owner)
+    ordinal = {k: i for i, k in enumerate(order)}
+
+    def parent_of(k):
+        p = struct.unpack_from("<i", d.bones[k].raw, 0x04)[0]
+        while p >= 0 and p not in owner:
+            p = struct.unpack_from("<i", d.bones[p].raw, 0x04)[0]
+        return p
+
+    roots = [d.bones[k].name for k in order if parent_of(k) < 0]
+    if len(roots) > 1:
+        raise SceneRefused(
+            "the collision hulls on %s each have no hull on any ancestor bone, so the "
+            "ragdoll would be in %d pieces: give a bone above them all a hull. Nothing was "
+            "written" % (", ".join(repr(n) for n in roots), len(roots)))
+    totalmass = float(arm_obj.get("vtmb_phy_totalmass", 1.0))
+    vols = [phy_mod.surface_volume(owner[k][1]) for k in order]
+
+    def num(o, key, default):
+        v = o.get("vtmb_phy_" + key)
+        return float(v) if v is not None else default
+
+    bias = [num(owner[k][0], "massbias", 1.0) for k in order]
+    share = phy_mod.masses(vols, bias, totalmass)
+    solids, joints = [], []
+    for i, k in enumerate(order):
+        o = owner[k][0]
+        flat = struct.unpack_from("<12f", d.bones[k].raw, 0x58)
+        rest = mdl_mod.mat_inverse([list(flat[0:4]), list(flat[4:8]), list(flat[8:12])])
+        p = parent_of(k)
+        solids.append({"name": d.bones[k].name,
+                       "parent": d.bones[p].name if p >= 0 else None,
+                       "origin": [r[3] for r in rest],
+                       "angles": phy_mod.matrix_angles(rest),
+                       "mass": num(o, "mass", share[i]),
+                       "surfaceprop": _text_prop(o, "surfaceprop", surfaceprop),
+                       "damping": num(o, "damping", 0.0),
+                       "rotdamping": num(o, "rotdamping", 0.0),
+                       "inertia": num(o, "inertia", 1.0),
+                       "volume": vols[i],
+                       "massbias": (None if o.get("vtmb_phy_massbias") is None
+                                    else bias[i])})
+        if p >= 0:
+            joints.append((ordinal[p], i, [num(o, key, 0.0) for key in JOINT_KEYS]))
+    surfaces = [owner[k][1] for k in order]
+    parts = sum(len(s.ledges) for s in surfaces)
+    text = phy_mod.text_half(solids, joints, str(arm_obj.get("vtmb_phy_rootname", "")),
+                             totalmass, concave=parts > len(surfaces))
+    return {"surfaces": surfaces, "text": text, "solids": [s["name"] for s in solids],
+            "joints": len(joints), "totalmass": totalmass, "parts": parts}
+
+
+def scene_hulls(arm_obj, m, source, content, scale):
+    """`read_hulls` over the donor's `.phy`, or None when the armature has no hull object.
+    Raises `SceneRefused` when it has one and the donor no `.phy` to write it into, or an
+    import that did not give every solid its object, so no hull can be matched to its
+    solid, or when the import made the hulls and every one is gone, which would leave a
+    `.phy` of no solid."""
+    objs = hull_objects(arm_obj)
+    if not objs and arm_obj.get("vtmb_phy_solids"):
+        raise SceneRefused(
+            "every collision hull object the import made is gone, and a .phy of no solid "
+            "is not something this export writes: undo the deletion, or keep one hull. "
+            "Nothing was written")
+    if not objs:
+        return None
+    try:
+        _where, data = donor_phy(source, content)
+    except OSError:
+        data = None
+    if data is None:
+        raise SceneRefused(
+            "%s %s collision hull%s, and the model being written over has no .phy to "
+            "write %s into: the export with a donor edits a .phy and does not make one. "
+            "Delete %s, or export with no donor (Export > VTMB model from scene), which "
+            "writes a .phy from the hulls. Nothing was written"
+            % (", ".join(repr(o.name) for o in objs[:3]) + (" ..." if len(objs) > 3 else ""),
+               "is a" if len(objs) == 1 else "are", "" if len(objs) == 1 else "s",
+               "it" if len(objs) == 1 else "them", "it" if len(objs) == 1 else "them"))
+    if not arm_obj.get("vtmb_phy_solids"):
+        raise SceneRefused(
+            "the armature has %d collision hull object%s and its import did not make one "
+            "per solid of the file's .phy (Collision was off, or a solid names a bone the "
+            "armature has not got), so none can be matched to its solid. Re-import with "
+            "Collision on, or delete the hull objects to keep the .phy as it is. Nothing "
+            "was written" % (len(objs), "" if len(objs) == 1 else "s"))
+    names = {v: k for k, v in bone_map(m, arm_obj).items()}
+    return read_hulls(arm_obj, m, data, scale, names)
+
+
+def bone_rests(d, m):
+    """{file bone name: its rest transform in model space, the inverse of the `posetobone`
+    `d` holds}."""
+    out = {}
+    for k, b in enumerate(m.bones):
+        flat = struct.unpack_from("<12f", d.bones[k].raw, 0x58)
+        out[b.name] = mdl_mod.mat_inverse([list(flat[0:4]), list(flat[4:8]), list(flat[8:12])])
+    return out
+
+
+def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls=None,
+                m=None, rest=None):
+    """The donor's `.phy` as this export leaves it: the edits `read_hulls` found in the
+    hulls (`hulls`), then every solid named for a bone in `removed` or dropped by a hull
+    taken away dropped (the user, 2026-10-29), or moved by `moves` when it has no parent and
+    more than one child solid (the user, the same day), then a solid added for each new
+    hull (`add_hull_solids`, with `m` and `rest`), then its bone names following `pairs`,
+    every remaining bone's (file name, name now) in file order. `write_phy` puts it beside
+    `dest` once the `.mdl` is written.
 
     It is written when it changed, and on a save-as whether or not it did: the new model has
     no collision and no ragdoll without it (the user, 2026-10-29). None when the donor has
     no `.phy`, or an export in place changes nothing in it; else {"data": the bytes, None on
     an error, "renamed": [(old, new)], "dropped": [solid names], "moved": [(solid name, bone
-    now)], "copied": where it came from when nothing changed, "error"}. A drop that would
-    leave the ragdoll in pieces raises `SceneRefused`, so nothing is written.
+    now)], "added": [bones], "rebuilt": [(solid, volume was, volume now)], "edited":
+    [(solid, key, was, now)], "copied": where it came from when nothing changed, "error"}.
+    A drop that would leave the ragdoll in pieces raises `SceneRefused`, so nothing is
+    written.
     """
+    h = hulls or {}
     try:
         where, data = donor_phy(source, content)
         if data is None:
             return None
-        out, _remap, dropped, moved = phy_mod.drop_solids(data, removed, moves)
+        out = phy_mod.edit_solids(data, h.get("surfaces"), h.get("values"), h.get("joints"))
+        out, _remap, dropped, moved = phy_mod.drop_solids(
+            out, list(removed) + list(h.get("drop", ())), moves)
+        added = []
+        if h.get("add"):
+            added, out = add_hull_solids(out, h["add"], m, rest or {})
         out, changed = (phy_mod.rename_bones(out, pairs) if any(a != b for a, b in pairs)
                         else (out, []))
     except phy_mod.RagdollSplit as e:
         raise SceneRefused("%s: %s. Nothing was written"
                            % (os.path.basename(phy_path(dest)), e)) from None
     except (OSError, phy_mod.PhyError) as e:
-        return {"data": None, "renamed": [], "dropped": [], "moved": [], "copied": None,
-                "error": str(e)}
-    if not changed and not dropped and not moved and same_file(source, dest):
+        return {"data": None, "renamed": [], "dropped": [], "moved": [], "added": [],
+                "rebuilt": [], "edited": [], "copied": None, "error": str(e)}
+    edited = bool(h.get("surfaces") or h.get("values") or h.get("joints"))
+    if not (changed or dropped or moved or added or edited) and same_file(source, dest):
         return None
     return {"data": out, "renamed": sorted(set(changed)), "dropped": dropped,
-            "moved": moved, "copied": None if changed or dropped or moved else where,
+            "moved": moved, "added": added, "rebuilt": list(h.get("rebuilt", ())),
+            "edited": list(h.get("edited", ())),
+            "copied": (None if changed or dropped or moved or added or edited else where),
             "error": None}
 
 
@@ -5052,8 +5554,8 @@ def write_phy(dest, rewrite):
         with open(phy_path(dest), "wb") as f:
             f.write(rewrite["data"])
     except OSError as e:
-        return dict(rewrite, data=None, renamed=[], dropped=[], moved=[], copied=None,
-                    error=str(e))
+        return dict(rewrite, data=None, renamed=[], dropped=[], moved=[], added=[],
+                    rebuilt=[], edited=[], copied=None, error=str(e))
     return rewrite
 
 
@@ -5068,6 +5570,9 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
     extra = {"rewritten": rewrite["renamed"] if done else [],
              "dropped": rewrite["dropped"] if done else [],
              "moved": rewrite["moved"] if done else [],
+             "added": rewrite["added"] if done else [],
+             "rebuilt": rewrite["rebuilt"] if done else [],
+             "edited": rewrite["edited"] if done else [],
              "copied": rewrite["copied"] if done else None,
              "error": rewrite["error"] if rewrite is not None else None}
     if done:
@@ -5089,7 +5594,8 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
     gone = sorted(g["name"] for g in removed or () if g["name"] in cited)
     moved = sorted((a, b) for a, b in renamed or () if a in cited)
     if not (gone or moved or geometry_moved or extra["rewritten"] or extra["dropped"]
-            or extra["moved"] or extra["copied"] or extra["error"]):
+            or extra["moved"] or extra["added"] or extra["rebuilt"] or extra["edited"]
+            or extra["copied"] or extra["error"]):
         return None
     return dict({"file": os.path.basename(phy_path(dest)), "removed": gone, "renamed": moved,
                  "geometry": geometry_moved}, **extra)
@@ -5657,11 +6163,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     for (bi, mi), ks in sorted(drops.items()):
         build_mod.drop_meshes(d, bi, mi, ks)
+    # Before `before_write`, which writes `.vmt` files: a dent refuses with nothing on disk.
+    hulls = scene_hulls(arm_obj, m, source, content, scale)
     if before_write is not None:
         before_write(d, scene["added_materials"])
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
-                              [g["name"] for g in removed], phy_moves(d, m, donor_pose))
-    if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]):
+                              [g["name"] for g in removed], phy_moves(d, m, donor_pose),
+                              hulls, m, bone_rests(d, m) if hulls and hulls["add"] else None)
+    if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]
+                                    or phy_rewrite["added"]):
         build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
     # The donor checksum is kept whether or not the .vtx is rewritten: the pair only
     # has to agree with each other, and the engine draws nothing when it does not.

@@ -760,6 +760,12 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
                     "holds coordinates, so the normal delta each flex record also "
                     "carries stays in the file and out of the scene. Off leaves the "
                     "mesh with no shape keys at all")
+    with_phy: bpy.props.BoolProperty(
+        name="Collision", default=True,
+        description="Read the .phy beside the model, or in the packs: one wire mesh per "
+                    "solid, parented to its bone, each loose part one convex piece. An "
+                    "export writes an edited one back, refusing a part with a dent in it, "
+                    "drops the solid of a deleted one and adds one for a new one")
     with_anims: bpy.props.BoolProperty(
         name="Animations", default=True,
         description="Import animations as actions")
@@ -794,6 +800,7 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         sub = lay.column()
         sub.enabled = self.with_mesh
         sub.prop(self, "with_flexes")
+        lay.prop(self, "with_phy")
         lay.prop(self, "with_anims")
         col = lay.column()
         col.enabled = self.with_anims
@@ -810,7 +817,7 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
                 context, self.filepath, anim_filter=self.anim_filter,
                 max_anims=self.max_anims,
                 with_mesh=self.with_mesh, with_flexes=self.with_flexes,
-                with_anims=self.with_anims, with_chained=self.with_chained,
+                with_phy=self.with_phy, with_anims=self.with_anims, with_chained=self.with_chained,
                 game_root=game_root, mods=mods, extra_roots=extract,
                 use_packs=self.use_packs, root_motion=self.root_motion)
         except Exception as exc:
@@ -821,9 +828,10 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         if r["warning"]:
             self.report({"WARNING"}, r["warning"])
         self.report({"INFO"}, "vtmb mdl: %d bones, %d verts, %d faces, %d animations "
-                              "(%d chained), %d sequences, %d/%d materials textured"
+                              "(%d chained), %d sequences, %d/%d materials textured, "
+                              "%d collision solids"
                     % (r["bones"], r["verts"], r["faces"], r["anims"],
-                       r["chained"], r["seqs"], r["textured"], r["materials"]))
+                       r["chained"], r["seqs"], r["textured"], r["materials"], r["hulls"]))
         return {"FINISHED"}
 
 
@@ -1583,16 +1591,25 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             % (phy["file"], phy["copied"]))
             if phy["dropped"]:
                 self.report({"INFO"},
-                            "%s: the solid%s of %s dropped with the bone%s, so that part "
-                            "of the body has no collision and no ragdoll segment of its own"
+                            "%s: the solid%s of %s dropped with the bone or the collision "
+                            "hull deleted, so that part of the body has no collision and "
+                            "no ragdoll segment of its own"
                             % (phy["file"], "" if len(phy["dropped"]) == 1 else "s",
-                               ", ".join(repr(n) for n in phy["dropped"]),
-                               "" if len(phy["dropped"]) == 1 else "s"))
+                               ", ".join(repr(n) for n in phy["dropped"])))
             for a, b in phy["moved"]:
                 self.report({"INFO"},
                             "%s: the solid of %r moved to %r, which its child bones now "
                             "hang from, so the ragdoll stays in one piece"
                             % (phy["file"], a, b))
+            for b in phy["added"]:
+                self.report({"INFO"}, "%s: a solid added on %r, jointed to its nearest "
+                                      "ancestor's solid" % (phy["file"], b))
+            for a, was, now in phy["rebuilt"]:
+                self.report({"INFO"}, "%s: the solid of %r rebuilt from its edited hull, "
+                                      "volume %s -> %s cubic inches; its mass is kept"
+                            % (phy["file"], a, was, now))
+            for a, key, was, now in phy["edited"]:
+                self.report({"INFO"}, "%s: %r %s %s -> %s" % (phy["file"], a, key, was, now))
             if phy["rewritten"]:
                 self.report({"INFO"},
                             "%s rewritten for the renamed bones: %s"
@@ -1616,9 +1633,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             "created" % (phy["file"], a))
             if phy["geometry"] and not phy["renamed"] and not phy["removed"]:
                 self.report({"WARNING"},
-                            "%s still describes the old geometry. Nothing here writes its "
-                            "hulls and the engine never compares the two, so collision "
-                            "stays at the shape the donor had" % phy["file"])
+                            "%s keeps the hulls the collision objects hold, and the engine "
+                            "never compares them with the mesh: edit those (an import with "
+                            "Collision on makes them) for collision to follow the new "
+                            "geometry" % phy["file"])
         for gone in r.get("removed") or []:
             self.report({"WARNING"},
                         "%r is not in the armature and was removed from the file: "
@@ -2136,13 +2154,30 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 # `build` emits each of these with a count of zero, which nobody reads out of a header.
 # The chain is the worst on a character: its animations live in the included files.
 SCRATCH_DROPS = (
-    "collision and ragdoll -- both live in the sibling .phy, not written",
     ("procedural bones, IK chains and bone controllers -- a spring bone chain "
      "authored on a bone IS written"),
     "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
     ("which hitbox set the engine selects at runtime -- the boxes and the sets "
      "themselves ARE written, whatever Fit hitboxes says"),
 )
+
+
+def _report_scratch_phy(op, phy):
+    """What the scratch export wrote of collision, out of `export_scene`'s "phy"."""
+    if phy is None:
+        op.report({"INFO"}, "no collision hull objects, so no .phy was written: the model "
+                            "has no collision and no ragdoll")
+    elif "stale" in phy:
+        op.report({"WARNING"}, "no collision hull objects, so no .phy was written, and %s "
+                               "from before is beside the model, left as it was: the engine "
+                               "loads it with this model" % phy["stale"])
+    else:
+        n = len(phy["solids"])
+        op.report({"INFO"}, "wrote a .phy of %d solid%s and %d joint%s, %d convex piece%s, "
+                            "total mass %s" % (n, "" if n == 1 else "s", phy["joints"],
+                                               "" if phy["joints"] == 1 else "s",
+                                               phy["parts"], "" if phy["parts"] == 1 else "s",
+                                               "%g" % phy["totalmass"]))
 
 
 def _scratch_meshes(context, arm_obj):
@@ -2152,7 +2187,7 @@ def _scratch_meshes(context, arm_obj):
     Not filtered on `vtmb_model`: that marker comes from the importer, and a hand-built
     scene -- the case this operator exists for -- is exactly the one with none.
     """
-    return [o for o in context.scene.objects if o.type == "MESH"
+    return [o for o in context.scene.objects if o.type == "MESH" and not o.get("vtmb_phy_hull")
             and (o.parent is arm_obj
                  or any(getattr(mo, "object", None) is arm_obj for mo in o.modifiers))]
 
@@ -2612,6 +2647,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
         _report_placed(self, moved, None, set())
+        _report_scratch_phy(self, r.get("phy"))
         if (r.get("skin_families") or 0) > 1:
             self.report({"INFO"}, "wrote %d skin families" % r["skin_families"])
         if r.get("meshless"):

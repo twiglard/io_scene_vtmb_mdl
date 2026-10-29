@@ -6,7 +6,8 @@ becomes `mstudiobone_t[]`, the mesh objects become bodyparts, the actions become
 The sequences are the imported list where the armature carries one, `vtmb_sequences` with its
 pose parameters, and one per action for every action that list does not cite. Attachments,
 hitboxes, the include chain, cloth, spring bone chains, shape keys as flexes with the flex
-controllers and rules, eyeballs and the mouth are written from the scene too.
+controllers and rules, eyeballs and the mouth are written from the scene too, and the
+collision hull objects as a `.phy` beside the model.
 Everything else is emitted with a count of zero, and `SCRATCH_DROPS` in `__init__` is the list
 of it the export dialog prints.
 
@@ -29,6 +30,7 @@ from . import mdl as mdl_mod
 from . import mdl_build as build_mod
 from . import mdl_write as write_mod
 from . import paths as paths_mod
+from . import phy as phy_mod
 from . import vtx_rebuild as vtxr_mod
 
 # A bone needs at least one bit of the 0xFFFC used-by mask or it gets no bone matrix and
@@ -1527,14 +1529,28 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, before_wr
                  **kw):
     """`before_write(d, added)` runs on the built model before any file is written, so a
     caller that refuses over what the build produced leaves nothing on disk. `added` is
-    every texture name, since with no donor every material is one the export added."""
+    every texture name, since with no donor every material is one the export added.
+
+    The collision hulls are read before it too, so a dent stops the export with nothing
+    written; with none, no `.phy` is, and one already beside `path` is left as it is."""
     (d, faces, unskinned, kept, moved, crowded, unfitted, unkeepable, cloths,
      stray, hbox, seqs, face) = build(context, arm_obj, mesh_objs, actions,
                                       embedded_name(path), **kw)
+    stem = path[:-4] if path.lower().endswith(".mdl") else path
+    phy = export_mod.hulls_phy(arm_obj, d, kw.get("scale", 1.0), kw.get("surfaceprop", "flesh"),
+                               os.path.basename(stem))
+    if phy is not None:
+        build_mod.set_physicsbones(d, phy["solids"])
     if before_write is not None:
         before_write(d, [r.name for r in d.textures])
     data, vtx, st = write(d, faces, path, checksum)
-    return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones),
+    if phy is not None:
+        with open(stem + ".phy", "wb") as f:
+            f.write(phy_mod.phy_file(checksum, phy["surfaces"], phy["text"]))
+        phy = {k: phy[k] for k in ("solids", "joints", "totalmass", "parts")}
+    elif os.path.exists(stem + ".phy"):
+        phy = {"stale": stem + ".phy"}
+    return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones), "phy": phy,
             "hull_inverted": export_mod.inverted_axes(d),
             "with_root_motion": moved, "unfitted": unfitted,
             "unkeepable": unkeepable,

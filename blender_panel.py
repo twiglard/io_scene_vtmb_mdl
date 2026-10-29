@@ -23,6 +23,7 @@ from . import blender_scratch
 from . import mdl as mdl_mod
 from . import mdl_build as build_mod
 from . import paths as paths_mod
+from . import phy as phy_mod
 
 INCLUDES = "vtmb_includes"
 CHAIN = "vtmb_chain"
@@ -804,7 +805,8 @@ class VTMB_PT_cloth(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "MESH"
+        o = context.object
+        return o is not None and o.type == "MESH" and not o.get("vtmb_phy_hull")
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -1013,6 +1015,183 @@ class VTMB_OT_add_cloth_sphere(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _hull_points(context, arm_obj, bone, whole):
+    """The rest-pose points studiomdl hulls for `bone`, in its space: every vertex of every
+    face of the armature's meshes with a vertex weighted to it (`CopyFaceVertsByBone`,
+    source-2003 `collisionmodel.cpp:835`), a weight on a descendant bone with no hull of
+    its own counting for it, as `RemapBone` maps one to the nearest ancestor with a
+    joint. With `whole`, every vertex. With no bone, in the armature's space."""
+    hulled = {o.parent_bone for o in blender_export.hull_objects(arm_obj)
+              if o.parent_type == "BONE"}
+    mine = None
+    if not whole:
+        mine, todo = set(), [bone]
+        while todo:
+            b = todo.pop()
+            mine.add(b.name)
+            todo += [c for c in b.children if c.name not in hulled]
+    to_arm = arm_obj.matrix_world.inverted()
+    to_bone = bone.matrix_local.inverted() if bone is not None else mathutils.Matrix()
+    out = []
+    for obj in blender_export.armature_meshes(context.scene, arm_obj):
+        m = to_bone @ to_arm @ obj.matrix_world
+        me = obj.data
+        if mine is None:
+            out += [tuple(m @ v.co) for v in me.vertices]
+            continue
+        groups = {g.index for g in obj.vertex_groups if g.name in mine}
+        on = [any(x.group in groups and x.weight > 0 for x in v.groups) for v in me.vertices]
+        used = set()
+        for p in me.polygons:
+            if any(on[i] for i in p.vertices):
+                used.update(p.vertices)
+        out += [tuple(m @ me.vertices[i].co) for i in sorted(used)]
+    return out
+
+
+class VTMB_OT_add_hull_from_weights(bpy.types.Operator):
+    bl_idname = "vtmb.add_hull_from_weights"
+    bl_label = "Hull from weights"
+    bl_description = ("A collision hull for the active bone as studiomdl builds one: the "
+                      "convex hull of every face with a vertex weighted to the bone, or to "
+                      "a child bone with no hull of its own. Replaces the bone's hull")
+    bl_options = {"REGISTER", "UNDO"}
+
+    whole: bpy.props.BoolProperty(
+        name="Whole model", default=False,
+        description="The hull of every vertex of the armature's meshes, weighted or not: "
+                    "a single-body prop's hull on the armature where it has one, else on "
+                    "the active bone")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == "ARMATURE"
+                and (context.active_bone is not None))
+
+    def execute(self, context):
+        arm_obj = context.object
+        bone = arm_obj.data.bones.get(context.active_bone.name)
+        if bone is None:
+            self.report({"ERROR"}, "bone %r is not in the armature yet; leave Edit mode "
+                                   "first" % context.active_bone.name)
+            return {"CANCELLED"}
+        prop = next((o for o in blender_export.hull_objects(arm_obj)
+                     if o.parent_type != "BONE"), None) if self.whole else None
+        pts = _hull_points(context, arm_obj, None if prop else bone, self.whole)
+        try:
+            tris = phy_mod.convex_hull(pts)
+        except phy_mod.PhyError as e:
+            self.report({"ERROR"}, "%d points make no hull: %s" % (len(pts), e))
+            return {"CANCELLED"}
+        keep = sorted({i for t in tris for i in t})
+        at = {i: k for k, i in enumerate(keep)}
+        old = prop or next((o for o in blender_export.hull_objects(arm_obj)
+                            if o.parent_type == "BONE" and o.parent_bone == bone.name), None)
+        label = old.data.name if prop else "%s.collision.%s" % (arm_obj.name, bone.name)
+        mesh = bpy.data.meshes.new(label)
+        mesh.from_pydata([pts[i] for i in keep], [], [tuple(at[i] for i in t) for t in tris])
+        mesh.update()
+        if old is not None:
+            was, old.data = old.data, mesh
+            if was.users == 0:
+                bpy.data.meshes.remove(was)
+                mesh.name = label
+            obj = old
+        else:
+            obj = bpy.data.objects.new(label, mesh)
+            obj.display_type = "WIRE"
+            obj.hide_render = True
+            _link_beside(arm_obj, obj)
+            blender_import._bone_child(obj, arm_obj, bone)
+            obj["vtmb_phy_hull"] = 1
+            # Written as the joint to the parent solid; a root solid has none.
+            for key in blender_export.JOINT_KEYS:
+                obj["vtmb_phy_" + key] = 0.0
+        self.report({"INFO"}, "%s: a hull of %d points over %d" % (obj.name, len(keep),
+                                                                   len(pts)))
+        return {"FINISHED"}
+
+
+class VTMB_OT_check_hull(bpy.types.Operator):
+    bl_idname = "vtmb.check_hull"
+    bl_label = "Check for dents"
+    bl_description = ("Whether the export would write this hull as it is drawn: each loose "
+                      "part must be convex, and a concave one stops the export")
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj is not None and obj.type == "MESH" and obj.get("vtmb_phy_hull")
+
+    def execute(self, context):
+        obj = context.object
+        if obj.mode == "EDIT":
+            obj.update_from_editmode()
+        scale = float((obj.parent or obj).get("vtmb_scale", 1.0) or 1.0)
+        try:
+            surf, dents = blender_export.hull_surface(obj, scale)
+        except blender_export.SceneRefused as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        if dents:
+            self.report({"WARNING"}, "; ".join(
+                "loose part %d is concave at %d %s" % (n, c, "vertex" if c == 1
+                                                         else "vertices")
+                for n, c in dents))
+        else:
+            self.report({"INFO"}, "%d loose part%s, every one convex"
+                        % (len(surf.ledges), "" if len(surf.ledges) == 1 else "s"))
+        return {"FINISHED"}
+
+
+# What the export writes for a `solid` value the object does not carry: studiomdl's
+# (source-2003 `collisionmodel.cpp:246`, `:523`), or the file's where it edits one.
+HULL_DEFAULTS = {"mass": "a share of the total mass by volume", "surfaceprop": "the model's",
+                 "damping": "0", "rotdamping": "0", "inertia": "1", "massbias": "1"}
+
+
+def draw_hull(lay, obj):
+    """A collision hull's solid: its bone, its `solid` values and, on a joint's child, the
+    joint's nine limits, in degrees about the child bone's own axes."""
+    k = obj.get("vtmb_phy_solid")
+    lay.label(text="%s on %s" % ("solid %d" % k if k is not None else "new solid",
+                                 obj.parent_bone if obj.parent_type == "BONE"
+                                 else "the armature, model space"), icon="BONE_DATA")
+    n = len(blender_export.loose_parts(obj.data))
+    lay.label(text="%d loose part%s, each written as its convex hull"
+              % (n, "" if n == 1 else "s"), icon="MESH_ICOSPHERE")
+    lay.operator("vtmb.check_hull", icon="CHECKMARK")
+    col = lay.column(align=True)
+    for key, _kind in blender_export.HULL_KEYS:
+        if obj.get("vtmb_phy_" + key) is not None:
+            col.prop(obj, '["vtmb_phy_%s"]' % key, text=key)
+        else:
+            col.label(text="%s: %s" % (key, HULL_DEFAULTS[key]))
+    if all(obj.get("vtmb_phy_" + key) is not None for key in blender_export.JOINT_KEYS):
+        lay.label(text="joint to the parent solid, degrees:")
+        grid = lay.grid_flow(columns=3, align=True)
+        for key in blender_export.JOINT_KEYS:
+            grid.prop(obj, '["vtmb_phy_%s"]' % key, text=key)
+
+
+class VTMB_PT_hull(bpy.types.Panel):
+    bl_label = "VTMB collision hull"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and bool(context.object.get("vtmb_phy_hull"))
+
+    def draw(self, context):
+        self.layout.use_property_split = False
+        draw_hull(self.layout, context.object)
+
+
 def _link_beside(arm_obj, obj):
     for c in bpy.data.collections:
         if arm_obj.name in c.objects:
@@ -1072,6 +1251,13 @@ def draw_accessories(lay, context, arm_obj):
     row = lay.row(align=True)
     row.operator("vtmb.add_cloth_capsule", icon="SPHERE")
     row.operator("vtmb.add_cloth_sphere", icon="MESH_UVSPHERE")
+    row = lay.row(align=True)
+    row.operator("vtmb.add_hull_from_weights", icon="MESH_ICOSPHERE").whole = False
+    row.operator("vtmb.add_hull_from_weights", text="Hull of whole model",
+                 icon="MESH_ICOSPHERE").whole = True
+    hulls = blender_export.hull_objects(arm_obj)
+    lay.label(text="%d collision hull%s" % (len(hulls), "" if len(hulls) == 1 else "s"),
+              icon="INFO")
     line, over = cloth_volume_line(arm_obj)
     lay.label(text=line, icon="INFO")
     if over:
@@ -3646,6 +3832,7 @@ CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_PT_cloth, VTMB_PT_material,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_OT_add_cloth_capsule,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
+           VTMB_OT_add_hull_from_weights, VTMB_OT_check_hull, VTMB_PT_hull,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
