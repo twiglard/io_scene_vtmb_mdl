@@ -1,4 +1,4 @@
-"""The `.vmt` beside a material the exporter has just added to a `.mdl`.
+r"""The `.vmt` beside a material the exporter has just added to a `.mdl`.
 
 A `.mdl` carries a material name and a directory list and nothing else -- no shader, no
 texture path, no render state -- so a new `mstudiotexture_t` resolves to the purple
@@ -39,7 +39,7 @@ SEP = "\\"
 
 
 def texture_path(directory, name):
-    """`models\character\...\andrei` -- a `$basetexture` value, no extension.
+    r"""`models\character\...\andrei` -- a `$basetexture` value, no extension.
 
     The directory is the same string the `.mdl`'s cdtexture list carries, which is
     relative to `materials/` and already carries its trailing separator on 4442 of the
