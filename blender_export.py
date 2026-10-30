@@ -5209,6 +5209,8 @@ def read_hulls(arm_obj, m, data, scale, names):
                 out["joints"][k] = jv
                 out["edited"] += [(label, key, joints[k][key], t) for key, t in jv.items()]
         if not hull_unchanged(o, s, scale):
+            # The donor's tag, or none, though a save reloads an untagged solid after solid 0
+            # as solid 0. Waits on a ragdoll saved and loaded in game (todo-vtmb-phy.md step 5).
             surf, bad = hull_surface(o, scale, s.dummy[8:])
             dents += [(o.name, label, n, c) for n, c in bad]
             if surf is not None:
