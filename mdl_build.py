@@ -1857,6 +1857,9 @@ def remove_bone(d, i):
     for r in d.anims:
         blk = r.extra.get("block")
         tracks.append(W.read_tracks(_Block(blk, old.bones), _AnimHdr(r)) if blk else None)
+    kid_idx = [k for k, r in enumerate(d.bones)
+               if struct.unpack_from("<i", r.raw, 0x04)[0] == i]
+    held = [_hold_removed(t, old, i, kid_idx) if t is not None else None for t in tracks]
 
     gone = M.mat_from_quat_pos(struct.unpack_from("<4f", d.bones[i].raw, 0x2c),
                                struct.unpack_from("<3f", d.bones[i].raw, 0x20))
@@ -1952,7 +1955,14 @@ def remove_bone(d, i):
     _stamp_posetobone(d)
 
     new = _skeleton(d)
-    for r, t in zip(d.anims, tracks):
+    held = [dict((ren(k), v) for k, v in h.items()) if h else None for h in held]
+    scales, _ = W.fit_rebase_scales(new, [h for h in held if h])
+    for k, br in enumerate(d.bones):
+        struct.pack_into("<3f", br.raw, 0x3c, *scales[k][:3])
+        struct.pack_into("<4f", br.raw, 0x48, *scales[k][3:])
+        new.bones[k].posscale = scales[k][:3]
+        new.bones[k].rotscale = scales[k][3:]
+    for r, t, h in zip(d.anims, tracks, held):
         if t is None:
             poses = r.extra.get("poses")
             if poses:
@@ -1961,9 +1971,83 @@ def remove_bone(d, i):
             continue
         t.chan = dict(((ren(b), c), v) for (b, c), v in t.chan.items() if b != i)
         t.weights = dict((ren(b), x) for b, x in t.weights.items() if b != i)
+        if h:
+            W.apply_rebase(t, new, h, scales)
         r.extra["block"] = W._anim_block(new, t)
         r.extra["block_bones"] = len(d.bones)
     return name, kids, moved, rigid, rebound
+
+
+def _hold_removed(t, old, i, kids):
+    """What each child of bone `i` has to carry, per frame, for its world pose to stay
+    where the animation put it with `i` still there: {child: (pos per frame, quat per
+    frame)}, either side None where the bind `remove_bone` writes already decodes to it.
+
+    A rotation channel has no bind base, so channels left as they are lose `i`'s rotation
+    (BUGS 185). Blender's delete holds `i` at its bind instead, so an animation re-exported
+    off the pose loses `i`'s motion where a carried one keeps it.
+
+    A BONE_ROTATION_FROM_ROOT child's world rotation is its local one, so only its
+    translation follows `i`. When `i` carries the flag, a child is taken against its
+    grandparent's world matrix at each frame.
+    """
+    nf = t.numframes
+    if nf <= 0 or not kids:
+        return {}
+    bones = old.bones
+
+    def has(k, lo, hi):
+        return any(t.chan.get((k, c)) for c in range(lo, hi))
+
+    def local(b, f):
+        k = b.index
+        return ([b.pos[c] + t.chan[(k, c)][f] * b.posscale[c] if t.chan.get((k, c))
+                 else b.pos[c] for c in range(3)],
+                [t.chan[(k, 3 + c)][f] * b.rotscale[c] if t.chan.get((k, 3 + c))
+                 else b.quat[c] for c in range(4)])
+
+    p = bones[i]
+    p_root = p.flags & M.BONE_ROTATION_FROM_ROOT
+    gp = p.parent
+    out = {}
+    for k in kids:
+        b = bones[k]
+        k_root = b.flags & M.BONE_ROTATION_FROM_ROOT
+        if p_root:
+            need_p = need_q = True
+        else:
+            need_p = has(k, 0, 3) or has(i, 0, 7)
+            # A flagged child keeps its own rotation, but the bind it falls back on for
+            # an absent component is now the composed one.
+            need_q = k_root or has(k, 3, 7) or has(i, 3, 7)
+        if not need_p and not need_q:
+            continue
+        pos_f, quat_f, prev = [], [], None
+        for f in range(nf):
+            pos_c, q_c = local(b, f)
+            if not p_root:
+                pos_p, q_p = local(p, f)
+                m = M.mat_from_quat_pos(q_p, pos_p)
+                pos_f.append([sum(m[r][x] * pos_c[x] for x in range(3)) + m[r][3]
+                              for r in range(3)])
+                quat_f.append(list(q_c) if k_root else W.qmul(q_p, q_c))
+                continue
+            world = M.Mdl.world_matrices(_Block(b"", bones), [local(x, f) for x in bones])
+            wk = world[k]
+            wg = world[gp] if gp >= 0 else M.mat_identity()
+            ginv = M.mat_inverse(wg)
+            dt = [wk[r][3] - wg[r][3] for r in range(3)]
+            pos_f.append([sum(ginv[r][x] * dt[x] for x in range(3)) for r in range(3)])
+            if k_root:
+                quat_f.append(list(q_c))
+                continue
+            q = M.quat_from_mat(M.mat_mul(ginv, wk))
+            if prev is not None and sum(x * y for x, y in zip(q, prev)) < 0:
+                q = [-x for x in q]
+            prev = q
+            quat_f.append(q)
+        out[k] = (pos_f if need_p else None, quat_f if need_q else None)
+    return out
 
 
 def add_hitbox(d, boxes, name="default", at=None):
