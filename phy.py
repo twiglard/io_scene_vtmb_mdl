@@ -1601,6 +1601,29 @@ def edit_solids(data, surfaces=None, values=None, joints=None):
     return bytes(data[:HEADER.size]) + b"".join(records) + text
 
 
+def tag_solids(data):
+    """`data` with `IVPS` in every solid's `dummy[2]` when it holds more than one, and how
+    many solids lacked it.
+
+    `VCollideLoad` (vphysics.dll 0x2600ac70) writes a solid's index into `dummy[0]` only on
+    a tagged solid, and `CollideIndex` answers 0 for any other. A saved game records that
+    answer and the load rebuilds the object from `solids[iCollide]` (vampire.dll
+    0x100458f1, 0x100444a4), so an untagged ragdoll comes back with every element on solid
+    0's hull. 98 of 7353 shipped solids are untagged: every solid of four ragdolls and 38
+    one-solid props, where index 0 is the right answer anyway."""
+    records = _records(data)
+    if len(records) < 2:
+        return data, 0
+    n = 0
+    for k, r in enumerate(records):
+        if r[48:52] != IVPS:
+            records[k] = r[:48] + IVPS + r[52:]
+            n += 1
+    if not n:
+        return data, 0
+    return bytes(data[:HEADER.size]) + b"".join(records) + bytes(data[text_start(data):]), n
+
+
 def add_solid(data, surface, pairs, joint=None):
     """`data` with one solid appended, and its ordinal: the record after the last, a `solid`
     block of `index` then `pairs` [(key, value)] after the last `solid` block, and with

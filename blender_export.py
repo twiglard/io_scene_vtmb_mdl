@@ -5209,8 +5209,7 @@ def read_hulls(arm_obj, m, data, scale, names):
                 out["joints"][k] = jv
                 out["edited"] += [(label, key, joints[k][key], t) for key, t in jv.items()]
         if not hull_unchanged(o, s, scale):
-            # The donor's tag, or none, though a save reloads an untagged solid after solid 0
-            # as solid 0. Waits on a ragdoll saved and loaded in game (todo-vtmb-phy.md step 5).
+            # The donor's tag; `rewrite_phy` tags every solid of a file with more than one.
             surf, bad = hull_surface(o, scale, s.dummy[8:])
             dents += [(o.name, label, n, c) for n, c in bad]
             if surf is not None:
@@ -5551,8 +5550,9 @@ def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls
     more than one child solid (the user, the same day), then a solid added for each new
     hull (`add_hull_solids`, with `m` and `rest`), then its bone names following `pairs`,
     every remaining bone's (file name, name now) in file order, then `collision`, bytes from
-    `scene_collision_text`, as its `phy.collision_text` where it differs. `write_phy` puts
-    it beside `dest` once the `.mdl` is written.
+    `scene_collision_text`, as its `phy.collision_text` where it differs, then `IVPS` on
+    every solid of a file with more than one (`phy.tag_solids`). `write_phy` puts it beside
+    `dest` once the `.mdl` is written.
 
     It is written when it changed, and on a save-as whether or not it did: the new model has
     no collision and no ragdoll without it (the user, 2026-10-29). None when the donor has
@@ -5560,7 +5560,8 @@ def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls
     an error, "renamed": [(old, new)], "dropped": [solid names], "moved": [(solid name, bone
     now)], "added": [bones], "rebuilt": [(solid, volume was, volume now)], "edited":
     [(solid, key, was, now)], "collision": (`break` blocks was, now) when `collision` was
-    written, "copied": where it came from when nothing changed, "error"}.
+    written, "copied": where it came from when nothing changed, "tagged": solids that
+    lacked the tag, "error"}.
     A drop that would leave the ragdoll in pieces raises `SceneRefused`, so nothing is
     written.
     """
@@ -5583,23 +5584,22 @@ def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls
             if collision != was:
                 out = phy_mod.with_collision_text(out, collision)
                 retext = (phy_mod.break_count(was), phy_mod.break_count(collision))
+        out, tagged = phy_mod.tag_solids(out)
     except phy_mod.RagdollSplit as e:
         raise SceneRefused("%s: %s. Nothing was written"
                            % (os.path.basename(phy_path(dest)), e)) from None
     except (OSError, phy_mod.PhyError) as e:
         return {"data": None, "renamed": [], "dropped": [], "moved": [], "added": [],
                 "rebuilt": [], "edited": [], "collision": None, "copied": None,
-                "error": str(e)}
+                "tagged": 0, "error": str(e)}
     edited = bool(h.get("surfaces") or h.get("values") or h.get("joints"))
-    if (not (changed or dropped or moved or added or edited or retext)
-            and same_file(source, dest)):
+    touched = changed or dropped or moved or added or edited or retext or tagged
+    if not touched and same_file(source, dest):
         return None
     return {"data": out, "renamed": sorted(set(changed)), "dropped": dropped,
             "moved": moved, "added": added, "rebuilt": list(h.get("rebuilt", ())),
             "edited": list(h.get("edited", ())), "collision": retext,
-            "copied": (None if changed or dropped or moved or added or edited or retext
-                       else where),
-            "error": None}
+            "copied": None if touched else where, "tagged": tagged, "error": None}
 
 
 def built_phy(checksum, built):
@@ -5621,7 +5621,7 @@ def write_phy(dest, rewrite):
     except OSError as e:
         return dict(rewrite, data=None, renamed=[], dropped=[], moved=[], added=[],
                     rebuilt=[], edited=[], collision=None, copied=None, built=None,
-                    error=str(e))
+                    tagged=0, error=str(e))
     return rewrite
 
 
@@ -5642,6 +5642,7 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
              "collision": rewrite.get("collision") if done else None,
              "copied": rewrite["copied"] if done else None,
              "built": rewrite.get("built") if done else None,
+             "tagged": rewrite.get("tagged", 0) if done else 0,
              "error": rewrite["error"] if rewrite is not None else None}
     if done:
         renamed = []

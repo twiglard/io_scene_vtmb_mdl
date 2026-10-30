@@ -1627,6 +1627,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                             % (phy["file"], a, was, now))
             for a, key, was, now in phy["edited"]:
                 self.report({"INFO"}, "%s: %r %s %s -> %s" % (phy["file"], a, key, was, now))
+            if phy.get("tagged"):
+                n = phy["tagged"]
+                self.report({"INFO"}, "%s: %d solid%s tagged IVPS, without which a saved "
+                                      "game rebuilds every part of the ragdoll from the "
+                                      "first solid" % (phy["file"], n, "" if n == 1 else "s"))
             if phy["rewritten"]:
                 self.report({"INFO"},
                             "%s rewritten for the renamed bones: %s"
