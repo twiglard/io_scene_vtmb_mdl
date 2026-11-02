@@ -4872,8 +4872,9 @@ def vtx_path(path, flavour="dx80"):
 def stale_flavours(dest, written=("dx80",)):
     """Other .vtx flavours beside the file just written, which now disagree with it.
 
-    A flavour nobody rewrote still describes the old geometry. The engine tests only the
-    flavour it loaded and takes `.dx80.vtx` first, so this is a warning, not an error.
+    A flavour nobody rewrote still describes the old geometry. The engine opens one flavour,
+    by dx level: `.dx80.vtx` at the default, `.dx7_2bone.vtx` alone under `-dxlevel 70`, and
+    never `.dx90` or `.sw`. So this is a warning, which matters only under `-dxlevel 70`.
     """
     return [os.path.basename(p) for p in
             (vtx_path(dest, f)
@@ -6346,8 +6347,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "remodelled": sorted((v, k) for k, v in remodelled.items()),
             "rebodied": sorted((v, k) for k, v in rebodied.items()),
             "includes": [r.name for r in d.includes],
+            # `drops` with the rest: a model or eye mesh written with no mesh moves every
+            # flavour's tree, so a .vtx this pass did not rewrite no longer matches.
             "stale": (stale_flavours(dest, [x["flavour"] for x in touched])
-                      if (revised or removed or added_bones or cloth_removed) else []),
+                      if (revised or removed or added_bones or cloth_removed or drops)
+                      else []),
             "cloth": cloth, "cloth_edits": cloth_was, "cloth_removed": cloth_removed,
             "lods": lods, "no_vtx": no_vtx, "vtx_eye_flags": eye_flags,
             "phy": phy_report(source, dest, removed, renamed, bool(revised), phy_rewrite,
