@@ -81,6 +81,10 @@ CLOTH_SPHERES_MAX = 16
 # A bone carrying no bit of the 0xfffc used-by mask gets no bone matrix, so anything skinned
 # to it draws nothing.  0x10 is the corpus norm: 62439 of 62702 bones carry it.
 BONE_USED = 0x10
+# Shipped: 14147 of 14151 box bones and all 1334 attachment bones, with every ancestor. A box
+# bone without 0x4 crashes vampire.dll's ComputeHitboxSurroundingBox at a prop_ragdoll spawn.
+BONE_USED_BY_HITBOX = 0x4
+BONE_USED_BY_ATTACHMENT = 0x8
 
 # Every record ships as this, on all 32742 blocks of all 311 corpus models that carry an
 # include -- one distinct value, no exceptions.  Nothing in the file reads it and the engine
@@ -2072,6 +2076,27 @@ def add_hitbox(d, boxes, name="default", at=None):
         struct.pack_into("<3f", raw, 20, *hi)
         rec.kids.append(Rec(raw))
     return at
+
+
+def mark_bones_used(d):
+    """OR BONE_USED_BY_HITBOX into each hitbox's bone and its ancestors, and
+    BONE_USED_BY_ATTACHMENT into each attachment's; the number of bone records changed."""
+    want = [0] * len(d.bones)
+    cites = [(struct.unpack_from("<i", k.raw, 0)[0], BONE_USED_BY_HITBOX)
+             for s in d.hitboxsets for k in s.kids]
+    cites += [(struct.unpack_from("<i", a.raw, 8)[0], BONE_USED_BY_ATTACHMENT)
+              for a in d.attachments]
+    for bone, bit in cites:
+        while 0 <= bone < len(d.bones) and not want[bone] & bit:
+            want[bone] |= bit
+            bone = struct.unpack_from("<i", d.bones[bone].raw, 0x04)[0]
+    changed = 0
+    for b, bits in zip(d.bones, want):
+        flags = struct.unpack_from("<i", b.raw, 0x88)[0]
+        if flags | bits != flags:
+            struct.pack_into("<i", b.raw, 0x88, flags | bits)
+            changed += 1
+    return changed
 
 
 def add_attachment(d, name, bone, local=None, type=0):

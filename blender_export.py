@@ -4233,6 +4233,8 @@ def apply_accessories(d, m, arm_obj, scale):
         for name, recs in want:
             build_mod.add_hitbox(d, [(b, g, v[0:3], v[3:6]) for b, g, v in recs], name)
         changed += sum(len(r) for _n, r in want) or 1
+    if changed:
+        build_mod.mark_bones_used(d)
     return changed
 
 

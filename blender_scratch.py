@@ -1426,6 +1426,7 @@ def build(context, arm_obj, mesh_objs, actions, name, scale=1.0, surfaceprop="fl
     nfit = fit_hitboxes(d, mesh_objs, bone_index, arm_obj, scale) if (
         hitboxes and not nset) else 0
     add_attachments(d, arm_obj, bone_index, scale)
+    build_mod.mark_bones_used(d)
     nvol, vmoved, d.cloth_two_bone = add_cloth_volumes(d, arm_obj, owners, bone_index,
                                                        scale)
     d.cloth_volumes = (nvol, vmoved)
