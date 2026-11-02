@@ -2075,7 +2075,18 @@ def add_hitbox(d, boxes, name="default", at=None):
         struct.pack_into("<3f", raw, 8, *lo)
         struct.pack_into("<3f", raw, 20, *hi)
         rec.kids.append(Rec(raw))
+        _mark_up(d, bone, BONE_USED_BY_HITBOX)
     return at
+
+
+def _mark_up(d, bone, bit):
+    """OR `bit` into the flags of `bone` and every ancestor of it."""
+    for _ in range(len(d.bones)):
+        if not 0 <= bone < len(d.bones):
+            return
+        raw = d.bones[bone].raw
+        struct.pack_into("<i", raw, 0x88, struct.unpack_from("<i", raw, 0x88)[0] | bit)
+        bone = struct.unpack_from("<i", raw, 0x04)[0]
 
 
 def mark_bones_used(d):
@@ -2114,6 +2125,7 @@ def add_attachment(d, name, bone, local=None, type=0):
     rows = local or ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
     struct.pack_into("<12f", raw, 12, *[f for row in rows for f in row])
     d.attachments.append(Rec(raw, name))
+    _mark_up(d, bone, BONE_USED_BY_ATTACHMENT)
     return len(d.attachments) - 1
 
 
