@@ -2827,8 +2827,17 @@ class VTMB_OT_add_event(bpy.types.Operator):
     event_id: bpy.props.IntProperty(name="Event id", default=2050, min=0)
     options: bpy.props.StringProperty(
         name="Options", default="",
-        description="The event's options[64] string. Read by atoi for most ids and as a "
-                    "spring bone chain name for 2070 and 2071. 63 bytes at most")
+        description="The event's options[64] string, 63 bytes at most. What it holds "
+                    "depends on the id. A number: 1003 the OnScriptEvent output 1-8, 2022 "
+                    "degrees of yaw, 5101 and 5102 a bodygroup index, 6013 a clip type 0-5. "
+                    "Several fields: 2060 \"expression fade-in hold fade-out\", 6001-6004 "
+                    "\"shell-type count\". A name: 2070 and 2071 the spring bone chain's root "
+                    "bone, 1005 a sentence group, 4020 a discipline, 4050 a camera shot "
+                    "prefix, 4100 a model path without .mdl, 4102 a path stem that gets "
+                    "_male.mdl or _female.mdl, 4150, 4151, 4154 and 4155 a wav under "
+                    "Interesting_places/, 5005 a wav under Disciplines/, 5105 an activity, "
+                    "5111-5120 a particle emitter (5118: bone;emitter). Every other shipped "
+                    "id ignores it")
 
     def execute(self, context):
         act = panel_action(context)
