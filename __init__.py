@@ -15,7 +15,7 @@ bl_info = {
                    "animations including the chained models. Export rebuilds a .mdl "
                    "from its own decoded records: animations from Blender's poses, "
                    "and optionally vertex positions, normals, UVs and weights. A "
-                   "second exporter authors a .mdl and .dx80.vtx from the scene with "
+                   "second exporter authors a .mdl and both .vtx from the scene with "
                    "no donor file at all",
     "version": (0, 2, 51),
     "warning": "Prerelease: what is past the 0.2.51 tag has not had its major test "
@@ -2170,7 +2170,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
 SCRATCH_DROPS = (
     ("procedural bones, IK chains and bone controllers -- a spring bone chain "
      "authored on a bone IS written"),
-    "every LOD below 0 -- the .dx80.vtx is written with numLODs 1 and nothing adds one",
+    ("every LOD below 0 -- the .dx80.vtx and .dx7_2bone.vtx are written with numLODs 1 "
+     "and nothing adds one"),
     ("which hitbox set the engine selects at runtime -- the boxes and the sets "
      "themselves ARE written, whatever Fit hitboxes says"),
 )
@@ -2792,14 +2793,14 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"INFO"}, "the hull was fitted to the mesh, %.0f %.0f %.0f .. %.0f "
                                   "%.0f %.0f, replacing the armature's %.0f %.0f %.0f .. "
                                   "%.0f %.0f %.0f" % (hull[0] + hull[1] + typed[0] + typed[1]))
-        self.report({"INFO"}, "wrote %s and its .dx80.vtx: %d bones, %d bodyparts, "
-                              "%d materials, %d animations (%d with root motion), "
-                              "%d sequences, %d chained, %d hitboxes, %d faces, "
-                              "%d verts, %d + %d bytes"
+        self.report({"INFO"}, "wrote %s, its .dx80.vtx and .dx7_2bone.vtx: %d bones, "
+                              "%d bodyparts, %d materials, %d animations (%d with root "
+                              "motion), %d sequences, %d chained, %d hitboxes, %d faces, "
+                              "%d verts, %d + %d + %d bytes"
                     % (os.path.basename(self.filepath), r["bones"], r["bodyparts"],
                        r["materials"], r["anims"], r["with_root_motion"], r["seqs"],
                        r["includes"], r["hitboxes"], r["faces"], r["verts"], r["bytes"],
-                       r["vtx_bytes"]))
+                       r["vtx_bytes"], r["vtx2_bytes"]))
         return {"FINISHED"}
 
 

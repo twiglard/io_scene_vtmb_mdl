@@ -1,4 +1,4 @@
-"""Author a .mdl and its .dx80.vtx from a Blender scene, with no donor file.
+"""Author a .mdl, its .dx80.vtx and .dx7_2bone.vtx from a Blender scene, with no donor file.
 
 `blender_export` rewrites a file that already exists: it opens with `Mdl(source)` and
 carries every record the scene does not supply. This does not open anything. The armature
@@ -1511,18 +1511,29 @@ def embedded_name(path):
 
 
 def write(d, faces, path, checksum):
-    """Emit both files. Returns (mdl bytes, vtx bytes, vtx stats)."""
+    """Emit the three files. Returns (mdl bytes, .dx80.vtx bytes, its stats), with the
+    `.dx7_2bone.vtx`'s size and stats under `st["dx7_2bone"]`.
+
+    The engine opens `.dx7_2bone.vtx` alone under `-dxlevel 70`, with no fallback, so a
+    model written without one loads nothing there; and one left beside the path from an
+    earlier file would describe that file's geometry.
+    """
     data = build_mod.emit(d, checksum)
     m = mdl_mod.Mdl("<scene>", data=data)
     vtx, st = vtxr_mod.scratch(m, faces, checksum)
+    two, st2 = vtxr_mod.scratch(m, faces, checksum, flavour="dx7_2bone")
     # Read rather than restated: vtx_rebuild.seed writes numLODs at 0x14 and the dialog
     # claims the file is single-LOD, so the claim is graded against the bytes.
     st["lods"] = struct.unpack_from("<i", vtx, 0x14)[0]
+    st2["bytes"] = len(two)
+    st["dx7_2bone"] = st2
     stem = path[:-4] if path.lower().endswith(".mdl") else path
     with open(stem + ".mdl", "wb") as f:
         f.write(data)
     with open(stem + ".dx80.vtx", "wb") as f:
         f.write(vtx)
+    with open(stem + ".dx7_2bone.vtx", "wb") as f:
+        f.write(two)
     return data, vtx, st
 
 
@@ -1550,7 +1561,9 @@ def export_scene(context, arm_obj, mesh_objs, actions, path, checksum, before_wr
         phy = {k: phy[k] for k in ("solids", "joints", "totalmass", "parts", "breaks")}
     elif os.path.exists(stem + ".phy"):
         phy = {"stale": stem + ".phy"}
-    return {"bytes": len(data), "vtx_bytes": len(vtx), "bones": len(d.bones), "phy": phy,
+    return {"bytes": len(data), "vtx_bytes": len(vtx),
+            "vtx2_bytes": st["dx7_2bone"]["bytes"], "vtx2_groups": st["dx7_2bone"]["groups"],
+            "bones": len(d.bones), "phy": phy,
             "hull_inverted": export_mod.inverted_axes(d),
             "with_root_motion": moved, "unfitted": unfitted,
             "unkeepable": unkeepable,

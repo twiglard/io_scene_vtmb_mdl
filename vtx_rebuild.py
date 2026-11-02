@@ -12,7 +12,7 @@ mesh is dealt out again by the rule the shipped files follow -- a triangle with 
 the mesh's cloth binding to the cloth group, the rest by `vtx_write.assign_groups`,
 studiomdl's four passes -- and its groups follow, growing or shrinking in number.
 
-`seed` and `scratch` write a .vtx for a model that never had one.
+`seed` and `scratch` write a .vtx for a model that never had one, in either flavour.
 """
 
 import os
@@ -356,13 +356,24 @@ def _fill(v, src_mesh, verts, cells, st):
         st["groups"] += 1
 
 
-def seed(mdl, checksum, boned=True):
+# The header's (vertCacheSize, maxBonesPerStrip, maxBonesPerTri, maxBonesPerVert) per
+# flavour, the arguments `optimize.cpp WriteOptimizedFiles` hands `OptimizeFromStudioHdr`
+# (vtx-format.md section 6b). The shipped headers carry 16/2/2/2 on 4443 of 4444
+# `.dx7_2bone.vtx` at version 107; `apple_monitor_screen`'s carries the `.dx80.vtx` one.
+FLAVOUR_LIMITS = {"dx80": (24, 16, 9, 3), "dx7_2bone": (16, 2, 2, 2)}
+# The flavour studiomdl writes with usesFixedFunction set: no bone influence reduced, and
+# a triangle over the two-bone budget goes to a software group (`optimize.cpp:1093`).
+FIXED_FUNCTION = ("dx7_2bone",)
+
+
+def seed(mdl, checksum, boned=True, flavour="dx80"):
     """A structurally valid .vtx for `mdl` with every strip group empty.
 
     `VtxFile` only ever parses, so a model that never had a .vtx has nothing to hand it.
     This is the smallest file with the right tree: one LOD, one group per mesh, all counts
     zero.  `_layout` treats a zero-count array as fresh and appends it, so filling the
     groups afterwards with `rebuild_group` grows the file rather than colliding with it.
+    The header's four limits are `FLAVOUR_LIMITS[flavour]`.
     """
     import struct as _s
     parts = []
@@ -374,7 +385,7 @@ def seed(mdl, checksum, boned=True):
     flags = W.SG_VERTS_ARE_BONED if boned else W.SG_VERTS_ARE_PLAIN
     if boned:
         flags |= W.SG_IS_HW_SKINNED
-    out += _s.pack("<iiHHiiiiii", W.VTX_VERSION, 24, 16, 9, 3, checksum, 1, 0,
+    out += _s.pack("<iiHHiiiiii", W.VTX_VERSION, *FLAVOUR_LIMITS[flavour], checksum, 1, 0,
                    len(parts), W.HEADER_SIZE)
     bpo = W.HEADER_SIZE
     out += b"\0" * (len(parts) * W.BODYPART_STRIDE)
@@ -418,15 +429,22 @@ def seed(mdl, checksum, boned=True):
     return W.VtxFile(path="<seed>", data=bytes(out))
 
 
-def scratch(mdl, faces, checksum=None):
+def scratch(mdl, faces, checksum=None, flavour="dx80"):
     """Emit a .vtx from nothing for a model that has none.
 
     `faces[bodypart][model][mesh]` is triangles as indices into that mesh's own vertices.
-    A mesh no flex moves keeps the one group `seed` gave it; a mesh a flex moves is dealt
-    out by `_repartition`, since the engine morphs only a group flagged `SG_IS_FLEXED`
-    (`r_studiodraw.cpp:1437`). `st["flexed"]` counts those groups.
+    In `.dx80.vtx` a mesh no flex moves keeps the one group `seed` gave it; a mesh a flex
+    moves is dealt out by `_repartition`, since the engine morphs only a group flagged
+    `SG_IS_FLEXED` (`r_studiodraw.cpp:1437`). `st["flexed"]` counts those groups.
+
+    In `.dx7_2bone.vtx` every mesh but a cloth one is dealt out, fixed-function: a
+    triangle whose corners bind more than two bones, or a vertex more than two, cannot be
+    hardware-skinned under its header and goes to a software group, as studiomdl puts it
+    (`vtx-format.md` section 6b, `pisha.mdl`'s third group). A cloth mesh keeps its one
+    cloth group, as in `.dx80.vtx`.
     """
-    v = seed(mdl, mdl.checksum if checksum is None else checksum)
+    fixed = flavour in FIXED_FUNCTION
+    v = seed(mdl, mdl.checksum if checksum is None else checksum, flavour=flavour)
     st = dict(groups=0, tris_out=0, verts_out=0, strips=0, boned=0, flexed=0)
     for i, bp in enumerate(v.bodyparts):
         for j, model in enumerate(bp.models):
@@ -437,8 +455,9 @@ def scratch(mdl, faces, checksum=None):
                     src_mesh = src_model.meshes[k]
                     tris = [tuple(t) for t in faces[i][j][k]]
                     dealt = [(mesh.groups[0], tris)]
-                    if src_mesh.flexes and tris:
-                        dealt = _repartition(mesh, src_mesh, tris, verts, v, lod, False,
+                    cloth = bool(mesh.groups[0].flags & W.SG_IS_CLOTH)
+                    if tris and (src_mesh.flexes or (fixed and not cloth)):
+                        dealt = _repartition(mesh, src_mesh, tris, verts, v, lod, fixed,
                                              False, i, j, k)
                         mesh.groups[:] = [g for g, _t in dealt]
                         st["flexed"] += sum(1 for g, _t in dealt
