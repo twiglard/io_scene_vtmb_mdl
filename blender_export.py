@@ -1573,14 +1573,23 @@ def moved_vertices(co, base):
 
 
 def key_deltas(me, co, base, base_n, moved, scale=1.0):
-    """[(Blender vertex, position delta, normal delta)] over `moved`, in file units.
+    """[(Blender vertex, position delta, normal delta)] in file units, over every vertex
+    once `moved` is not empty.
 
+    A vertex that stays put still turns when a face around it moves, and studiomdl writes
+    it with a zero position delta; looking at `moved` alone dropped that ring (BUGS 187).
     A vertex under half a step of both bytes is left out: its record would say nothing.
     """
+    if not moved:
+        return []
     morph_n = _vertex_normals(me, co)
+    moved = set(moved)
     out = []
-    for vi in moved:
-        delta = tuple((co[vi][c] - base[vi][c]) / scale for c in range(3))
+    for vi in range(len(co)):
+        if vi in moved:
+            delta = tuple((co[vi][c] - base[vi][c]) / scale for c in range(3))
+        else:
+            delta = (0.0, 0.0, 0.0)
         ndelta = tuple(morph_n[vi][c] - base_n[vi][c] for c in range(3))
         if (sum(c * c for c in delta) ** 0.5 < FLEX_POS_STEP / 2.0
                 and sum(c * c for c in ndelta) ** 0.5 < FLEX_NRM_STEP / 2.0):
