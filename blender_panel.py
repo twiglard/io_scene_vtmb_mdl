@@ -1212,6 +1212,63 @@ class VTMB_OT_check_hull(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _phy_value_owner(context, key):
+    """The object `key`'s `vtmb_phy_` property goes on, or None: the armature for
+    `totalmass`."""
+    obj = context.object
+    if obj is not None and key == "totalmass" and obj.type == "ARMATURE":
+        return obj
+    return None
+
+
+def phy_value_default(obj, key):
+    """What the export writes for `key` while `obj` does not carry it."""
+    return blender_export.PHY_TOTALMASS
+
+
+class VTMB_OT_set_phy_value(bpy.types.Operator):
+    bl_idname = "vtmb.set_phy_value"
+    bl_label = "Set"
+    bl_description = ("Give this .phy value a field of its own, starting at what the export "
+                      "writes while it has none, so the file changes only once it is edited")
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    key: bpy.props.StringProperty(options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None
+
+    def execute(self, context):
+        obj = _phy_value_owner(context, self.key)
+        if obj is None:
+            self.report({"ERROR"}, "%r is no .phy value of %s" % (self.key, context.object.name))
+            return {"CANCELLED"}
+        obj["vtmb_phy_" + self.key] = float(phy_value_default(obj, self.key))
+        return {"FINISHED"}
+
+
+class VTMB_OT_unset_phy_value(bpy.types.Operator):
+    bl_idname = "vtmb.unset_phy_value"
+    bl_label = "Unset"
+    bl_description = "Remove this .phy value's field, so the export writes its default again"
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    key: bpy.props.StringProperty(options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None
+
+    def execute(self, context):
+        obj = _phy_value_owner(context, self.key)
+        if obj is None:
+            self.report({"ERROR"}, "%r is no .phy value of %s" % (self.key, context.object.name))
+            return {"CANCELLED"}
+        obj.pop("vtmb_phy_" + self.key, None)
+        return {"FINISHED"}
+
+
 # Keys VTMB's `CBreakParser::ParseKeyValue` (vampire.dll `10191e90`) reads beside `model`, with
 # their values when unset: health 1, offset 0 0 0, fadetime 0, bodyindex 0, which sets bodygroup
 # 0 of the piece. Source-2003's burst and debris are not among them.
@@ -1372,6 +1429,13 @@ def draw_accessories(lay, context, arm_obj):
     hulls = blender_export.hull_objects(arm_obj)
     lay.label(text="%d collision hull%s" % (len(hulls), "" if len(hulls) == 1 else "s"),
               icon="INFO")
+    row = lay.row(align=True)
+    if arm_obj.get("vtmb_phy_totalmass") is not None:
+        row.prop(arm_obj, '["vtmb_phy_totalmass"]', text="Total mass, kg")
+        row.operator("vtmb.unset_phy_value", text="", icon="X").key = "totalmass"
+    else:
+        row.label(text="total mass %g kg, studiomdl's default" % blender_export.PHY_TOTALMASS)
+        row.operator("vtmb.set_phy_value", text="Set").key = "totalmass"
     row = lay.row(align=True)
     row.operator("vtmb.add_break", icon="MOD_EXPLODE")
     row.label(text=break_line(arm_obj))
@@ -3964,7 +4028,8 @@ CLASSES = [VTMB_OT_mark_armature, VTMB_OT_add_cdtexture, VTMB_OT_add_include, VT
            VTMB_PT_cloth, VTMB_PT_material,
            VTMB_OT_add_attachment, VTMB_OT_add_hitbox, VTMB_OT_add_cloth_capsule,
            VTMB_OT_add_cloth_sphere, VTMB_PT_accessories,
-           VTMB_OT_add_hull_from_weights, VTMB_OT_check_hull, VTMB_OT_add_break, VTMB_PT_hull,
+           VTMB_OT_add_hull_from_weights, VTMB_OT_check_hull, VTMB_OT_set_phy_value,
+           VTMB_OT_unset_phy_value, VTMB_OT_add_break, VTMB_PT_hull,
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,

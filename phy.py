@@ -1571,13 +1571,14 @@ def _latin1(x):
         raise PhyError(f"{x!r} has no latin-1 form: {e}") from None
 
 
-def edit_solids(data, surfaces=None, values=None, joints=None):
+def edit_solids(data, surfaces=None, values=None, joints=None, editparams=None):
     """`data` with surfaces replaced and values rewritten, every other byte copied.
 
     `surfaces` is {ordinal: Surface}. `values` is {ordinal: {key: value}} on that solid's
-    block and `joints` {child ordinal: {key: value}} on the `ragdollconstraint` whose `child`
-    is that ordinal; a value is rewritten in its token's span, and a key the block lacks is
-    added on a line before its `}`. Raises `PhyError` naming a solid or joint not there."""
+    block, `joints` {child ordinal: {key: value}} on the `ragdollconstraint` whose `child`
+    is that ordinal, and `editparams` {key: value} on the `editparams` block; a value is
+    rewritten in its token's span, and a key the block lacks is added on a line before its
+    `}`. Raises `PhyError` naming a solid, joint or `editparams` not there."""
     start = text_start(data)
     text = bytes(data[start:])
     want = {}
@@ -1585,6 +1586,8 @@ def edit_solids(data, surfaces=None, values=None, joints=None):
         want[(b"solid", k)] = kv
     for k, kv in (joints or {}).items():
         want[(b"ragdollconstraint", k)] = kv
+    if editparams:
+        want[(b"editparams", 0)] = editparams
     edits, found, solid = [], set(), 0
     for name, pairs, span in block_spans(text):
         n = name[0].lower()
@@ -1596,6 +1599,8 @@ def edit_solids(data, surfaces=None, values=None, joints=None):
                 key = (n, int(got[0]))
             except (IndexError, ValueError):
                 continue
+        elif n == b"editparams":
+            key = (n, 0)
         else:
             continue
         kv = want.get(key)

@@ -5030,6 +5030,10 @@ def phy_moves(d, m, donor_pose):
 HULL_KEYS = (("mass", float), ("surfaceprop", str), ("damping", float),
              ("rotdamping", float), ("inertia", float), ("massbias", float))
 JOINT_KEYS = tuple(a + k for a in "xyz" for k in ("min", "max", "friction"))
+# `editparams`' totalmass when the armature carries no `vtmb_phy_totalmass`: studiomdl's
+# (source-2003 `collisionmodel.cpp:237`). 345 of the 2605 shipped one-solid `.phy` carry it
+# and none of the 324 with more than one solid, whose median is 90.
+PHY_TOTALMASS = 1.0
 
 
 def hull_objects(arm_obj):
@@ -5420,7 +5424,7 @@ def hulls_phy(arm_obj, d, scale, stem):
         surf, bad = hull_surface(o, scale)
         if bad:
             raise SceneRefused(_dents_text([(o.name, n, c) for n, c in bad]))
-        totalmass = float(arm_obj.get("vtmb_phy_totalmass", 1.0))
+        totalmass = float(arm_obj.get("vtmb_phy_totalmass", PHY_TOTALMASS))
         vol = phy_mod.surface_volume(surf)
 
         def num1(key, default):
@@ -5473,7 +5477,7 @@ def hulls_phy(arm_obj, d, scale, stem):
             "the collision hulls on %s each have no hull on any ancestor bone, so the "
             "ragdoll would be in %d pieces: give a bone above them all a hull. Nothing was "
             "written" % (", ".join(repr(n) for n in roots), len(roots)))
-    totalmass = float(arm_obj.get("vtmb_phy_totalmass", 1.0))
+    totalmass = float(arm_obj.get("vtmb_phy_totalmass", PHY_TOTALMASS))
     vols = [phy_mod.surface_volume(owner[k][1]) for k in order]
 
     def num(o, key, default):
@@ -5555,10 +5559,12 @@ def bone_rests(d, m):
 
 
 def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls=None,
-                m=None, rest=None, collision=None):
+                m=None, rest=None, collision=None, totalmass=None):
     """The donor's `.phy` as this export leaves it: the edits `read_hulls` found in the
-    hulls (`hulls`), then every solid named for a bone in `removed` or dropped by a hull
-    taken away dropped (the user, 2026-10-29), or moved by `moves` when it has no parent and
+    hulls (`hulls`) and `totalmass`, the armature's `vtmb_phy_totalmass`, written into
+    `editparams` where it differs from the file's, then every solid named for a bone in
+    `removed` or dropped by a hull taken away dropped (the user, 2026-10-29), or moved by
+    `moves` when it has no parent and
     more than one child solid (the user, the same day), then a solid added for each new
     hull (`add_hull_solids`, with `m` and `rest`), then its bone names following `pairs`,
     every remaining bone's (file name, name now) in file order, then `collision`, bytes from
@@ -5582,7 +5588,13 @@ def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls
         where, data = donor_phy(source, content)
         if data is None:
             return None
-        out = phy_mod.edit_solids(data, h.get("surfaces"), h.get("values"), h.get("joints"))
+        params, was_mass = None, None
+        if totalmass is not None:
+            was_mass = phy_mod.text_values(data)[2].get("totalmass")
+            if _float_changed(totalmass, was_mass):
+                params = {"totalmass": phy_mod.float_text(float(totalmass))}
+        out = phy_mod.edit_solids(data, h.get("surfaces"), h.get("values"), h.get("joints"),
+                                  params)
         out, _remap, dropped, moved = phy_mod.drop_solids(
             out, list(removed) + list(h.get("drop", ())), moves)
         added = []
@@ -5604,13 +5616,16 @@ def rewrite_phy(source, dest, pairs, content=None, removed=(), moves=None, hulls
         return {"data": None, "renamed": [], "dropped": [], "moved": [], "added": [],
                 "rebuilt": [], "edited": [], "collision": None, "copied": None,
                 "tagged": 0, "error": str(e)}
-    edited = bool(h.get("surfaces") or h.get("values") or h.get("joints"))
+    edited = bool(h.get("surfaces") or h.get("values") or h.get("joints") or params)
     touched = changed or dropped or moved or added or edited or retext or tagged
     if not touched and same_file(source, dest):
         return None
     return {"data": out, "renamed": sorted(set(changed)), "dropped": dropped,
             "moved": moved, "added": added, "rebuilt": list(h.get("rebuilt", ())),
-            "edited": list(h.get("edited", ())), "collision": retext,
+            "edited": list(h.get("edited", ())) + (
+                [("editparams", "totalmass", was_mass, params["totalmass"])]
+                if params else []),
+            "collision": retext,
             "copied": None if touched else where, "tagged": tagged, "error": None}
 
 
@@ -6255,7 +6270,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
                               [g["name"] for g in removed], phy_moves(d, m, donor_pose),
                               hulls, m, bone_rests(d, m) if hulls and hulls["add"] else None,
-                              collision)
+                              collision, arm_obj.get("vtmb_phy_totalmass"))
     if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]
                                     or phy_rewrite["added"]):
         build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
