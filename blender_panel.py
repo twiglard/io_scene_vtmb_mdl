@@ -12,6 +12,7 @@ material.
 import os
 import re
 import struct
+import zlib
 
 import bpy
 import mathutils
@@ -1115,12 +1116,63 @@ def _hull_points(context, arm_obj, bone, whole):
     return out
 
 
+# On a hull the operator wrote for one bone: a CRC of what it wrote, so that a later hull
+# lower in the chain can tell whether that hull is still the operator's output.
+HULL_STAMP = "vtmb_hull_from_weights"
+
+
+def _hull_stamp(obj):
+    """CRC-32 of the hull's vertices, faces and transform under its bone, as 8 hex digits
+    (an ID property int is 32 bits signed, which a CRC overflows)."""
+    me = obj.data
+    co = [0.0] * (3 * len(me.vertices))
+    me.vertices.foreach_get("co", co)
+    loops = [0] * len(me.loops)
+    me.loops.foreach_get("vertex_index", loops)
+    m = [x for mat in (obj.matrix_basis, obj.matrix_parent_inverse) for row in mat for x in row]
+    return "%08x" % zlib.crc32(struct.pack("<%dfi%di%df" % (len(co), len(loops), len(m)),
+                                           *co, len(me.polygons), *loops, *m))
+
+
+def _hull_mesh(pts, label):
+    """A mesh of the convex hull of `pts`, or the error `convex_hull` raised."""
+    try:
+        tris = phy_mod.convex_hull(pts)
+    except phy_mod.PhyError as e:
+        return None, 0, "%d points make no hull: %s" % (len(pts), e)
+    keep = sorted({i for t in tris for i in t})
+    at = {i: k for k, i in enumerate(keep)}
+    mesh = bpy.data.meshes.new(label)
+    mesh.from_pydata([pts[i] for i in keep], [], [tuple(at[i] for i in t) for t in tris])
+    mesh.update()
+    return mesh, len(keep), None
+
+
+def _swap_mesh(obj, mesh, label):
+    was, obj.data = obj.data, mesh
+    if was.users == 0:
+        bpy.data.meshes.remove(was)
+        mesh.name = label
+
+
+def _hulled_ancestor(arm_obj, bone):
+    """The hull object of `bone`'s nearest ancestor that has one, else None."""
+    by_bone = {o.parent_bone: o for o in blender_export.hull_objects(arm_obj)
+               if o.parent_type == "BONE"}
+    b = bone.parent
+    while b is not None and b.name not in by_bone:
+        b = b.parent
+    return None if b is None else by_bone[b.name]
+
+
 class VTMB_OT_add_hull_from_weights(bpy.types.Operator):
     bl_idname = "vtmb.add_hull_from_weights"
     bl_label = "Hull from weights"
     bl_description = ("A collision hull for the active bone as studiomdl builds one: the "
                       "convex hull of every face with a vertex weighted to the bone, or to "
-                      "a child bone with no hull of its own. Replaces the bone's hull")
+                      "a child bone with no hull of its own. Replaces the bone's hull, and "
+                      "takes the faces it now covers out of the nearest ancestor's hull "
+                      "where this operator made that hull and it was not edited since")
     bl_options = {"REGISTER", "UNDO"}
 
     whole: bpy.props.BoolProperty(
@@ -1145,24 +1197,15 @@ class VTMB_OT_add_hull_from_weights(bpy.types.Operator):
         prop = next((o for o in blender_export.hull_objects(arm_obj)
                      if o.parent_type != "BONE"), None) if self.whole else None
         pts = _hull_points(context, arm_obj, None if prop else bone, self.whole)
-        try:
-            tris = phy_mod.convex_hull(pts)
-        except phy_mod.PhyError as e:
-            self.report({"ERROR"}, "%d points make no hull: %s" % (len(pts), e))
-            return {"CANCELLED"}
-        keep = sorted({i for t in tris for i in t})
-        at = {i: k for k, i in enumerate(keep)}
         old = prop or next((o for o in blender_export.hull_objects(arm_obj)
                             if o.parent_type == "BONE" and o.parent_bone == bone.name), None)
         label = old.data.name if prop else "%s.collision.%s" % (arm_obj.name, bone.name)
-        mesh = bpy.data.meshes.new(label)
-        mesh.from_pydata([pts[i] for i in keep], [], [tuple(at[i] for i in t) for t in tris])
-        mesh.update()
+        mesh, n, err = _hull_mesh(pts, label)
+        if mesh is None:
+            self.report({"ERROR"}, err)
+            return {"CANCELLED"}
         if old is not None:
-            was, old.data = old.data, mesh
-            if was.users == 0:
-                bpy.data.meshes.remove(was)
-                mesh.name = label
+            _swap_mesh(old, mesh, label)
             obj = old
         else:
             obj = bpy.data.objects.new(label, mesh)
@@ -1174,9 +1217,41 @@ class VTMB_OT_add_hull_from_weights(bpy.types.Operator):
             # Written as the joint to the parent solid; a root solid has none.
             for key in blender_export.JOINT_KEYS:
                 obj["vtmb_phy_" + key] = 0.0
-        self.report({"INFO"}, "%s: a hull of %d points over %d" % (obj.name, len(keep),
-                                                                   len(pts)))
+        if prop is None and not self.whole:
+            obj[HULL_STAMP] = _hull_stamp(obj)
+        elif HULL_STAMP in obj:
+            del obj[HULL_STAMP]
+        self.report({"INFO"}, "%s: a hull of %d points over %d" % (obj.name, n, len(pts)))
+        if prop is None and old is None:
+            self._refit_ancestor(context, arm_obj, bone)
         return {"FINISHED"}
+
+    def _refit_ancestor(self, context, arm_obj, bone):
+        """A new hull on `bone` takes its faces from the nearest hulled ancestor, which held
+        them while `bone` had none: refit that hull where it is still what this operator
+        wrote, so building parents first gives the hulls building children first does."""
+        up = _hulled_ancestor(arm_obj, bone)
+        if up is None:
+            return
+        name = up.parent_bone
+        stamp = up.get(HULL_STAMP)
+        if stamp is None or stamp != _hull_stamp(up):
+            self.report({"WARNING"}, "%s still holds the faces of %s, which now has a hull of "
+                                     "its own: it was %s, so it is left as it is; run Hull "
+                                     "from weights on %s to refit it"
+                        % (up.name, bone.name, "edited since this operator made it"
+                           if stamp is not None else "not made by this operator", name))
+            return
+        pts = _hull_points(context, arm_obj, arm_obj.data.bones[name], False)
+        mesh, n, err = _hull_mesh(pts, up.data.name)
+        if mesh is None:
+            self.report({"WARNING"}, "%s left holding the faces of %s: %s"
+                        % (up.name, bone.name, err))
+            return
+        _swap_mesh(up, mesh, up.data.name)
+        up[HULL_STAMP] = _hull_stamp(up)
+        self.report({"INFO"}, "%s refitted without %s: a hull of %d points over %d"
+                    % (up.name, bone.name, n, len(pts)))
 
 
 class VTMB_OT_check_hull(bpy.types.Operator):
