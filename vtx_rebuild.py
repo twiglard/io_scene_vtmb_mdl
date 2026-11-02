@@ -56,6 +56,7 @@ def rebuild(mdl_path, vtx_path, keep=None):
     m = M.Mdl(mdl_path)
     reader = R.Vtx(vtx_path)
     v = W.VtxFile(vtx_path)
+    fixed = os.path.basename(vtx_path).endswith(".dx7_2bone.vtx")
     if len(reader.groups) != sum(len(mesh.groups)
                                  for bp in v.bodyparts for mo in bp.models
                                  for lod in mo.lods for mesh in lod.meshes):
@@ -94,7 +95,8 @@ def rebuild(mdl_path, vtx_path, keep=None):
                             if grp.flags & W.SG_VERTS_ARE_BONED else None
                         W.rebuild_group(grp, orig_ids, tris, vb,
                                         max_bones=v.maxbones_strip,
-                                        max_per_vert=v.maxbones_vert)
+                                        max_per_vert=v.maxbones_vert,
+                                        fixed_function=fixed)
                         st["tris_out"] += len(grp.indices) // 3
                         st["verts_out"] += grp.numverts
                         st["strips"] += len(grp.strips)
@@ -293,7 +295,7 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
                             local = dict((o, m) for m, o in enumerate(orig))
                             cells.append((g, orig, [tuple(local[x] for x in t)
                                                     for t in mine]))
-                    _fill(v, src_mesh, verts, cells, st)
+                    _fill(v, src_mesh, verts, cells, st, fixed_function)
                 if gone:
                     lod.meshes[:] = [e for k, e in enumerate(lod.meshes) if k not in gone]
     # A bodypart past the donor's is one `mdl_build.add_model` appended, given one LOD.
@@ -314,7 +316,7 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
                     orig = sorted(set(x for t in mine for x in t))
                     local = dict((o, n) for n, o in enumerate(orig))
                     cells.append((g, orig, [tuple(local[x] for x in t) for t in mine]))
-                _fill(v, src_mesh, verts, cells, st)
+                _fill(v, src_mesh, verts, cells, st, fixed_function)
             bp.models.append(W.Model([lod]))
         v.bodyparts.append(bp)
     return v.to_bytes(), st
@@ -333,7 +335,7 @@ def _binds_off_bone0(src_mesh, orig_ids, verts):
     return False
 
 
-def _fill(v, src_mesh, verts, cells, st):
+def _fill(v, src_mesh, verts, cells, st, fixed_function=False):
     """Each strip group of `cells` rebuilt from its (group, vertex ids, triangles).
 
     A 2-byte group's strips carry no bone state change, and every shipped one binds bone 0
@@ -349,7 +351,7 @@ def _fill(v, src_mesh, verts, cells, st):
         vb = (vertex_bones(src_mesh, orig, verts)
               if grp.flags & W.SG_VERTS_ARE_BONED else None)
         W.rebuild_group(grp, orig, tris, vb, max_bones=v.maxbones_strip,
-                        max_per_vert=v.maxbones_vert)
+                        max_per_vert=v.maxbones_vert, fixed_function=fixed_function)
         st["tris_out"] += len(grp.indices) // 3
         st["verts_out"] += grp.numverts
         st["strips"] += len(grp.strips)
@@ -467,7 +469,7 @@ def scratch(mdl, faces, checksum=None, flavour="dx80"):
                         orig = sorted(set(x for t in mine for x in t))
                         local = dict((o, n) for n, o in enumerate(orig))
                         cells.append((g, orig, [tuple(local[x] for x in t) for t in mine]))
-                    _fill(v, src_mesh, verts, cells, st)
+                    _fill(v, src_mesh, verts, cells, st, fixed)
     return v.to_bytes(), st
 
 

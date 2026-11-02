@@ -559,6 +559,27 @@ def pack_vert1(orig_id, bone_slots, max_per_vert=3):
         + struct.pack("<h", orig_id)
 
 
+def pack_vert_fixed(orig_id, bones, strip_bones):
+    """A 12-byte record of a fixed-function strip, as studiomdl's `SortBonesWithinVertex`
+    leaves it (`optimize.cpp:2152`): two positions, boneID[] (0, 1), and boneMapIndex
+    pairing position q with the weight of `strip_bones[q]`, or with a weight past the
+    vertex's own `bones` where that slot's bone is not the vertex's.
+
+    Fixed-function blending draws position q with hardware matrix q. `pack_vert1`'s
+    spelling of a vertex in slot 1, (1, 1, 0), draws it with slot 0's bone.
+    """
+    order, dead = [], len(bones)
+    for q in range(2):
+        b = strip_bones[q] if q < len(strip_bones) else None
+        if b is not None and b in bones:
+            order.append(bones.index(b))
+        else:
+            order.append(dead)
+            dead += 1
+    full = tuple(order) + tuple(x for x in range(4) if x not in order)
+    return struct.pack("<6h", bone_map_index(2, full), 0, 1, -1, -1, orig_id)
+
+
 MIN_BONE_INFLUENCE = 1.0
 
 
@@ -655,7 +676,7 @@ def partition(triangles, vert_bones=None, max_bones=16):
 
 
 def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
-                  max_per_vert=3):
+                  max_per_vert=3, fixed_function=False):
     """Replace one strip group's vertices, indices and strips.
 
     `orig_ids` is one entry per group-local vertex, indexing the owning mesh's vertex
@@ -663,6 +684,12 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
     `vert_bones` giving each vertex its model bones. With SG_IS_HW_SKINNED the record
     stores slots only the strip's own bone state changes can resolve, which is why a
     vertex two strips share is emitted once per strip.
+
+    `fixed_function`, for `.dx7_2bone.vtx`, spells a hardware-skinned strip of at most two
+    bones as studiomdl does there: every bound vertex by `pack_vert_fixed`, and numBones
+    the strip's bone count (`optimize.cpp:1483`). The shipped `.dx7_2bone.vtx` spell 3 966 688
+    of their 4 047 666 bound hardware-skinned records that way, and numBones is the count of
+    slots weighted above zero on 82 536 of their 82 536 strips that weight one.
     """
     n = len(orig_ids)
     for tri in triangles:
@@ -689,6 +716,7 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
     indices, strips, recs = [], [], []
     for tris, bones in runs:
         slot = dict((b, i) for i, b in enumerate(bones)) if bones is not None else {}
+        fixed = fixed_function and boned and hw and len(bones) <= 2
         local, first, base = {}, len(indices), len(recs)
         for tri in tris:
             for v in tri:
@@ -696,6 +724,8 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
                     local[v] = len(recs)
                     if not boned:
                         recs.append(pack_vert0(orig_ids[v]))
+                    elif fixed and vert_bones[v]:
+                        recs.append(pack_vert_fixed(orig_ids[v], list(vert_bones[v]), bones))
                     else:
                         # Never sorted: the table at +0x6ce30 pairs slot i with weight i.
                         # Without SG_IS_HW_SKINNED there are no slots -- these are bones.
@@ -708,7 +738,8 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
         per_vert = max([len(vert_bones[v]) for tri in tris for v in tri] or [0]) \
             if boned else 0
         strips.append(Strip(len(tris) * 3, first, len(recs) - base, base,
-                            min(per_vert, 4), STRIP_IS_TRILIST, state))
+                            len(bones) if fixed else min(per_vert, 4), STRIP_IS_TRILIST,
+                            state))
     for name, c in (("vertices", len(recs)), ("indices", len(indices)),
                     ("strips", len(strips))):
         if c > SHORT_MAX:
