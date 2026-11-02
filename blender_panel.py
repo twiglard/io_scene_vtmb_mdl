@@ -205,6 +205,71 @@ def panel_action(context):
     return ad.action if ad is not None else None
 
 
+def poll_action_panel(context):
+    """The sidebar panels show for an action that is VTMB's (`is_vtmb_action`)."""
+    act = panel_action(context)
+    return act is not None and is_vtmb_action(context, act)
+
+
+MARK = "vtmb_mark"
+
+
+def owning_armature(obj):
+    """The armature an object belongs to, as both exports resolve it: itself, its parent when
+    that is an armature, else for a mesh its first Armature modifier's object.  None for
+    anything else."""
+    if obj is None or obj.type == "ARMATURE":
+        return obj
+    if obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+    if obj.type != "MESH":
+        return None
+    return next((mo.object for mo in obj.modifiers if mo.type == "ARMATURE"
+                 and mo.object is not None and mo.object.type == "ARMATURE"), None)
+
+
+def is_vtmb_armature(arm):
+    """Whether the addon's panels show on this armature: its `vtmb_mark` when set, else
+    whether it was imported (`vtmb_source`) or carries an Add > VTMB bone set
+    (`vtmb_templates`).  Polls run on every redraw, so this stays a few lookups."""
+    if arm is None or arm.type != "ARMATURE":
+        return False
+    mark = arm.get(MARK)
+    if mark is not None:
+        return bool(mark)
+    return arm.get("vtmb_source") is not None or arm.get("vtmb_templates") is not None
+
+
+def is_vtmb_object(obj):
+    """A mesh or empty passes when its owning armature does, since neither export can write
+    one that has none."""
+    return is_vtmb_armature(owning_armature(obj))
+
+
+def is_vtmb_action(context, act):
+    return act.get("vtmb_anim_name") is not None or is_vtmb_object(context.object)
+
+
+class VTMB_OT_mark_armature(bpy.types.Operator):
+    """Show the VTMB panels on this armature, or hide them, whatever it carries"""
+    bl_idname = "vtmb.mark_armature"
+    bl_label = "Mark as a VTMB model"
+    bl_options = {"REGISTER", "UNDO"}
+
+    value: bpy.props.BoolProperty(default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == "ARMATURE"
+
+    def execute(self, context):
+        context.object[MARK] = bool(self.value)
+        self.report({"INFO"}, "%s %s a VTMB model" % (context.object.name,
+                                                      "is marked" if self.value else
+                                                      "is no longer marked"))
+        return {"FINISHED"}
+
+
 def _append(obj, key, path):
     out = paths_mod.engine_paths(list(obj.get(key) or ()) + [path])
     obj[key] = out
@@ -600,7 +665,7 @@ class VTMB_PT_skin_families(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -806,7 +871,8 @@ class VTMB_PT_cloth(bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         o = context.object
-        return o is not None and o.type == "MESH" and not o.get("vtmb_phy_hull")
+        return (o is not None and o.type == "MESH" and not o.get("vtmb_phy_hull")
+                and is_vtmb_object(o))
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -1542,7 +1608,7 @@ class VTMB_PT_face(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -2126,7 +2192,7 @@ class VTMB_PT_flex(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -2218,7 +2284,7 @@ class VTMB_PT_flex_preview(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         draw_flex_preview(self.layout, context.object)
@@ -2391,8 +2457,7 @@ class VTMB_PT_shape_key(bpy.types.Panel):
     def poll(cls, context):
         obj = context.object
         return (obj is not None and obj.type == "MESH" and obj.data.shape_keys is not None
-                and (obj.get("vtmb_flex_names") is not None
-                     or obj.parent is not None and obj.parent.type == "ARMATURE"))
+                and (obj.get("vtmb_flex_names") is not None or is_vtmb_object(obj)))
 
     def draw(self, context):
         draw_shape_key(self.layout, context.object)
@@ -2407,7 +2472,7 @@ class VTMB_PT_accessories(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -2546,6 +2611,13 @@ class VTMB_PT_armature(bpy.types.Panel):
         obj = context.object
         lay = self.layout
         lay.use_property_split = False
+        if not is_vtmb_armature(obj):
+            lay.label(text="Not imported and no VTMB bone set, so the VTMB panels are hidden",
+                      icon="INFO")
+            lay.operator(VTMB_OT_mark_armature.bl_idname, icon="CHECKMARK").value = True
+            return
+        lay.operator(VTMB_OT_mark_armature.bl_idname, text="Unmark: hide the VTMB panels",
+                     icon="X").value = False
 
         col = lay.column(align=True)
         col.label(text="Material directories, under materials/", icon="MATERIAL")
@@ -2722,7 +2794,7 @@ class VTMB_PT_actions(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         obj = context.object
@@ -2750,7 +2822,7 @@ class VTMB_PT_action(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return panel_action(context) is not None
+        return poll_action_panel(context)
 
     def draw(self, context):
         act = panel_action(context)
@@ -2993,7 +3065,7 @@ class VTMB_PT_action_seqtail(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return panel_action(context) is not None
+        return poll_action_panel(context)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -3008,7 +3080,7 @@ class VTMB_PT_action_events(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return panel_action(context) is not None
+        return poll_action_panel(context)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -3119,7 +3191,7 @@ class VTMB_PT_action_params(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return panel_action(context) is not None
+        return poll_action_panel(context)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -3154,7 +3226,7 @@ class VTMB_PT_poseparams(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == "ARMATURE"
+        return is_vtmb_armature(context.object)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -3858,7 +3930,7 @@ class VTMB_PT_action_sequence(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return panel_action(context) is not None
+        return poll_action_panel(context)
 
     def draw(self, context):
         self.layout.use_property_split = False
@@ -3876,14 +3948,14 @@ class VTMB_PT_material(bpy.types.Panel):
     def poll(cls, context):
         obj = context.object
         return (obj is not None and obj.type == "MESH"
-                and getattr(context, "material", None) is not None)
+                and getattr(context, "material", None) is not None and is_vtmb_object(obj))
 
     def draw(self, context):
         for text, icon in material_lines(context, context.object, context.material):
             self.layout.label(text=text, icon=icon)
 
 
-CLASSES = [VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
+CLASSES = [VTMB_OT_mark_armature, VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
            VTMB_UL_actions,
            VTMB_OT_set_skin_family, VTMB_OT_add_skin_family, VTMB_OT_remove_skin_family,
