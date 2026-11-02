@@ -5208,9 +5208,13 @@ def read_hulls(arm_obj, m, data, scale, names):
         vals = {}
         for key, kind in HULL_KEYS:
             v = o.get("vtmb_phy_" + key)
-            if v is None or key not in kv:
+            if v is None:
                 continue
-            if kind is float and _float_changed(v, kv[key]):
+            if key not in kv:
+                # Only massbias is missing from a shipped solid, on 4855 of 7353; the import
+                # stamps none there, so the object carries it only once it is set.
+                vals[key] = phy_mod.float_text(float(v)) if kind is float else str(v)
+            elif kind is float and _float_changed(v, kv[key]):
                 vals[key] = phy_mod.float_text(float(v))
             elif kind is str and str(v) != kv[key]:
                 vals[key] = str(v)
@@ -5234,7 +5238,7 @@ def read_hulls(arm_obj, m, data, scale, names):
                     out["rebuilt"].append((label, kv["volume"], vals["volume"]))
         if vals:
             out["values"][k] = vals
-            out["edited"] += [(label, key, kv[key], t) for key, t in vals.items()
+            out["edited"] += [(label, key, kv.get(key), t) for key, t in vals.items()
                               if key != "volume" or k not in out["surfaces"]]
     taken = {n.lower() for n in (solids[k].get("name", "") for k in range(len(solids)))}
     taken -= {n.lower() for n in out["drop"]}
@@ -5382,6 +5386,27 @@ def scene_collision_text(arm_obj, source=None, content=None):
                 "in the Text Editor, or delete the Text to write none. Nothing was written"
                 % (t.name, "; ".join(errs)))
     return s.encode("latin-1")
+
+
+def hull_mass_share(arm_obj, obj, scale=1.0):
+    """The mass `hulls_phy` gives `obj` while it carries no `vtmb_phy_mass`: its share of
+    the armature's total mass by volume times massbias among the armature's hulls, the
+    order theirs by bone. None when a hull makes no surface."""
+    objs = hull_objects(arm_obj)
+    total = float(arm_obj.get("vtmb_phy_totalmass", PHY_TOTALMASS))
+    try:
+        if obj.parent_type != "BONE":
+            vol = phy_mod.surface_volume(hull_surface(obj, scale)[0])
+            return phy_mod.masses([vol], [1.0], total)[0]
+        at = {b.name: k for k, b in enumerate(arm_obj.data.bones)}
+        bone = sorted((at.get(o.parent_bone, -1), o) for o in objs
+                      if o.parent_type == "BONE")
+        vols = [phy_mod.surface_volume(hull_surface(o, scale)[0]) for _k, o in bone]
+    except (SceneRefused, phy_mod.PhyError, AttributeError):
+        return None
+    bias = [float(o.get("vtmb_phy_massbias", 1.0)) for _k, o in bone]
+    share = phy_mod.masses(vols, bias, total)
+    return next((m for (_k, o), m in zip(bone, share) if o == obj), None)
 
 
 def hulls_phy(arm_obj, d, scale, stem):

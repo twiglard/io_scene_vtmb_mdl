@@ -1212,25 +1212,45 @@ class VTMB_OT_check_hull(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# The `solid` values the hull panel sets and unsets; surfaceprop is a string and has no
+# button.
+HULL_SETTABLE = ("mass", "damping", "rotdamping", "inertia", "massbias")
+HULL_SEEDS = {"damping": 0.0, "rotdamping": 0.0, "inertia": 1.0, "massbias": 1.0}
+
+
 def _phy_value_owner(context, key):
     """The object `key`'s `vtmb_phy_` property goes on, or None: the armature for
-    `totalmass`."""
+    `totalmass`, a collision hull for the `solid` values."""
     obj = context.object
-    if obj is not None and key == "totalmass" and obj.type == "ARMATURE":
+    if obj is None:
+        return None
+    if key == "totalmass" and obj.type == "ARMATURE":
+        return obj
+    if key in HULL_SETTABLE and obj.type == "MESH" and obj.get("vtmb_phy_hull"):
         return obj
     return None
 
 
 def phy_value_default(obj, key):
-    """What the export writes for `key` while `obj` does not carry it."""
-    return blender_export.PHY_TOTALMASS
+    """studiomdl's value for `key`, which the export writes while `obj` does not carry it,
+    unless `obj`'s solid comes from a donor `.phy`, whose own value it keeps."""
+    if key == "totalmass":
+        return blender_export.PHY_TOTALMASS
+    if key == "mass":
+        arm = obj.parent
+        scale = float(arm.get("vtmb_scale", 1.0) or 1.0) if arm is not None else 1.0
+        share = (blender_export.hull_mass_share(arm, obj, scale)
+                 if arm is not None and arm.type == "ARMATURE" else None)
+        return 1.0 if share is None else share
+    return HULL_SEEDS[key]
 
 
 class VTMB_OT_set_phy_value(bpy.types.Operator):
     bl_idname = "vtmb.set_phy_value"
     bl_label = "Set"
-    bl_description = ("Give this .phy value a field of its own, starting at what the export "
-                      "writes while it has none, so the file changes only once it is edited")
+    bl_description = ("Give this .phy value a field of its own, starting at studiomdl's: "
+                      "what the export writes while it has none, except where a donor .phy "
+                      "holds the value, which is then kept")
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     key: bpy.props.StringProperty(options={"HIDDEN"})
@@ -1251,7 +1271,8 @@ class VTMB_OT_set_phy_value(bpy.types.Operator):
 class VTMB_OT_unset_phy_value(bpy.types.Operator):
     bl_idname = "vtmb.unset_phy_value"
     bl_label = "Unset"
-    bl_description = "Remove this .phy value's field, so the export writes its default again"
+    bl_description = ("Remove this .phy value's field: the export writes studiomdl's value "
+                      "again, or the donor .phy's where it holds one")
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     key: bpy.props.StringProperty(options={"HIDDEN"})
@@ -1335,11 +1356,17 @@ def draw_hull(lay, obj):
               % (n, "" if n == 1 else "s"), icon="MESH_ICOSPHERE")
     lay.operator("vtmb.check_hull", icon="CHECKMARK")
     col = lay.column(align=True)
+    donor = obj.get("vtmb_phy_solid") is not None
     for key, _kind in blender_export.HULL_KEYS:
+        row = col.row(align=True)
         if obj.get("vtmb_phy_" + key) is not None:
-            col.prop(obj, '["vtmb_phy_%s"]' % key, text=key)
+            row.prop(obj, '["vtmb_phy_%s"]' % key, text=key)
+            if key in HULL_SETTABLE:
+                row.operator("vtmb.unset_phy_value", text="", icon="X").key = key
         else:
-            col.label(text="%s: %s" % (key, HULL_DEFAULTS[key]))
+            row.label(text="%s: %s" % (key, "the file's" if donor else HULL_DEFAULTS[key]))
+            if key in HULL_SETTABLE:
+                row.operator("vtmb.set_phy_value", text="Set").key = key
     if all(obj.get("vtmb_phy_" + key) is not None for key in blender_export.JOINT_KEYS):
         lay.label(text="joint to the parent solid, degrees:")
         grid = lay.grid_flow(columns=3, align=True)
