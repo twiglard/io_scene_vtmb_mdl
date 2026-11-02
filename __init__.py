@@ -1587,14 +1587,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 self.report({"INFO"},
                             "%s written from the collision hull objects, since the model "
                             "written over has no .phy: %d solid%s and %d joint%s, %d convex "
-                            "piece%s, total mass %g, %d break block%s"
+                            "piece%s, total mass %g, %d break piece%s"
                             % (phy["file"], n, "" if n == 1 else "s", b["joints"],
                                "" if b["joints"] == 1 else "s", b["parts"],
                                "" if b["parts"] == 1 else "s", b["totalmass"], b["breaks"],
                                "" if b["breaks"] == 1 else "s"))
             if phy.get("collision"):
                 was, now = phy["collision"]
-                self.report({"INFO"}, "%s: %d break block%s, the pieces the prop breaks into, "
+                self.report({"INFO"}, "%s: %d break piece%s, the pieces the prop breaks into, "
                                       "written from the armature's collision text, where it "
                                       "had %d" % (phy["file"], now, "" if now == 1 else "s",
                                                   was))
@@ -2188,7 +2188,7 @@ def _report_scratch_phy(op, phy):
     else:
         n = len(phy["solids"])
         op.report({"INFO"}, "wrote a .phy of %d solid%s and %d joint%s, %d convex piece%s, "
-                            "total mass %s, %d break block%s"
+                            "total mass %s, %d break piece%s"
                     % (n, "" if n == 1 else "s", phy["joints"], "" if phy["joints"] == 1 else "s",
                        phy["parts"], "" if phy["parts"] == 1 else "s", "%g" % phy["totalmass"],
                        phy["breaks"], "" if phy["breaks"] == 1 else "s"))

@@ -1212,8 +1212,9 @@ class VTMB_OT_check_hull(bpy.types.Operator):
         return {"FINISHED"}
 
 
-# Keys `CBreakParser` reads beside `model` (source-2003 `dlls/props.cpp:1330`): health 1,
-# offset 0 0 0, fadetime 0, burst and debris the prop's when unset.
+# Keys VTMB's `CBreakParser::ParseKeyValue` (vampire.dll `10191e90`) reads beside `model`, with
+# their values when unset: health 1, offset 0 0 0, fadetime 0, bodyindex 0, which sets bodygroup
+# 0 of the piece. Source-2003's burst and debris are not among them.
 BREAK_BLOCK = 'break {\n"model" ""\n"health" "1"\n}\n'
 
 

@@ -37,6 +37,7 @@ IVP's axes, HL = (x, z, -y) / 0.0254.
 
 import decimal
 import math
+import re
 import struct
 
 HEADER = struct.Struct("<iiil")
@@ -1120,8 +1121,33 @@ def walk_collision_text(text):
 
 
 def break_count(text):
-    """How many `break` blocks the engine reads in `collision_text` bytes `text`."""
-    return sum(1 for name, _p, _l in walk_collision_text(text)[0] if name == "break")
+    """How many pieces the engine makes of the `break` blocks in `collision_text` bytes `text`.
+    VTMB's `BreakModelList` (vampire.dll `10191cc0`) drops a block with no `model` key, which
+    `CBreakParser::SetDefaults` (`101920e0`) leaves with an empty name, and one whose `health`
+    is 0 or less; source-2003 keeps both."""
+    return sum(1 for name, pairs, _l in walk_collision_text(text)[0]
+               if name == "break" and break_model(pairs) is not None
+               and break_health(pairs) > 0.0)
+
+
+_ATOF = re.compile(r"[ \t\n\v\f\r]*([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)")
+
+
+def c_atof(s):
+    """`s` as the CRT's `atof` reads it: the longest number at its start after whitespace, and
+    0.0 when there is none."""
+    m = _ATOF.match(s)
+    return float(m.group(1)) if m else 0.0
+
+
+def break_health(pairs):
+    """The `health` a `break` block's pairs leave in `breakmodel_t`: the last one through
+    `atof` (`CBreakParser::ParseKeyValue`, vampire.dll `10191e90`), 1.0 with none."""
+    out = 1.0
+    for k, v in pairs:
+        if k == "health" and v is not None:
+            out = c_atof(v)
+    return out
 
 
 def break_model(pairs):
@@ -1137,8 +1163,8 @@ def break_model(pairs):
 def check_collision_text(s):
     """What stops `s` going in as `collision_text`: [message]. `walk_collision_text`'s, then a
     `break` block, one piece the prop breaks into (`CBreakParser`, source-2003
-    `dlls/props.cpp:1330`), whose `model` is missing or empty, which the engine spawns as
-    `models/.mdl`."""
+    `dlls/props.cpp:1330`), whose `model` is missing, which VTMB's `BreakModelList` drops, or
+    empty, which the engine spawns as `models/.mdl`."""
     if "\0" in s:
         return ["a NUL, which ends the text there"]
     try:

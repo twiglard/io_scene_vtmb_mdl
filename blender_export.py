@@ -5399,7 +5399,8 @@ def hulls_phy(arm_obj, d, scale, stem):
     no parent, or collision text that fails its check.
 
     {"surfaces": [Surface], "text": bytes, "solids": [bone names], "joints": count,
-    "totalmass": float, "parts": loose parts written, "breaks": `break` blocks written}"""
+    "totalmass": float, "parts": loose parts written, "breaks": `break` blocks written that
+    VTMB makes a piece of}"""
     objs = hull_objects(arm_obj)
     if not objs:
         return None
