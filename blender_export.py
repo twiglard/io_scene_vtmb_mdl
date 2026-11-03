@@ -803,14 +803,20 @@ def stamp_appended(d, rows, arm_obj=None):
         obj["vtmb_model"] = obj.name + ".smd"
         obj["vtmb_filetype"] = 0
         obj["vtmb_appended"] = True
-        # A copy keeps the import's, which numbers the vertices its `vtmb_orig` tags name.
-        if obj.get("vtmb_meshes") is None:
-            obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
+        moves = slot_moves(obj)[0]
+        # A copy carries its original's stash and vertex tags, which the next export would
+        # read as describing this model.
+        obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
+        if me.attributes.get("vtmb_orig") is not None:
+            me.attributes.remove(me.attributes["vtmb_orig"])
+        obj.pop("vtmb_orig_co", None)
         stamp_slots(obj)
-        # The model was written with no eyeball record, so an eye stamp no empty on it
-        # claims is a copy's, naming its original's eyeball, which this model has not got.
+        # An eye stamp no empty on this model claims is a copy's, naming its original's
+        # eyeball, which this model has not got.
         mine = {int(o["vtmb_eyeball"]) for o in eyes.get(obj.name + ".smd", ())}
-        eye = [[int(a), int(b)] for a, b in obj.get("vtmb_eye_slots") or () if int(b) in mine]
+        eye = [[int(a) if moves is None else moves.get(int(a)), int(b)]
+               for a, b in obj.get("vtmb_eye_slots") or () if int(b) in mine]
+        eye = [x for x in eye if x[0] is not None]
         if eye:
             obj["vtmb_eye_slots"] = eye
         else:
@@ -3878,12 +3884,14 @@ def apply_appended_eyes(d, m, arm_obj, scale, rows):
             recs.append(rec)
             out["used"].add(obj.name)
         meshed = set()
+        moves = slot_moves(row["object"])[0]
         for slot, param in row["object"].get("vtmb_eye_slots") or ():
             k = pos.get(int(param))
-            if k is None:
+            here = int(slot) if moves is None else moves.get(int(slot))
+            if k is None or here is None:
                 continue
             for j, (s, _r, _n) in enumerate(row["slots"]):
-                if s == int(slot):
+                if s == here:
                     struct.pack_into("<2i", mr.kids[j].raw, 0x18, 1, k)
                     out["eye_meshes"] += 1
                     meshed.add(k)
