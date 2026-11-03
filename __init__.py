@@ -1304,10 +1304,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             objs = (list(blender_export.mesh_objects(m, src).values())
                     + blender_export.new_model_objects(m, src, obj))
             eye_vmts = {}
+            # The dialog's Material dirs can make the file's list differ from the armature's.
+            out_dirs = (paths.cdtexture_list(self.cdtexture) if self.cdtexture
+                        else paths.engine_paths(m.material_paths))
 
             def vet(d, added):
                 eye_vmts.update(_eye_vmts(
-                    context, obj, blender_scratch.scene_cdtextures(obj), self.filepath,
+                    context, obj, out_dirs, self.filepath,
                     [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
                     self.write_vmt))
 
@@ -2136,7 +2139,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                       % (len(scene["added_materials"]),
                          "" if len(scene["added_materials"]) == 1 else "s",
                          ", ".join(scene["added_materials"])))
-            dirs = blender_scratch.scene_cdtextures(obj)
+            dirs = out_dirs
             extra += _write_vmts(context, dirs, self.filepath,
                                  scene["added_materials"], self.write_vmt, eye_vmts)
             extra += _write_tths(context, dirs, self.filepath,
