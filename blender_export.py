@@ -762,7 +762,7 @@ def append_models(d, objs, bone_index, family, added, scale=1.0):
     rows, faces, skipped = [], {}, []
     for obj in objs:
         try:
-            runs, unskinned = scratch_mod.split_mesh(obj, bone_index, scale)[:2]
+            runs, unskinned, _k, why = scratch_mod.split_mesh(obj, bone_index, scale)[:4]
             cloth = scratch_mod.cloth_params(obj) is not None
         except scratch_mod.Refused as e:
             skipped.append((obj.name, str(e)))
@@ -786,7 +786,7 @@ def append_models(d, objs, bone_index, family, added, scale=1.0):
         if cloth:
             unwritten.append("its cloth")
         rows.append({"object": obj, "name": obj.name, "bodypart": bi, "slots": slots,
-                     "verts": sum(len(v) for _r, v, _t in meshes),
+                     "partition": why is None, "verts": sum(len(v) for _r, v, _t in meshes),
                      "tris": sum(len(t) for _r, _v, t in meshes),
                      "unskinned": unskinned, "unwritten": unwritten, "stamped": False})
     return rows, faces, skipped
@@ -804,12 +804,16 @@ def stamp_appended(d, rows, arm_obj=None):
         obj["vtmb_filetype"] = 0
         obj["vtmb_appended"] = True
         moves = slot_moves(obj)[0]
-        # A copy carries its original's stash and vertex tags, which the next export would
-        # read as describing this model.
-        obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
-        if me.attributes.get("vtmb_orig") is not None:
-            me.attributes.remove(me.attributes["vtmb_orig"])
-        obj.pop("vtmb_orig_co", None)
+        stash = obj.get("vtmb_meshes")
+        if row["partition"] and stash is not None:
+            # The runs were the import's meshes, so its counts and tags still number them.
+            obj["vtmb_meshes"] = [[slot, int(x[1])]
+                                  for (slot, _r, _n), x in zip(row["slots"], stash)]
+        else:
+            # A copy's stash and tags describe its original, which the split renumbered.
+            obj["vtmb_meshes"] = [[slot, n] for slot, _r, n in row["slots"]]
+            if me.attributes.get("vtmb_orig") is not None:
+                me.attributes.remove(me.attributes["vtmb_orig"])
         stamp_slots(obj)
         # An eye stamp no empty on this model claims is a copy's, naming its original's
         # eyeball, which this model has not got.
