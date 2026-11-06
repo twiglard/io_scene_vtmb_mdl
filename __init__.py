@@ -146,6 +146,15 @@ def _roots(context, arm_obj, filepath):
     return roots
 
 
+def _lid_targets_text(name, has_lids):
+    if has_lids:
+        return ("%r has lid flexes and no aim points. All 602 shipped records carry both or "
+                "neither, so this one is written as the scene has it and no shipped file "
+                "looks like it" % name)
+    return ("%r has aim points and no lid flexes, so they were written as zero, as on the "
+            "210 shipped records with no lid flexes" % name)
+
+
 def _record_only_text(names):
     return ("no .vmt or .tth written for %d name%s only an eyeball record carries: %s. "
             "StudioRender reads neither the iris nor the glint index, and 552 of the 594 "
@@ -2139,11 +2148,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "faces both gone; any later eyeball of the model moves "
                                   "down and its eye mesh follows" % (i, model))
         for name, has_lids in scene.get("eye_lid_targets") or ():
-            self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
-                                     "neither, so this one is written as the scene has it "
-                                     "and no shipped file looks like it"
-                        % (name, "lid flexes and no aim points" if has_lids
-                           else "aim points and no lid flexes"))
+            self.report({"WARNING"}, _lid_targets_text(name, has_lids))
         if scene.get("flex") and scene["flex"][0] + scene["flex"][1]:
             nc, nr, added = scene["flex"]
             extra += ("; wrote %d flex controller%s and %d rule%s"
@@ -2784,10 +2789,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                                      "the sphere's %.4f. The sphere is what was written and "
                                      "the key has been corrected to it" % (name, key, live))
         for name, has_lids in r.get("eye_lid_targets") or ():
-            self.report({"WARNING"}, "%r has %s. All 602 shipped records carry both or "
-                                     "neither, so no shipped file looks like this one"
-                        % (name, "lid flexes and no aim points" if has_lids
-                           else "aim points and no lid flexes"))
+            self.report({"WARNING"}, _lid_targets_text(name, has_lids))
         eye_meshes = r.get("eye_mesh_materials") or []
         unread = [n for n in r.get("eye_materials") or [] if n not in eye_meshes]
         if unread:

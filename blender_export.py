@@ -4359,6 +4359,15 @@ def _eye_material(d, raw, off, name, added):
     return _material_index(d, name, added)
 
 
+def lid_targets(obj, lids):
+    """The two aim points an eyeball record holds: zero without lid flexes, as on the 210
+    of 602 shipped records that have none."""
+    if not (len(lids) == 8 and any(lids)):
+        return [0.0] * 3, [0.0] * 3
+    return tuple([float(c) for c in (obj.get(k) or (0.0, 0.0, 0.0))]
+                 for k in ("vtmb_eyeball_uppertarget", "vtmb_eyeball_lowertarget"))
+
+
 def _apply_eyeball(d, rec, obj, scale, out, bone=None):
     """Rewrite one mstudioeyeball_t off its empty; 1 if any field moved. `bone`, where
     given, is the file bone index the empty is on, written to +0x04."""
@@ -4371,9 +4380,11 @@ def _apply_eyeball(d, rec, obj, scale, out, bone=None):
     iris = _eye_material(d, raw, 0x38, obj.get("vtmb_eyeball_iris"), out["materials"])
     glint = _eye_material(d, raw, 0x40, obj.get("vtmb_eyeball_glint"), out["materials"])
     iscale = float(obj.get("vtmb_eyeball_iris_scale") or 0.0)
-    upt = [float(c) for c in (obj.get("vtmb_eyeball_uppertarget") or (0.0, 0.0, 0.0))]
-    lot = [float(c) for c in (obj.get("vtmb_eyeball_lowertarget") or (0.0, 0.0, 0.0))]
     lids = [str(x) for x in (obj.get("vtmb_eyeball_lidflexes") or ())]
+    has_lids = len(lids) == 8 and any(lids)
+    aims = [float(c) for k in ("vtmb_eyeball_uppertarget", "vtmb_eyeball_lowertarget")
+            for c in (obj.get(k) or (0.0, 0.0, 0.0))]
+    upt, lot = lid_targets(obj, lids)
     # Compared as the float32 the record stores, which is what the game divides.
     out["lid_past_radius"] += [
         (obj.name, "%s[%d]" % (nm, k), t, radius)
@@ -4398,8 +4409,8 @@ def _apply_eyeball(d, rec, obj, scale, out, bone=None):
     # Lid flexes and the two aim points move together on all 602 shipped records -- 392
     # carry both and 210 carry neither -- so either alone is a state the format has never
     # held, and it is named rather than refused.
-    if (len(lids) == 8 and any(lids)) == all(c == 0.0 for c in list(upt) + list(lot)):
-        out["lid_targets"].append((obj.name, bool(len(lids) == 8 and any(lids))))
+    if has_lids == all(c == 0.0 for c in aims):
+        out["lid_targets"].append((obj.name, has_lids))
     have = (struct.unpack_from("<3f", raw, 0x08) + struct.unpack_from("<f", raw, 0x18)
             + struct.unpack_from("<3f", raw, 0x1c) + struct.unpack_from("<3f", raw, 0x28)
             + struct.unpack_from("<i", raw, 0x38) + struct.unpack_from("<f", raw, 0x3c)
