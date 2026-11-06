@@ -15,6 +15,7 @@ import array
 import collections
 import contextlib
 import copy
+import hashlib
 import math
 import os
 import re
@@ -79,6 +80,7 @@ SINGULAR_DET = 1e-9
 SKIN_ATTR = "vtmb_skin"
 WEIGHT_ATTR = "vtmb_weight"
 COUNT_ATTR = "vtmb_numbones"
+DIGEST_KEY = "vtmb_mdl_sha256"
 ROOT_MOTION_MODES = ("keep", "extract", "none", "in_place")
 PER_ACTION = "per_action"
 MODE_ATTR = "vtmb_root_motion_mode"
@@ -685,25 +687,43 @@ def placed(objs, arm_obj):
                 att.data.foreach_get("vector", nor)
             home = obj.get("vtmb_orig_co")
             home = list(home) if home is not None else None
-            saved.append((obj, me, co, keys, nor, home))
+            turned = moved = None
             me.transform(rel, shape_keys=True)
             if nor is not None:
-                att.data.foreach_set("vector", _turned_normals(rel, nor))
+                turned = _turned_normals(rel, nor)
+                att.data.foreach_set("vector", turned)
             if home is not None:
-                obj["vtmb_orig_co"] = [c for i in range(0, len(home) - 2, 3)
-                                       for c in rel @ mathutils.Vector(home[i:i + 3])]
+                moved = _moved_points(rel, home)
+                obj["vtmb_orig_co"] = moved
+            saved.append((obj, me, rel, co, keys, nor, turned, home, moved))
             me.update()
         yield [row for _obj, _rel, row in todo]
     finally:
-        for obj, me, co, keys, nor, home in saved:
+        for obj, me, rel, co, keys, nor, turned, home, moved in saved:
+            back = rel.inverted()
             me.vertices.foreach_set("co", co)
             for kb, a in zip(me.shape_keys.key_blocks if me.shape_keys else (), keys):
                 kb.data.foreach_set("co", a)
-            if nor is not None:
-                me.attributes[NORMAL_ATTR].data.foreach_set("vector", nor)
-            if home is not None:
+            att = me.attributes.get(NORMAL_ATTR)
+            if nor is not None and att is not None and len(att.data) * 3 == len(nor):
+                now = array.array("f", [0.0]) * len(nor)
+                att.data.foreach_get("vector", now)
+                # A stash that changed was restamped from the file, which holds the mesh placed.
+                att.data.foreach_set("vector", nor if now == turned
+                                     else _turned_normals(back, now))
+            now = obj.get("vtmb_orig_co")
+            now = list(now) if now is not None else None
+            if home is not None and now == moved:
                 obj["vtmb_orig_co"] = home
+            elif now is not None and now != home:
+                obj["vtmb_orig_co"] = _moved_points(back, now)
             me.update()
+
+
+def _moved_points(m, flat):
+    """A flat list of 3 floats per point, each through the 4x4 `m`."""
+    return [c for i in range(0, len(flat) - 2, 3)
+            for c in m @ mathutils.Vector(flat[i:i + 3])]
 
 
 def _turned_normals(rel, flat):
@@ -761,8 +781,10 @@ def append_models(d, objs, bone_index, family, added, scale=1.0):
     from . import blender_scratch as scratch_mod
     rows, faces, skipped = [], {}, []
     for obj in objs:
+        carry = []
         try:
-            runs, unskinned, _k, why = scratch_mod.split_mesh(obj, bone_index, scale)[:4]
+            runs, unskinned, _k, why, _e, origins = scratch_mod.split_mesh(
+                obj, bone_index, scale, carry=carry)
             cloth = scratch_mod.cloth_params(obj) is not None
         except scratch_mod.Refused as e:
             skipped.append((obj.name, str(e)))
@@ -788,7 +810,8 @@ def append_models(d, objs, bone_index, family, added, scale=1.0):
         rows.append({"object": obj, "name": obj.name, "bodypart": bi, "slots": slots,
                      "partition": why is None, "verts": sum(len(v) for _r, v, _t in meshes),
                      "tris": sum(len(t) for _r, _v, t in meshes),
-                     "unskinned": unskinned, "unwritten": unwritten, "stamped": False})
+                     "unskinned": unskinned, "unwritten": unwritten, "stamped": False,
+                     "origins": origins, "carry": carry})
     return rows, faces, skipped
 
 
@@ -835,6 +858,119 @@ def stamp_appended(d, rows, arm_obj=None):
         row["stamped"] = True
     if arm_obj is not None and rows:
         widen_skin_table(d, arm_obj)
+
+
+def mdl_digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def stamp_written(data, m, source, numbering, drops, cells, fields, appended, scale=1.0):
+    """Each object of `source` stamped as an import of `data`, written over it, would be.
+    `numbering` is `split_mesh`'s (origins, carry) per rebuilt model. [(object, why not)]."""
+    w = mdl_mod.Mdl(source, data)
+    written = {(bi, mi): mo for bi, mi, _bp, mo in mesh_mod.models_of(w)}
+    jobs = []
+    for key, obj in sorted(mesh_objects(m, source).items()):
+        if key in numbering:
+            wrote = ("positions", "normals")
+        else:
+            wrote = tuple(f for f in fields if key in cells)
+        jobs.append((obj, written.get(key), 1.0, numbering.get(key), drops.get(key, ()),
+                     wrote))
+    for row in appended:
+        if row["stamped"]:
+            jobs.append((row["object"], written.get((row["bodypart"], 0)), scale,
+                         (row["origins"], row["carry"]), (), ("positions", "normals")))
+    digest, left = mdl_digest(data), []
+    for obj, mo, unit, runs, dropped, wrote in jobs:
+        why = _restamp(obj, w, mo, unit, runs, dropped, wrote)
+        if why is None:
+            obj[DIGEST_KEY] = digest
+        else:
+            left.append((obj.name, why))
+    return left
+
+
+def _restamp(obj, w, mo, unit, runs, dropped, wrote):
+    """None once `obj` carries an import's stamps of `w`'s model `mo`, else why not. A
+    vertex written twice claims its original's copy, else the first."""
+    from . import blender_scratch as scratch_mod
+    me = obj.data
+    if mo is None:
+        return "the file as written has no model for it"
+    if any(o.data is me and o is not obj for o in bpy.data.objects):
+        return "its mesh is shared with another object, and one set of tags cannot number both"
+    verts = w.vertices(mo)
+    counts = [x.numvertices for x in mo.meshes]
+    spec = obj.get("vtmb_meshes")
+    tags = rows = None
+    if runs is None:
+        ident = scratch_mod.identity_map(obj, me)
+        if ident is None and len(me.vertices) == len(verts):
+            ident = {j: j for j in range(len(verts))}
+        if ident is None:
+            return "its vertices carry no tags and its count differs from the file's"
+        if spec is not None and [int(n) for _s, n in spec] != counts:
+            return "its vtmb_meshes counts differ from the file's"
+        own = {b: j for j, b in ident.items() if j < len(verts)}
+    else:
+        origins, carry = runs
+        kept = [k for k in range(len(origins)) if k not in dropped]
+        if [len(origins[k]) for k in kept] != counts:
+            return "the file as written holds other mesh counts than the export wrote"
+        homes = [0 if carry[k] is None else sum(1 for x in carry[k] if x is not None)
+                 for k in range(len(origins))]
+        flat = [(b, i < homes[k]) for k in kept for i, b in enumerate(origins[k])]
+        own = {b: j for j, (b, home) in enumerate(flat) if home}
+        for j, (b, _home) in enumerate(flat):
+            own.setdefault(b, j)
+        if all(carry[k] is None for k in kept):
+            if me.attributes.get("vtmb_orig") is not None:
+                me.attributes.remove(me.attributes["vtmb_orig"])
+        elif spec is not None and len(spec) == len(origins):
+            tags = [-1] * len(me.vertices)
+            for b, j in own.items():
+                tags[b] = j
+            rows = [[int(spec[k][0]), n] for k, n in zip(kept, counts)]
+        else:
+            return "its vtmb_meshes rows do not match the file's meshes"
+    if tags is not None:
+        att = me.attributes.get("vtmb_orig")
+        if att is None or len(att.data) != len(me.vertices):
+            return "its vtmb_orig tags are missing"
+        att.data.foreach_set("value", tags)
+        obj["vtmb_meshes"] = rows
+        gone = {int(spec[k][0]) for k in dropped if k < len(spec)}
+        eye = [[int(a), int(b)] for a, b in obj.get("vtmb_eye_slots") or ()
+               if int(a) not in gone]
+        if eye:
+            obj["vtmb_eye_slots"] = eye
+        else:
+            obj.pop("vtmb_eye_slots", None)
+    if "positions" in wrote and (tags is not None or runs is None):
+        obj["vtmb_orig_co"] = [c * unit for v in verts for c in v.pos]
+    _set_points(me, "vtmb_uv", "vector", 2, own, [(v.uv[0], 1.0 - v.uv[1]) for v in verts])
+    if "normals" in wrote:
+        _set_points(me, NORMAL_ATTR, "vector", 3, own, [v.normal for v in verts])
+    if mo.filetype == 0:
+        _set_points(me, SKIN_ATTR, "color", 4, own, [[float(b) for b in v.bones] for v in verts])
+        _set_points(me, WEIGHT_ATTR, "color", 4, own, [v.weights for v in verts])
+        _set_points(me, COUNT_ATTR, "value", 1, own, [[v.numbones] for v in verts])
+    obj["vtmb_filetype"] = mo.filetype
+    return None
+
+
+def _set_points(me, name, field, width, own, values):
+    """`name` of each Blender vertex in `own` set to its file vertex's `values`."""
+    att = me.attributes.get(name)
+    if att is None or att.domain != "POINT" or len(att.data) != len(me.vertices):
+        return
+    zero = 0 if field == "value" else 0.0
+    buf = [zero] * (width * len(me.vertices))
+    att.data.foreach_get(field, buf)
+    for b, j in own.items():
+        buf[b * width:(b + 1) * width] = list(values[j])
+    att.data.foreach_set(field, buf)
 
 
 def widen_skin_table(d, arm_obj):
@@ -1513,6 +1649,7 @@ def rebuild_cell(d, obj, bi, mi, bone_index, fields=("uvs", "normals"),
         d, bi, mi, [(None, v, f) for _slot, v, f in runs], donor_tris=donor_tris,
         carry=carry if kept else None, flips=cloth_flip_bits(obj, vertex), place=place)
     edits["flex_dropped"], edits["flex_emptied"] = flex
+    edits["origins"], edits["carry"] = origins, carry
     if d.bodyparts[bi].kids[mi].extra.get("cloth"):
         # The cloth object now names the WRITTEN numbering, which is Blender's only where
         # nothing was added or deleted, so `cloth_edits` reads the scene through this.
@@ -1847,6 +1984,40 @@ def _old_import_text(old):
     return ("an import older than what this export reads made part of this scene: %s. "
             "Nothing tells an edit there from what that import left. Re-import the model"
             % said)
+
+
+def stale_stamps(m, source):
+    """[(object name, why)] for each object whose stamps number another file than the one
+    at `source`, by its SHA-256 and, where tags number it, its per-mesh vertex counts."""
+    models = {(bi, mi): mo for bi, mi, _bp, mo in mesh_mod.models_of(m)}
+    digest, out = None, []
+    for key, obj in sorted(mesh_objects(m, source).items()):
+        got = obj.get(DIGEST_KEY)
+        if got is not None:
+            if digest is None:
+                digest = mdl_digest(m.d)
+            if got != digest:
+                out.append((obj.name, "was stamped from another version of the file"))
+                continue
+        spec = obj.get("vtmb_meshes")
+        if spec is None or obj.data.attributes.get("vtmb_orig") is None:
+            continue
+        have = [int(n) for _s, n in spec]
+        want = [x.numvertices for x in models[key].meshes]
+        if have != want:
+            out.append((obj.name, "numbers %s vertices over its meshes where the file holds %s"
+                        % (have, want)))
+    return out
+
+
+def _stale_stamps_text(stale, source):
+    said = "; ".join("%s %s" % x for x in stale[:6])
+    if len(stale) > 6:
+        said += "; and %d more" % (len(stale) - 6)
+    return ("%s on disk is not the file this scene's vertex numbering was taken from: %s. "
+            "Ctrl+Z after an export leaves the file written, and a .blend saved before an "
+            "export describes the file as it was. Re-import the model"
+            % (os.path.basename(source), said))
 
 
 def read_meshes(m, source, fields, boxes=None, blank=None):
@@ -5822,6 +5993,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     old = old_imports(m, source, arm_obj)
     if old:
         raise build_mod.Refused(_old_import_text(old))
+    stale = stale_stamps(m, source)
+    if stale:
+        raise build_mod.Refused(_stale_stamps_text(stale, source))
     stray = stray_accessories(arm_obj)
     if stray:
         raise build_mod.Refused(stray_text(stray))
@@ -6132,7 +6306,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
             "cloth_promoted": [], "cloth_rigid": [],
             "flexes": 0, "flex_records": 0, "flex_skipped": 0, "flex_refused": [],
             "flex_carried": [], "flex_gone": [], "flex_unkeyed": [],
-            "stray_groups": [], "dequantised": [], "rebased": []}
+            "stray_groups": [], "dequantised": [], "rebased": [], "unstamped": []}
     revised = {}
     placed = placed or {}
     scene_objs = mesh_objects(m, source)
@@ -6195,7 +6369,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["tangents"] += t
     mesh["models"] = len(cells)
     bone_index = {b.name: b.index for b in m.bones}
-    cloth_maps = {}
+    cloth_maps, numbering = {}, {}
     for (bi, mi), obj in sorted(rebuild.items()):
         mo = m.bodyparts[bi].models[mi]
         was = mo.numvertices
@@ -6229,6 +6403,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["tangents"] += edits["tangents"]
         if "cloth_map" in edits:
             cloth_maps[(bi, mi)] = edits["cloth_map"]
+        numbering[(bi, mi)] = (edits["origins"], edits["carry"])
         ce = edits.get("cloth")
         if ce and ce.get("rigid"):
             mesh["cloth_rigid"].append((obj.name, ce["rigid"], ce["why"]))
@@ -6338,7 +6513,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # A save-as leaves the armature describing the donor, which has no such model.
     if same_file(source, dest):
         stamp_appended(d, appended, arm_obj)
-    mesh["appended"] = [dict((k, v) for k, v in x.items() if k != "object")
+        mesh["unstamped"] = stamp_written(data, m, source, numbering, drops, cells,
+                                          mesh_fields, appended, scale)
+    mesh["appended"] = [dict((k, v) for k, v in x.items()
+                             if k not in ("object", "origins", "carry"))
                         for x in appended]
     return {"wrote": wrote, "added": added, "dropped": dropped, "unfitted": unfitted,
             "unkeepable": unkeepable, "bones": len(m.bones),

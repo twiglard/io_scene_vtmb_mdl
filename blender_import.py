@@ -1044,6 +1044,7 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
     objs = []
     skin_mats = {}
     cloth_notes = []
+    digest = export_mod.mdl_digest(m.d)
     nkeys = nflexrec = nflexdrop = 0
     for gi, (bp, model) in enumerate(models):
         faces = faces_by_model.get(gi)
@@ -1144,6 +1145,7 @@ def build_meshes(context, m, arm_obj, name, scale, content, with_flexes=True):
         # Keyed by file vertex, not by Blender vertex: an edit rewrites the second and
         # interpolates any float attribute, so only an object property survives one.
         obj["vtmb_orig_co"] = [c * scale for v_ in verts for c in v_.pos]
+        obj[export_mod.DIGEST_KEY] = digest
         # Which import wrote the stash, so a later decode fix can be told from a live edit.
         # `vtmb_import` on the armature carries the same number and is not enough: one scene
         # holds objects from several imports.

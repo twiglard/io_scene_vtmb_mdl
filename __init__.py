@@ -1377,6 +1377,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for name, was, now in mesh["rebuilt"]:
             self.report({"INFO"}, "%s was rebuilt: %d vertices -> %d, and the "
                                   ".dx80.vtx rewritten with it" % (name, was, now))
+        for name, why in mesh.get("unstamped") or ():
+            self.report({"WARNING"}, "%s still numbers its vertices as the file did before "
+                                     "this export, since %s, so the next export will refuse "
+                                     "it: re-import it first" % (name, why))
         for name, ft in mesh.get("rebased") or ():
             self.report({"INFO"}, "%s keeps filetype %d: it is only shifted or scaled "
                                   "evenly, so its quantisation box moves with it and no "

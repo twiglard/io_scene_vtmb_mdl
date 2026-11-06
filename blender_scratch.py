@@ -154,6 +154,8 @@ def identity_map(obj, me):
         claims.setdefault(o, []).append(vi)
     out = {}
     for o, vs in claims.items():
+        if o < 0:
+            continue
         if len(vs) == 1:
             out[o] = vs[0]
             continue
