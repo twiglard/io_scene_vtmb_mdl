@@ -2038,6 +2038,51 @@ def draw_bodypart(layout, obj):
     n = len(bodypart_objects(obj))
     if n > 1:
         layout.label(text="renames the bodypart on all %d of its objects" % n)
+    layout.operator("vtmb.move_by_bone_rest", icon="BONE_DATA")
+
+
+_SOURCE_ARMATURES = []
+
+
+def _source_armatures(self, context):
+    own = owning_armature(context.object)
+    _SOURCE_ARMATURES[:] = [(o.name, o.name, "") for o in bpy.data.objects
+                            if o.type == "ARMATURE" and o is not own]
+    return _SOURCE_ARMATURES or [("", "no other armature", "")]
+
+
+class VTMB_OT_move_by_bone_rest(bpy.types.Operator):
+    bl_idname = "vtmb.move_by_bone_rest"
+    bl_label = "Move onto this armature's bone"
+    bl_description = ("Move the mesh by the bone's rest matrix in its own armature times the "
+                      "inverse of the same bone's in the armature it was copied from, so an "
+                      "eye copied from another model sits on this head as it sat on that one")
+    bl_options = {"REGISTER", "UNDO"}
+
+    source: bpy.props.EnumProperty(name="Copied from", items=_source_armatures)
+    bone: bpy.props.StringProperty(name="Bone", default="Bip01 Head")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj is not None and obj.type == "MESH" and owning_armature(obj) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.object
+        dst, src = owning_armature(obj), bpy.data.objects.get(self.source)
+        if src is None or src.type != "ARMATURE":
+            self.report({"ERROR"}, "no armature %r to move the mesh from" % self.source)
+            return {"CANCELLED"}
+        lack = [a.name for a in (src, dst) if self.bone not in a.data.bones]
+        if lack:
+            self.report({"ERROR"}, "%s has no bone %r" % (" and ".join(lack), self.bone))
+            return {"CANCELLED"}
+        rest = [a.matrix_world @ a.data.bones[self.bone].matrix_local for a in (src, dst)]
+        obj.matrix_world = rest[1] @ rest[0].inverted() @ obj.matrix_world
+        return {"FINISHED"}
 
 
 class VTMB_PT_bodypart(bpy.types.Panel):
@@ -4167,6 +4212,7 @@ CLASSES = [VTMB_OT_mark_armature, VTMB_OT_add_cdtexture, VTMB_OT_add_include, VT
            VTMB_OT_add_spring_bone, VTMB_OT_remove_spring_bone,
            VTMB_OT_edit_flex_line, VTMB_OT_add_flex_line,
            VTMB_OT_remove_flex_line, VTMB_OT_add_eyeball, VTMB_OT_add_mouth,
+           VTMB_OT_move_by_bone_rest,
            VTMB_OT_remove_mouth,
            VTMB_PT_face, VTMB_PT_eyeball, VTMB_PT_hitbox, VTMB_PT_bodypart, VTMB_PT_flex,
            VTMB_OT_flex_preview, VTMB_OT_flex_preview_stop, VTMB_PT_flex_preview,
