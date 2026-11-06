@@ -757,6 +757,20 @@ def new_model_objects(m, source, arm_obj):
                   key=lambda o: o.name)
 
 
+def drawn_names(d):
+    """The texture names some mesh of `d` draws, in any skin family."""
+    rows = d.skin or [range(len(d.textures))]
+    out = set()
+    for bp in d.bodyparts:
+        for mr in bp.kids:
+            for mesh in mr.kids:
+                ref = struct.unpack_from("<i", mesh.raw, 0)[0]
+                for row in rows:
+                    if 0 <= ref < len(row) and 0 <= row[ref] < len(d.textures):
+                        out.add(d.textures[row[ref]].name)
+    return out
+
+
 def _skin_ref(d, tex, family):
     """The skinref that draws texture `tex` in skin family `family`, appended if none does.
 
@@ -6214,7 +6228,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
              "stale": 0,
              "accessories": 0, "hitboxsets": 0,
              "rebased": 0, "requantised": [], "root_turned": [], "reparented": [],
-             "added_materials": [], "skin_families": 0,
+             "added_materials": [], "eye_record_materials": [], "skin_families": 0,
              "slots_moved": 0, "slots_gone": [],
              "renamed_anims": [],
              "seqlist": {},
@@ -6291,6 +6305,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["eyes_removed"] = face["eyes_removed"]
     # After the mesh pass above rather than beside it: an eyeball is the one thing that
     # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
+    eye_names = list(face["materials"])
     for name in face["materials"]:
         if name not in scene["added_materials"]:
             scene["added_materials"].append(name)
@@ -6469,6 +6484,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         scene["eye_empties"] = [x for x in scene["eye_empties"] if x[0] not in eyes["used"]]
         scene["eye_radius_keys"] = scene["eye_radius_keys"] + eyes["radius_keys"]
         scene["eye_lid_targets"] = scene["eye_lid_targets"] + eyes["lid_targets"]
+        eye_names += eyes["materials"]
         for name in eyes["materials"]:
             if name not in scene["added_materials"]:
                 scene["added_materials"].append(name)
@@ -6519,6 +6535,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     built = (hulls_phy(arm_obj, d, scale, os.path.splitext(os.path.basename(dest))[0])
              if hulls is None else None)
     collision = scene_collision_text(arm_obj, source, content) if built is None else None
+    drawn = drawn_names(d)
+    scene["eye_record_materials"] = [n for n in dict.fromkeys(eye_names) if n not in drawn]
     if before_write is not None:
         before_write(d, scene["added_materials"])
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,

@@ -146,12 +146,20 @@ def _roots(context, arm_obj, filepath):
     return roots
 
 
-def _eye_vmts(context, arm_obj, dirs, dest, names, enabled):
+def _record_only_text(names):
+    return ("no .vmt or .tth written for %d name%s only an eyeball record carries: %s. "
+            "StudioRender reads neither the iris nor the glint index, and 552 of the 594 "
+            "shipped glint records name a texture with no .vmt either"
+            % (len(names), "" if len(names) == 1 else "s", ", ".join(names[:4])))
+
+
+def _eye_vmts(context, arm_obj, dirs, dest, names, enabled, tth=False):
     """{name: text} for each eye mesh material in `names` whose `.vmt` is to be written.
 
     `Eyes` takes `$iris` from the `.vmt` alone, so the text is the `.vmt` the material was
-    imported with, `$basetexture` pointed at the image written beside it. With nothing to
-    copy the export is refused: no `$iris` is invented, and that file is the user's to write.
+    imported with, `$basetexture` pointed at the image written beside it where `tth` writes
+    one. With nothing to copy the export is refused: no `$iris` is invented, and that file
+    is the user's to write.
     """
     if not (enabled and dirs and names):
         return {}
@@ -179,8 +187,12 @@ def _eye_vmts(context, arm_obj, dirs, dest, names, enabled):
                 "copied: write %s by hand, or untick Write .vmt"
                 % (name, (paths.MATERIALS_DIR + "/" + rel).replace("\\", "/")))
         shader, pairs = got
+        base = next((v for k, v in pairs if k.lower() == "$basetexture"), None)
+        img = _base_image(mat) if tth and mat is not None else None
+        if base is None or (img is not None and _image_rgba(img) is not None):
+            base = vmt_write.texture_path(dirs[0], name)
         out[name] = vmt_write.vmt_text(
-            vmt_write.texture_path(dirs[0], name), shader=shader,
+            base, shader=shader,
             extra=[(k, v) for k, v in pairs if k.lower() != "$basetexture"])
     if bad:
         raise mdl_build.Refused(
@@ -1312,7 +1324,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 eye_vmts.update(_eye_vmts(
                     context, obj, out_dirs, self.filepath,
                     [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
-                    self.write_vmt))
+                    self.write_vmt, self.write_tth))
 
             with blender_export.placed(objs, obj) as moved:
                 r = blender_export.export_actions(
@@ -2144,11 +2156,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                          "" if len(scene["added_materials"]) == 1 else "s",
                          ", ".join(scene["added_materials"])))
             dirs = out_dirs
-            extra += _write_vmts(context, dirs, self.filepath,
-                                 scene["added_materials"], self.write_vmt, eye_vmts)
-            extra += _write_tths(context, dirs, self.filepath,
-                                 scene["added_materials"], self.write_tth,
-                                 self.tth_format)
+            unread = scene.get("eye_record_materials") or []
+            mats = [n for n in scene["added_materials"] if n not in unread]
+            if unread:
+                extra += "; " + _record_only_text(unread)
+            if mats:
+                extra += _write_vmts(context, dirs, self.filepath, mats, self.write_vmt,
+                                     eye_vmts)
+                extra += _write_tths(context, dirs, self.filepath, mats, self.write_tth,
+                                     self.tth_format)
         if scene.get("skin_families"):
             extra += "; wrote the scene's %d skin famil%s" % (
                 scene["skin_families"], "y" if scene["skin_families"] == 1 else "ies")
@@ -2645,7 +2661,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             eye_vmts.update(_eye_vmts(
                 context, obj, dirs, self.filepath,
                 [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
-                self.write_vmt))
+                self.write_vmt, self.write_tth))
 
         try:
             with blender_export.placed(meshes, obj) as moved:
@@ -2775,12 +2791,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         eye_meshes = r.get("eye_mesh_materials") or []
         unread = [n for n in r.get("eye_materials") or [] if n not in eye_meshes]
         if unread:
-            self.report({"INFO"}, "no .vmt or .tth written for %d name%s only an eyeball "
-                                  "record carries: %s. StudioRender reads neither the iris "
-                                  "nor the glint index, and 556 of the 594 shipped glint "
-                                  "names have no .vmt either"
-                        % (len(unread), "" if len(unread) == 1 else "s",
-                           ", ".join(unread[:4])))
+            self.report({"INFO"}, _record_only_text(unread))
         mats = [n for n in r.get("material_names") or [] if n not in unread]
         if mats:
             said = _write_vmts(context, dirs, self.filepath, mats, self.write_vmt,
