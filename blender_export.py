@@ -2950,18 +2950,21 @@ def accessory_objects(arm_obj):
     return attach, boxes, names
 
 
-def eyeball_objects(arm_obj):
+def eyeball_objects(arm_obj, renamed=None):
     """The eyeball empties under one armature, in the order the file will carry them.
 
     Keyed on `vtmb_eyeball_model` because an eyeball belongs to one mstudiomodel_t and the
     scene has no other way to say which; an empty the scene added carries no model name and
-    lands on the first model the export writes.
+    lands on the first model the export writes. `renamed` is `resolve_eyeball_models`'.
     """
     out = {}
     for obj in arm_obj.children_recursive:
         if obj.get("vtmb_eyeball") is None:
             continue
-        out.setdefault(str(obj.get("vtmb_eyeball_model") or ""), []).append(obj)
+        model = (renamed or {}).get(obj.name)
+        if model is None:
+            model = str(obj.get("vtmb_eyeball_model") or "")
+        out.setdefault(model, []).append(obj)
     big = 1 << 30
     for k in out:
         out[k].sort(key=lambda o: (int(o.get("vtmb_eyeball", big)), o.name))
@@ -2988,6 +2991,43 @@ def stray_eyeballs(m, arm_obj):
         if up is None:
             out.append(obj.name)
     return sorted(out)
+
+
+def resolve_eyeball_models(m, arm_obj, objs):
+    """{empty name: model} for each eyeball empty naming a model that neither `m` nor the
+    appended `objs` write, taken from the one of `objs` that came from it and draws the eye."""
+    models = {mo.name for bp in m.bodyparts for mo in bp.models}
+    models |= {o.name + ".smd" for o in objs}
+    out, several = {}, []
+    for obj in arm_obj.children_recursive:
+        i, name = obj.get("vtmb_eyeball"), str(obj.get("vtmb_eyeball_model") or "")
+        if i is None or not name or name in models:
+            continue
+        got = [o for o in objs
+               if str(o.get("vtmb_model") or "") == name and _draws_eyeball(o, int(i))]
+        if len(got) == 1:
+            out[obj.name] = got[0].name + ".smd"
+        elif got:
+            several.append("%r, eyeball %d of %r: %s"
+                           % (obj.name, int(i), name, ", ".join(repr(o.name) for o in got)))
+    if several:
+        raise build_mod.Refused(
+            "%s each came from the eyeball's model and still draw it, so nothing says which "
+            "one the eyeball goes with. Set the empty's vtmb_eyeball_model to that object's "
+            "name followed by .smd, or delete the eye's faces from the others"
+            % "; ".join(several))
+    return out
+
+
+def _draws_eyeball(obj, i):
+    """Whether a `vtmb_eye_slots` entry of `obj` names eyeball `i` on a slot with faces."""
+    moves = slot_moves(obj)[0]
+    faces = collections.Counter(p.material_index for p in obj.data.polygons)
+    for slot, param in obj.get("vtmb_eye_slots") or ():
+        here = int(slot) if moves is None else moves.get(int(slot))
+        if int(param) == i and here is not None and faces[here]:
+            return True
+    return False
 
 
 # The stamp each kind of accessory empty carries, and what the message calls it.
@@ -3901,7 +3941,7 @@ class _Named(object):
         self.name = name
 
 
-def apply_face(d, m, arm_obj, scale, source=None):
+def apply_face(d, m, arm_obj, scale, source=None, renamed=None):
     """The eyeball records and the one mouth record, written only where they differ.
 
     Answers `{changed, materials, radius_keys, lid_targets, eye_empties, eye_records,
@@ -3942,7 +3982,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
             "eyeball empty %s is not parented to a bone, so nothing says which bone it moves "
             "with. Parent it to one of the model's bones (Ctrl+P > Bone, or Object properties "
             "> Relations), or %s" % (", ".join(repr(n) for n in stray), _DELETE["eyeball"]))
-    eyes = eyeball_objects(arm_obj)
+    eyes = eyeball_objects(arm_obj, renamed)
     used = set()
     at, added, gone = {}, [], {}
     bmap = None
@@ -4023,7 +4063,7 @@ def apply_face(d, m, arm_obj, scale, source=None):
     return out
 
 
-def apply_appended_eyes(d, m, arm_obj, scale, rows):
+def apply_appended_eyes(d, m, arm_obj, scale, rows, renamed=None):
     """Eyeball records for the models this export appended, and their eye meshes' fields.
 
     `apply_face` runs before the append and walks the donor's models only, so an empty
@@ -4035,7 +4075,7 @@ def apply_appended_eyes(d, m, arm_obj, scale, rows):
     """
     out = {"changed": 0, "materials": [], "radius_keys": [], "lid_targets": [],
            "lid_past_radius": [], "eyes_added": [], "eye_meshes": 0, "used": set()}
-    eyes = eyeball_objects(arm_obj)
+    eyes = eyeball_objects(arm_obj, renamed)
     bmap = None
     for row in rows:
         model = row["name"] + ".smd"
@@ -6016,6 +6056,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # a bone of the file in its own right.
     dup_bones = duplicate_bones(m, arm_obj)
     new_objs = new_model_objects(m, source, arm_obj)
+    eye_models = resolve_eyeball_models(m, arm_obj, new_objs)
     appending = set(o.name for o in new_objs)
     dup_models = [x for x in dup_models if x[0] not in appending]
     # Before the first reader: `read_poses` and `read_bones` both walk the FILE's bone list
@@ -6237,7 +6278,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     scene["cloth_two_bone"] = vol.get("two_bone") or []
     # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
     scene["hitboxsets"] = len(d.hitboxsets)
-    face = apply_face(d, m, arm_obj, scale, source)
+    face = apply_face(d, m, arm_obj, scale, source, eye_models)
     scene["face"] = face["changed"]
     scene["eyes_added"] = face["eyes_added"]
     scene["mouth_added"] = face["mouth_added"]
@@ -6421,7 +6462,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     appended, add_faces, mesh["not_appended"] = append_models(
         d, new_objs, bone_index, skin_family(m, arm_obj), scene["added_materials"], scale)
     revised.update(add_faces)
-    eyes = apply_appended_eyes(d, m, arm_obj, scale, appended)
+    eyes = apply_appended_eyes(d, m, arm_obj, scale, appended, eye_models)
     if eyes["used"]:
         scene["eyes_added"] = scene["eyes_added"] + eyes["eyes_added"]
         scene["eye_meshes"] += eyes["eye_meshes"]
@@ -6512,6 +6553,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     phy_rewrite = write_phy(dest, phy_rewrite)
     # A save-as leaves the armature describing the donor, which has no such model.
     if same_file(source, dest):
+        for name, model in eye_models.items():
+            bpy.data.objects[name]["vtmb_eyeball_model"] = model
         stamp_appended(d, appended, arm_obj)
         mesh["unstamped"] = stamp_written(data, m, source, numbering, drops, cells,
                                           mesh_fields, appended, scale)

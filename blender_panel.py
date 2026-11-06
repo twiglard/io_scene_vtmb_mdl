@@ -1562,6 +1562,34 @@ def draw_accessories(lay, context, arm_obj):
                          obj.parent_bone or "no bone"))
 
 
+_SOURCE_MDL = {}
+
+
+def appended_eyes(arm_obj):
+    """(names of the objects the donor export appends, `resolve_eyeball_models`' answer),
+    off the armature's source file, cached on its mtime and size."""
+    path = arm_obj.get("vtmb_source")
+    try:
+        st = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return set(), {}
+    stamp = (st.st_mtime_ns, st.st_size)
+    got = _SOURCE_MDL.get(path)
+    if got is None or got[0] != stamp:
+        try:
+            got = stamp, mdl_mod.Mdl(path)
+        except Exception:
+            return set(), {}
+        _SOURCE_MDL.clear()
+        _SOURCE_MDL[path] = got
+    objs = blender_export.new_model_objects(got[1], path, arm_obj)
+    try:
+        renamed = blender_export.resolve_eyeball_models(got[1], arm_obj, objs)
+    except blender_export.build_mod.Refused:
+        renamed = {}
+    return {o.name for o in objs}, renamed
+
+
 def eye_mesh_choices(context, arm_obj):
     """[(object, stamp slot, material name, model name)] per mesh that can be an eye.
 
@@ -1571,10 +1599,13 @@ def eye_mesh_choices(context, arm_obj):
     no file mesh on a donor export -- and so is a mesh already an eye.
     """
     out = []
+    appended = appended_eyes(arm_obj)[0]
     for obj in arm_meshes(context, arm_obj):
         mats = obj.data.materials
         taken = {int(s) for s, _p in obj.get("vtmb_eye_slots") or ()}
-        model = str(obj.get("vtmb_model") or obj.name + ".smd")
+        model = obj.name + ".smd"
+        if obj.name not in appended:
+            model = str(obj.get("vtmb_model") or model)
         moves = blender_export.slot_moves(obj)[0]
         if moves is None:
             slots = [(j, j) for j in range(len(mats))]
@@ -1640,7 +1671,8 @@ class VTMB_OT_add_eyeball(bpy.types.Operator):
             return {"CANCELLED"}
         mesh_obj, slot, mat, model = pick
         scale = float(arm_obj.get("vtmb_scale", 1.0) or 1.0)
-        mine = blender_export.eyeball_objects(arm_obj).get(model) or []
+        mine = blender_export.eyeball_objects(arm_obj, appended_eyes(arm_obj)[1]).get(
+            model) or []
         index = max((int(o["vtmb_eyeball"]) for o in mine), default=-1) + 1
         obj = bpy.data.objects.new("%s.eye%d" % (arm_obj.name, index), None)
         obj.empty_display_type = "SPHERE"
