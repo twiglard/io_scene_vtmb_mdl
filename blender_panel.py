@@ -2986,6 +2986,51 @@ def chain_paths(obj):
     return {os.path.normcase(os.path.normpath(p)) for p in got if p}
 
 
+class VTMB_OT_copy_action(bpy.types.Operator):
+    bl_idname = "vtmb.copy_action"
+    bl_label = "Copy into this model"
+    bl_description = ("Copy this action, which came from another file such as an include, "
+                      "so that an export of this model with Add the rest as new appends it "
+                      "as a new animation. The copy keeps the keys, frame rate, activity "
+                      "and root motion, and becomes the assigned action")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        act = listed_action(obj)
+        return (act is not None and obj.type == "ARMATURE" and bool(obj.get("vtmb_source"))
+                and blender_export.from_another_file(act, obj["vtmb_source"]))
+
+    def execute(self, context):
+        obj = context.object
+        act = listed_action(obj)
+        try:
+            taken = {a.name for a in mdl_mod.Mdl(obj["vtmb_source"]).anims}
+        except Exception as exc:
+            self.report({"ERROR"}, "cannot read %s: %s" % (obj["vtmb_source"], exc))
+            return {"CANCELLED"}
+        # A name the file already has would replace that animation instead of appending.
+        base = str(act.get("vtmb_anim_name") or act.name.rpartition("|")[2])
+        name, n = base, 0
+        while name in taken or name in bpy.data.actions:
+            n += 1
+            name = "%s.%03d" % (base, n)
+        new = act.copy()
+        new.name = name
+        new.use_fake_user = True
+        for key in ("vtmb_source", "vtmb_anim_index", "vtmb_anim_name"):
+            if key in new:
+                del new[key]
+        ad = obj.animation_data or obj.animation_data_create()
+        ad.action = new
+        blender_import._bind_slot(obj, new)
+        obj.vtmb_action_index = bpy.data.actions.find(new.name)
+        self.report({"INFO"}, "%s copied as %s, which an export of %s appends"
+                    % (act.name, new.name, os.path.basename(obj["vtmb_source"])))
+        return {"FINISHED"}
+
+
 class VTMB_UL_actions(bpy.types.UIList):
     """Every action in the blend that could be this model's, and the mode each writes.
 
@@ -3051,6 +3096,10 @@ class VTMB_PT_actions(bpy.types.Panel):
             lay.label(text="the blend holds no action", icon="INFO")
             return
         draw_action_fields(lay, act, obj)
+        if VTMB_OT_copy_action.poll(context):
+            lay.label(text="from %s, so an export of this model does not write it"
+                      % os.path.basename(act["vtmb_source"]), icon="INFO")
+            lay.operator("vtmb.copy_action", icon="DUPLICATE")
         ad = obj.animation_data
         if ad is None or ad.action is not act:
             lay.label(text="not the assigned action -- an export with target Active "
@@ -4201,7 +4250,7 @@ class VTMB_PT_material(bpy.types.Panel):
 
 CLASSES = [VTMB_OT_mark_armature, VTMB_OT_add_cdtexture, VTMB_OT_add_include, VTMB_OT_check_paths,
            VTMB_OT_add_event, VTMB_OT_remove_event, VTMB_OT_set_param,
-           VTMB_UL_actions,
+           VTMB_OT_copy_action, VTMB_UL_actions,
            VTMB_OT_set_skin_family, VTMB_OT_add_skin_family, VTMB_OT_remove_skin_family,
            VTMB_OT_set_skin_cell, VTMB_PT_skin_families,
            VTMB_PT_cloth, VTMB_PT_material,

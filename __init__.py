@@ -331,6 +331,19 @@ def _report_unkeepable(op, names):
                  + ("" if len(names) <= 3 else " and %d more" % (len(names) - 3))))
 
 
+def _report_skipped(op, acts, src):
+    if not acts:
+        return
+    files = sorted({os.path.basename(a["vtmb_source"]) for a in acts})
+    op.report({"WARNING"},
+              "%d action%s not written into %s, because %s from %s: %s. Copy into this "
+              "model, in Object Data > VTMB animations, makes a copy that is"
+              % (len(acts), "" if len(acts) == 1 else "s", os.path.basename(src),
+                 "it came" if len(acts) == 1 else "they came", " and ".join(files),
+                 ", ".join(a.name for a in acts[:3])
+                 + ("" if len(acts) <= 3 else " and %d more" % (len(acts) - 3))))
+
+
 def _report_placed(op, moved, fields, whole):
     """Name each object `placed` baked, or the unticked field that kept the file's own
     placement. `fields` is None on the no-donor path, which writes every field, and an
@@ -413,21 +426,21 @@ def _export_armature(context):
 
 
 def _base_from(op, context):
-    """The .mdl being rewritten, and what named it: "source", "action", "armature" or "".
+    """The .mdl being rewritten, and what named it: "source", "armature", "action" or "".
 
-    Never the save path: importing with the chain on gives actions from about 29 files at
-    once, so the action's own stamp wins. An action keyed in Blender carries none, and then
-    the file the armature was imported from is the one it goes into.
+    Never the save path, and the armature's file before the active action's: with the chain
+    on the action may be an include's, and the armature's stashes describe the armature's
+    file only. The action's file only for an armature imported from nothing, a template's.
     """
     if getattr(op, "source", ""):
         return bpy.path.abspath(op.source), "source"
     obj = _export_armature(context)
+    got = obj.get("vtmb_source") if obj else None
+    if got:
+        return got, "armature"
     ad = obj.animation_data if obj else None
     got = ad.action.get("vtmb_source") if ad and ad.action else None
-    if got:
-        return got, "action"
-    got = obj.get("vtmb_source") if obj else None
-    return (got, "armature") if got else ("", "")
+    return (got, "action") if got else ("", "")
 
 
 def _base_path(op, context):
@@ -633,9 +646,10 @@ def _auto_name(op, context):
     write uses, so the dialog cannot name one slot while the write takes another."""
     obj = _export_armature(context)
     ad = obj.animation_data if obj else None
-    if not (ad and ad.action):
+    path = _base_path(op, context)
+    if not (ad and ad.action) or blender_export.from_another_file(ad.action, path):
         return None
-    anims = _base_anims(_base_path(op, context))
+    anims = _base_anims(path)
     i = blender_export.name_index([n for n, _ in anims], ad.action)
     return None if i is None else (i, anims[i][0], anims[i][1])
 
@@ -1074,8 +1088,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         self.cdtexture = ";".join(
             blender_scratch.scene_cdtextures(_export_armature(context)))
         base, why = _base_from(self, context)
-        self.reading = ("%s (the armature's)" % os.path.basename(base) if why == "armature"
-                        else os.path.basename(base) or "(none)")
+        self.reading = ("%s (the active action's)" % os.path.basename(base)
+                        if why == "action" else os.path.basename(base) or "(none)")
         self.filepath = base or self.filepath
         return super().invoke(context, event)
 
@@ -1188,7 +1202,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                "the meshes alone", icon="ERROR")
             elif self.target != NONE:
                 auto = _auto_name(self, context)
-                if self.target == ACTIVE and not auto and self.add_new:
+                if self.target == ACTIVE and blender_export.from_another_file(act, base):
+                    box.label(text="%s came from %s, so it is not written"
+                              % (act.name, os.path.basename(act["vtmb_source"])),
+                              icon="ERROR")
+                    box.label(text="    VTMB animations > Copy into this model makes one "
+                                   "that is")
+                elif self.target == ACTIVE and not auto and self.add_new:
                     _pair(box, "into", "a new animation and sequence, %s" % act.name,
                           icon="ADD")
                 elif self.target == ACTIVE and not auto:
@@ -1301,7 +1321,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         "no action is assigned to %s, so Replace has nothing to write: "
                         "set Replace to Nothing to write the meshes alone, or to Every "
                         "matching action" % obj.name)
-                if _appends_active(self, act, adds):
+                if _appends_active(self, act, adds) \
+                        or blender_export.from_another_file(act, src):
                     actions = {}
                 else:
                     actions = {blender_export.resolve_target(
@@ -1373,6 +1394,10 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             context.scene.frame_set(frame)
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
+        if self.target != NONE:
+            written = set(actions.values()) | set(adds)
+            _report_skipped(self, [a for a in blender_export.skipped_actions(obj, src)
+                                   if a not in written], src)
         mesh = r["mesh"]
         _report_placed(self, moved, mesh["fields"],
                        {row["name"] for row in mesh.get("appended") or ()})

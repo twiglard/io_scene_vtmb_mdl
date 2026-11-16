@@ -2153,6 +2153,14 @@ def same_file(a, b):
             os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
+def from_another_file(act, source):
+    """Whether the import stamped this action for a file other than `source`, as it stamps
+    an include's animation imported with the chain on. Neither the active-action write nor
+    the append takes one: it would put the include's animation into this file unasked."""
+    got = act.get("vtmb_source")
+    return bool(got) and not same_file(got, source)
+
+
 def armature_actions(arm_obj):
     """Every action the armature currently plays -- its own, and its NLA strips'."""
     ad = getattr(arm_obj, "animation_data", None)
@@ -2162,6 +2170,11 @@ def armature_actions(arm_obj):
     for tr in ad.nla_tracks:
         out += [s.action for s in tr.strips if s.action]
     return out
+
+
+def skipped_actions(arm_obj, source):
+    """The armature's actions an export of `source` leaves out, by `from_another_file`."""
+    return [a for a in armature_actions(arm_obj) if from_another_file(a, source)]
 
 
 def match_indices(anim_names, source, arm_obj=None):
@@ -2213,7 +2226,8 @@ def match_indices(anim_names, source, arm_obj=None):
     seen = set(found.values()) | {a for a in loose}
     named_out = {u[1] for u in unwritten}
     for act in armature_actions(arm_obj):
-        if act not in seen and act.name not in named_out:
+        if act not in seen and act.name not in named_out \
+                and not from_another_file(act, source):
             unwritten.append((None, act.name, None))
             named_out.add(act.name)
             addable.append(act)
