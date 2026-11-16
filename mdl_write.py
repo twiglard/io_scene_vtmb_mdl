@@ -203,6 +203,49 @@ def quantise(m, poses, scales, drop_zero_pos=True, drop_bind_rot=True):
     return chan
 
 
+# A value this close to the donor's decoded one keeps the donor's int16, so a smaller edit is
+# lost. An unedited export moved no int16 of snuff_bip1 or courtroom_bip2 past 2e-4 off it.
+DONOR_TOLERANCE = 2e-4
+
+
+def keep_donor_values(poses, t, old, new, tol=DONOR_TOLERANCE):
+    """Put the donor's decoded value from `t` into `poses` wherever it lies within `tol`, on
+    the bones whose name, bind and scales are the donor's. Returns how many were put back."""
+    if t.numframes != len(poses):
+        return 0
+    by_name = dict((o.name, o) for o in old)
+    kept = 0
+    for b in new:
+        o = by_name.get(b.name)
+        if o is None or [list(o.pos), list(o.quat), list(o.posscale), list(o.rotscale)] != \
+                [list(b.pos), list(b.quat), list(b.posscale), list(b.rotscale)]:
+            continue
+        pc = [t.chan.get((o.index, c)) for c in range(3)]
+        qc = [t.chan.get((o.index, 3 + c)) for c in range(4)]
+        want = [([o.pos[c] + pc[c][f] * o.posscale[c] if pc[c] else o.pos[c]
+                  for c in range(3)],
+                 [qc[c][f] * o.rotscale[c] if qc[c] else o.quat[c] for c in range(4)])
+                for f in range(len(poses))]
+        dot = sum(poses[f][b.index][1][c] * want[f][1][c]
+                  for f in range(len(poses)) for c in range(4))
+        # Negated whole: flipping single frames would undo unwind_signs.
+        sign = -1.0 if dot < 0.0 else 1.0
+        for f, (wpos, wquat) in enumerate(want):
+            pos, quat = poses[f][b.index]
+            pos, quat = list(pos), [sign * x for x in quat]
+            for c in range(3):
+                if abs(pos[c] - wpos[c]) <= tol:
+                    pos[c] = wpos[c]
+                    kept += 1
+            # All four or none: a quaternion mixing the donor's components with new ones
+            # is off unit length, and the next import reads it up to 2.1e-4 off.
+            if all(abs(quat[c] - wquat[c]) <= tol for c in range(4)):
+                quat = list(wquat)
+                kept += 4
+            poses[f][b.index] = (pos, quat)
+    return kept
+
+
 def rescale(t, old, new):
     """Requantise every channel of `t` from one set of per-bone scales to another.
 

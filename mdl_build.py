@@ -1449,6 +1449,8 @@ def apply_anims(d, edits, path=""):
         if not 0 <= i < len(d.anims):
             raise ValueError("no animation %d in %s" % (i, path))
         r = d.anims[i]
+        if r.extra.get("block") and r.extra.get("block_bones") == len(d.bones):
+            r.extra["donor"] = (r.extra["block"], _AnimHdr(r), _skeleton(d).bones)
         r.extra["poses"] = e["poses"]
         r.extra["block"] = b""
         struct.pack_into("<i", r.raw, 0x0c, len(e["poses"]))
@@ -3211,6 +3213,10 @@ def quantise(d):
         for f in r.extra["poses"]:
             out.append([f[b.index] if f[b.index] is not None else (b.pos, b.quat)
                         for b in m.bones])
+        donor = r.extra.pop("donor", None)
+        if donor:
+            block, hdr, bones = donor
+            W.keep_donor_values(out, W.read_tracks(_Block(block, bones), hdr), bones, m.bones)
         filled.append(out)
     scales = W.fit_scales(m, filled)
     for k, br in enumerate(d.bones):
