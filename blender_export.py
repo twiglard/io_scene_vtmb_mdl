@@ -5986,7 +5986,8 @@ def phy_report(source, dest, removed, renamed, geometry_moved, rewrite=None, con
 
 
 def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
-    """Rewrite the .vtx for a model whose geometry moved, and return what each cost.
+    """Rewrite the .vtx for a model whose geometry moved, or whose flex records name a
+    vertex the donor draws unmorphed (`unflexed_records`), and return what each cost.
 
     The donor's own file supplies every strip group the edit did not touch, so a change to
     one mesh leaves the others byte for byte as the compiler emitted them. Each flavour is
@@ -6014,6 +6015,25 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
         st["flavour"] = flavour
         out.append(st)
     return out
+
+
+def unflexed_records(source, data, flavours=("dx80",), drop=None):
+    """Whether a flex record of the model as written names a vertex that the donor's `.vtx`
+    draws in a strip group the engine does not morph, in any flavour asked for.
+
+    Such a model needs `revise_vtx` even when no face, bone or mesh changed: carried
+    unchanged, the donor's groups leave that vertex where it was while the face moves.
+    """
+    written = None
+    for flavour in flavours:
+        src = vtx_path(source, flavour)
+        if not os.path.exists(src):
+            continue
+        if written is None:
+            written = mdl_mod.Mdl("<written>", data=data)
+        if vtxr_mod.unflexed_meshes(written, src, drop):
+            return True
+    return False
 
 
 def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
@@ -6583,7 +6603,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
     # was named, so an empty face map is the whole of what either needs.
     touched = (revise_vtx(source, dest, data, revised, vtx_flavours, drops)
-               if (revised or removed or added_bones or cloth_removed or drops) else [])
+               if (revised or removed or added_bones or cloth_removed or drops
+                   or unflexed_records(source, data, vtx_flavours, drops)) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
     # wrote.

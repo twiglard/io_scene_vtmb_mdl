@@ -147,6 +147,59 @@ def _cloth_row(src_mesh, li):
     return rows[li] if li < len(rows) else {}
 
 
+def _donor_groups(reader, mesh, ri):
+    """Each strip group of `mesh` as (group, mesh-local vertex ids, group-local triangles),
+    `ri` being the reader's index of the mesh's first group."""
+    out = []
+    for n, grp in enumerate(mesh.groups):
+        if not grp.numverts:
+            out.append((grp, [], []))
+            continue
+        out.append((grp, grp.orig_vert_ids(),
+                    [tuple(t) for t in reader.triangles(reader.groups[ri + n])]))
+    return out
+
+
+def _unflexed_flex_verts(src_mesh, donor):
+    """The vertices a flex record of the written mesh names that a donor group without
+    SG_IS_FLEXED draws.
+
+    StudioRender morphs only a flagged group (`R_StudioDrawDynamicMesh` 0x2c01c3c5), and no
+    shipped file has such a vertex in a LOD with a flagged group. An eyeball mesh is morphed
+    whole (`R_StudioDrawEyeball` 0x2c01cc11), so it has none.
+    """
+    if src_mesh.materialtype == 1 or not src_mesh.flexes:
+        return set()
+    plain = set(ids[x] for g, ids, tris in donor if not g.flags & W.SG_IS_FLEXED
+                for t in tris for x in t)
+    return set(va.index for f in src_mesh.flexes for va in f.verts) & plain
+
+
+def unflexed_meshes(mdl, vtx_path, drop=None):
+    """The LOD-0 cells (bodypart, model, donor mesh index) that `revise` deals out again
+    because a flex record of `mdl` names a vertex the donor draws in an unflagged group.
+
+    A LOD with no flagged group has none: there the donor draws no morph at all, which is
+    what Troika chose for the last LOD of 123 files. `drop` is as `revise` takes it.
+    """
+    reader = R.Vtx(vtx_path)
+    v = W.VtxFile(vtx_path)
+    out, ri = [], 0
+    for i, bp in enumerate(v.bodyparts):
+        for j, model in enumerate(bp.models):
+            src_model = mdl.bodyparts[i].models[j]
+            gone = (drop or {}).get((i, j)) or set()
+            for li, lod in enumerate(model.lods):
+                flagged = any(g.flags & W.SG_IS_FLEXED for e in lod.meshes for g in e.groups)
+                for k, mesh in enumerate(lod.meshes):
+                    if li == 0 and flagged and k not in gone:
+                        src_mesh = src_model.meshes[k - sum(1 for g in gone if g < k)]
+                        if _unflexed_flex_verts(src_mesh, _donor_groups(reader, mesh, ri)):
+                            out.append((i, j, k))
+                    ri += len(mesh.groups)
+    return out
+
+
 def _repartition(mesh, src_mesh, new, verts, v, lod, fixed_function, force_no_flex,
                  i, j, k, li=0):
     """New triangles dealt out over one mesh's strip groups, as [(group, triangles)].
@@ -213,7 +266,10 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
     Only LOD 0 is revised from `faces`; the lower LODs keep their own triangles, which
     stay valid because an addition never moves an original vertex id. A mesh whose donor
     groups include a cloth-flagged one while the written model binds none of its vertices
-    in that LOD's row is dealt out again in every LOD, keeping its triangles. `lod0_only`
+    in that LOD's row is dealt out again in every LOD, keeping its triangles. So is a mesh
+    a flex record of which names a vertex that a donor group without SG_IS_FLEXED draws, in
+    a LOD with a flagged group, since the engine morphs only those; `st["reflexed"]` counts
+    them. `lod0_only`
     is for an export that cuts the file to one LOD next, which a renumbering rebuild
     forces: there the lower LODs name vertices by the donor's numbering, so they are left
     as read and not rebuilt against the written model, whose vertex at the same index is
@@ -234,7 +290,7 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
     v = W.VtxFile(vtx_path)
     if fixed_function is None:
         fixed_function = os.path.basename(vtx_path).endswith(".dx7_2bone.vtx")
-    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0, boned=0)
+    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0, boned=0, reflexed=0)
     ri = 0
     for i, bp in enumerate(v.bodyparts):
         for j, model in enumerate(bp.models):
@@ -259,13 +315,7 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
                     # their original ids, so an edit that adds vertices leaves its
                     # triangles valid, and handing it LOD 0's would replace it with them.
                     new = faces.get((i, j, k)) if li == 0 else None
-                    donor = []
-                    for n, grp in enumerate(mesh.groups):
-                        sg = reader.groups[ri + n]
-                        ids = grp.orig_vert_ids() if grp.numverts else []
-                        donor.append((grp, ids,
-                                      [tuple(t) for t in reader.triangles(sg)]
-                                      if grp.numverts else []))
+                    donor = _donor_groups(reader, mesh, ri)
                     ri += len(mesh.groups)
                     # The comparison is in mesh-local indices, which is what the caller
                     # speaks; `rebuild_group` wants the group-local ones kept above.
@@ -278,6 +328,10 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
                         # row -- its cloth object was removed -- so the cloth group's
                         # triangles are dealt out again over the plain passes.
                         new = flat
+                    if (new is None and not force_no_flex
+                            and _unflexed_flex_verts(src_mesh, donor)):
+                        new = flat
+                        st["reflexed"] += 1
                     if new is None:
                         cells = [(g, ids, tris) for g, ids, tris in donor if g.numverts]
                     else:
