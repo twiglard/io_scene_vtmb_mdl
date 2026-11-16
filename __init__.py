@@ -1202,7 +1202,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                "the meshes alone", icon="ERROR")
             elif self.target != NONE:
                 auto = _auto_name(self, context)
-                if self.target == ACTIVE and blender_export.from_another_file(act, base):
+                if blender_export.from_another_file(act, base):
                     box.label(text="%s came from %s, so it is not written"
                               % (act.name, os.path.basename(act["vtmb_source"])),
                               icon="ERROR")
