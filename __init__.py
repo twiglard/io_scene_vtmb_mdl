@@ -453,6 +453,24 @@ def _appends_active(op, act, adds):
     return op.target == ACTIVE and op.add_new and act in adds
 
 
+def _active_lands(op, context, act):
+    """How the export writes the active action, by the tests execute() makes: "replace"
+    over an animation of the file, "append" as a new one, None where it is not written."""
+    path = _base_path(op, context)
+    if blender_export.from_another_file(act, path):
+        return None
+    found, _unwritten, addable = blender_export.match_indices(
+        [n for n, _ in _base_anims(path)], path, _export_armature(context))
+    adds = addable if op.add_new else []
+    if op.target == ALL:
+        return "replace" if act in found.values() else ("append" if act in adds else None)
+    if _appends_active(op, act, adds):
+        return "append"
+    if op.target == ACTIVE and not _auto_name(op, context):
+        return None
+    return "replace"
+
+
 def _restamp_sequences(obj, written, src, added, dropped_seqs, seqlist=None):
     """Write `vtmb_sequences` again when the export moved how many sequences the file has,
     or which order they are in.
@@ -1238,10 +1256,17 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 if nmv is not None:
                     _pair(box, "the file's animations",
                           "%d carry a movement block" % nmv)
-                box.prop(self, "root_motion_in_keys")
+                lands = _active_lands(self, context, act)
+                # An append reads the keys whole and has no donor blocks, so the box would
+                # change nothing.
+                if lands == "replace":
+                    box.prop(self, "root_motion_in_keys")
                 try:
-                    _pair(box, "this action writes", ROOT_MOTION_LABELS[
-                        blender_export.root_motion_mode(act, self.root_motion)])
+                    _pair(box, "this action writes", "nothing, it is not written"
+                          if lands is None else ROOT_MOTION_LABELS[
+                              blender_export.root_motion_mode(
+                                  act, self.root_motion, donor=lands == "replace",
+                                  default="keep" if lands == "replace" else "extract")])
                 except (ValueError, KeyError) as exc:
                     box.label(text=str(exc), icon="ERROR")
                 if self.root_motion != blender_export.PER_ACTION:

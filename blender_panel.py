@@ -48,8 +48,9 @@ MODE_ITEMS = (
      "Leave it to the export dialog, which falls back to the animation this action came "
      "from: the file's own blocks where it had one, nothing where it did not"),
     ("keep", "Engine carries the character, as the file has it",
-     "Reuse the movement blocks the file already has, unchanged. A from-scratch export "
-     "has no file to keep them from and fits them from the keys instead"),
+     "Reuse the movement blocks the file already has, unchanged. A from-scratch export, "
+     "and an action added to the file as a new animation, have no blocks to keep and fit "
+     "them from the keys instead"),
     ("extract", "Engine carries the character",
      "Fit new movement blocks to the root bone's path in the scene, replacing whatever "
      "the file had"),
