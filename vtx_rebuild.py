@@ -28,6 +28,8 @@ else:
     from . import vtx as R
     from . import vtx_write as W
 
+FLEXED_HW = W.SG_IS_FLEXED | W.SG_IS_HW_SKINNED
+
 
 def vertex_bones(mesh, orig_ids, verts):
     """Group-local vertex -> its .mdl bones, in the .mdl's own order.
@@ -162,12 +164,7 @@ def _donor_groups(reader, mesh, ri):
 
 def _unflexed_flex_verts(src_mesh, donor):
     """The vertices a flex record of the written mesh names that a donor group without
-    SG_IS_FLEXED draws.
-
-    StudioRender morphs only a flagged group (`R_StudioDrawDynamicMesh` 0x2c01c3c5), and no
-    shipped file has such a vertex in a LOD with a flagged group. An eyeball mesh is morphed
-    whole (`R_StudioDrawEyeball` 0x2c01cc11), so it has none.
-    """
+    SG_IS_FLEXED draws. An eyeball mesh, which the engine morphs whole, has none."""
     if src_mesh.materialtype == 1 or not src_mesh.flexes:
         return set()
     plain = set(ids[x] for g, ids, tris in donor if not g.flags & W.SG_IS_FLEXED
@@ -175,13 +172,22 @@ def _unflexed_flex_verts(src_mesh, donor):
     return set(va.index for f in src_mesh.flexes for va in f.verts) & plain
 
 
+def _multibone_flexed_hw(src_mesh, donor, verts, max_per_vert):
+    """Whether a donor group flagged flexed and hardware-skinned has a triangle whose
+    corners, as the written model binds them, name more than one bone, which
+    `rebuild_group` cannot build there."""
+    for g, ids, tris in donor:
+        if g.flags & FLEXED_HW != FLEXED_HW or not tris:
+            continue
+        vb = vertex_bones(src_mesh, ids, verts)
+        if any(len(set(b for x in t for b in vb[x][:max_per_vert])) > 1 for t in tris):
+            return True
+    return False
+
+
 def unflexed_meshes(mdl, vtx_path, drop=None):
     """The LOD-0 cells (bodypart, model, donor mesh index) that `revise` deals out again
-    because a flex record of `mdl` names a vertex the donor draws in an unflagged group.
-
-    A LOD with no flagged group has none: there the donor draws no morph at all, which is
-    what Troika chose for the last LOD of 123 files. `drop` is as `revise` takes it.
-    """
+    for `_unflexed_flex_verts`, in a LOD with a flagged group. `drop` is as `revise` takes."""
     reader = R.Vtx(vtx_path)
     v = W.VtxFile(vtx_path)
     out, ri = [], 0
@@ -268,9 +274,11 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
     groups include a cloth-flagged one while the written model binds none of its vertices
     in that LOD's row is dealt out again in every LOD, keeping its triangles. So is a mesh
     a flex record of which names a vertex that a donor group without SG_IS_FLEXED draws, in
-    a LOD with a flagged group, since the engine morphs only those; `st["reflexed"]` counts
-    them. `lod0_only`
-    is for an export that cuts the file to one LOD next, which a renumbering rebuild
+    a LOD with a flagged group, since the engine morphs only those (`st["redealt_unflexed"]`),
+    and one whose flexed hardware-skinned group has a triangle the written model binds to
+    more than one bone, which such a strip cannot draw (`st["redealt_multibone"]`).
+
+    `lod0_only` is for an export that cuts the file to one LOD next, which a renumbering rebuild
     forces: there the lower LODs name vertices by the donor's numbering, so they are left
     as read and not rebuilt against the written model, whose vertex at the same index is
     another one.
@@ -290,7 +298,8 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
     v = W.VtxFile(vtx_path)
     if fixed_function is None:
         fixed_function = os.path.basename(vtx_path).endswith(".dx7_2bone.vtx")
-    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0, boned=0, reflexed=0)
+    st = dict(groups=0, revised=0, tris_out=0, verts_out=0, strips=0, boned=0,
+              redealt_unflexed=0, redealt_multibone=0)
     ri = 0
     for i, bp in enumerate(v.bodyparts):
         for j, model in enumerate(bp.models):
@@ -331,7 +340,11 @@ def revise(mdl, vtx_path, faces, fixed_function=None, lod0_only=False, drop=None
                     if (new is None and not force_no_flex
                             and _unflexed_flex_verts(src_mesh, donor)):
                         new = flat
-                        st["reflexed"] += 1
+                        st["redealt_unflexed"] += 1
+                    if new is None and _multibone_flexed_hw(src_mesh, donor, verts,
+                                                            v.maxbones_vert):
+                        new = flat
+                        st["redealt_multibone"] += 1
                     if new is None:
                         cells = [(g, ids, tris) for g, ids, tris in donor if g.numverts]
                     else:

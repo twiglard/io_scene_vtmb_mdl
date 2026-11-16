@@ -683,7 +683,9 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
     range in the .mdl; `triangles` are group-local triples, and a 12-byte group needs
     `vert_bones` giving each vertex its model bones. With SG_IS_HW_SKINNED the record
     stores slots only the strip's own bone state changes can resolve, which is why a
-    vertex two strips share is emitted once per strip.
+    vertex two strips share is emitted once per strip. A group flagged both SG_IS_FLEXED
+    and SG_IS_HW_SKINNED takes one bone per strip whatever `max_bones` says, so a triangle
+    there that names two bones raises.
 
     `fixed_function`, for `.dx7_2bone.vtx`, spells a hardware-skinned strip of at most two
     bones as studiomdl does there: every bound vertex by `pack_vert_fixed`, and numBones
@@ -711,6 +713,10 @@ def rebuild_group(group, orig_ids, triangles, vert_bones=None, max_bones=16,
         # studiomdl drops the .mdl's fourth bone rather than raising maxBonesPerVert.
         # The slot map has to lose it too, or the strip reserves a bone nothing reads.
         vert_bones = dict((v, list(b)[:max_per_vert]) for v, b in vert_bones.items())
+    if hw and group.flags & SG_IS_FLEXED:
+        # The morphed draw puts every vertex on the strip's slot-0 bone (StudioRender
+        # 0x2c01b5d4), so studiomdl gives such a strip one bone (optimize.cpp:1563-1567).
+        max_bones = 1
     runs = partition(triangles, vert_bones if boned and hw else None, max_bones)
 
     indices, strips, recs = [], [], []

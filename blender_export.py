@@ -6019,11 +6019,7 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
 
 def unflexed_records(source, data, flavours=("dx80",), drop=None):
     """Whether a flex record of the model as written names a vertex that the donor's `.vtx`
-    draws in a strip group the engine does not morph, in any flavour asked for.
-
-    Such a model needs `revise_vtx` even when no face, bone or mesh changed: carried
-    unchanged, the donor's groups leave that vertex where it was while the face moves.
-    """
+    draws in a strip group the engine does not morph, in any flavour asked for."""
     written = None
     for flavour in flavours:
         src = vtx_path(source, flavour)
