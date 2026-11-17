@@ -880,6 +880,25 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
+class VTMB_OT_confirm_vtx_rewrite(bpy.types.Operator):
+    """Ask whether to replace a .vtx that belongs to another model, then open the export"""
+    bl_idname = "vtmb.confirm_vtx_rewrite"
+    bl_label = "Write a new .vtx"
+    bl_options = {"INTERNAL"}
+
+    title: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    message: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(
+            self, event, title=self.title, message=self.message,
+            confirm_text="Write a new .vtx", icon="WARNING")
+
+    def execute(self, context):
+        bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_vtx="REWRITE")
+        return {"FINISHED"}
+
+
 class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     bl_idname = "export_scene.vtmb_mdl"
     bl_label = "Export VTMB Model " + VERSION
@@ -945,6 +964,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "none of them feeding Base Color, is named in the report and skipped. "
                     "Neither half of an existing pair is overwritten. Nothing looks for "
                     "the image at all unless a .vmt is there too")
+    mismatched_vtx: bpy.props.EnumProperty(
+        name="Another model's .vtx", default="STOP", options={"HIDDEN", "SKIP_SAVE"},
+        items=(("STOP", "Stop", "Refuse the export and write nothing"),
+               ("REWRITE", "Write a new .vtx",
+                "Rebuild every model from the scene and write each .vtx flavour beside the "
+                "source from nothing")),
+        description="What a .vtx beside the source whose checksum is not the .mdl's gets. "
+                    "The game draws no geometry from such a pair. Set by the popup the "
+                    "dialog opens on one")
     write_2bone_vtx: bpy.props.BoolProperty(
         name="Also rewrite .dx7_2bone.vtx", default=False,
         description="Rewrite the second strip file beside the model as well as the "
@@ -1106,6 +1134,20 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         self.cdtexture = ";".join(
             blender_scratch.scene_cdtextures(_export_armature(context)))
         base, why = _base_from(self, context)
+        rows = blender_export.mismatched_vtx_files(base) if base else []
+        if rows and self.mismatched_vtx != "REWRITE":
+            lacking = blender_export.unmeshed_models(mdl.Mdl(base), base,
+                                                     _export_armature(context))
+            if lacking:
+                self.report({"ERROR"}, blender_export.unmeshed_text(lacking, base))
+                return {"CANCELLED"}
+            _flavour, path, got, want = rows[0]
+            bpy.ops.vtmb.confirm_vtx_rewrite(
+                "INVOKE_DEFAULT", title="%s belongs to another model" % os.path.basename(path),
+                message="Its checksum is %s and the .mdl's %#x, so the game draws no geometry "
+                        "with it. A new one is built from the scene's meshes"
+                        % ("unreadable" if got is None else "%#x" % got, want))
+            return {"CANCELLED"}
         self.reading = ("%s (the active action's)" % os.path.basename(base)
                         if why == "action" else os.path.basename(base) or "(none)")
         self.filepath = base or self.filepath
@@ -1406,7 +1448,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                           else None),
                     frame_start=context.scene.frame_start if self.use_range and one else None,
                     frame_end=context.scene.frame_end if self.use_range and one else None,
-                    content=blender_import.Content(paths.roots(src, *_prefs(context))))
+                    content=blender_import.Content(paths.roots(src, *_prefs(context))),
+                    mismatched_vtx=self.mismatched_vtx.lower())
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -1637,6 +1680,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                         % (len(undriven), "" if len(undriven) == 1 else "es",
                            "it" if len(undriven) == 1 else "them", ", ".join(undriven)))
         vtx = r.get("vtx")
+        for x in ([vtx] if vtx is not None else []) + list(r.get("vtx_more") or ()):
+            if x.get("replaced"):
+                _was, ck = x["replaced"]
+                self.report({"WARNING"}, "%s written from the scene's meshes in place of the "
+                                         "one beside the source, whose checksum %s was "
+                                         "another model's"
+                            % (os.path.basename(x["path"]),
+                               "unreadable" if ck is None else "%#x" % ck))
         if vtx is not None:
             self.report({"INFO"}, "%s rewritten, %d bytes over %d strip groups"
                         % (os.path.basename(vtx["path"]), vtx["bytes"], vtx["groups"]))
@@ -2875,8 +2926,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
 
 
 CLASSES = ([VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
-            EXPORT_OT_vtmb_mdl_scratch] + list(blender_templates.CLASSES)
-           + list(blender_panel.CLASSES))
+            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_confirm_vtx_rewrite]
+           + list(blender_templates.CLASSES) + list(blender_panel.CLASSES))
 
 if hasattr(bpy.types, "FileHandler"):
     class IO_FH_vtmb_mdl(bpy.types.FileHandler):

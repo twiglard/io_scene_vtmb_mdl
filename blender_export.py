@@ -1378,7 +1378,8 @@ def _donor_faces(source, m, meshes=None):
     vertices are indexed by, by the same mapping `blender_import` reads them in through.
 
     Empty where no .vtx sits beside the source, which leaves the caller comparing what it
-    compared before rather than rebuilding every model on a missing file.
+    compared before rather than rebuilding every model on a missing file, and where the one
+    there is another model's, whose triangles the import did not read either.
 
     `meshes`, if given, is filled with {(bodypart, model): {triangle: {file mesh index}}},
     which is what says a face has moved to another material slot.
@@ -1387,6 +1388,8 @@ def _donor_faces(source, m, meshes=None):
     if not source or not os.path.exists(path):
         return {}
     reader = vtx_mod.Vtx(path)
+    if reader.checksum & 0xffffffff != _header_u32(source, 8):
+        return {}
     models = mesh_mod.models_of(m)
     out, per = {}, {}
     for sg in reader.groups:
@@ -2034,7 +2037,7 @@ def _stale_stamps_text(stale, source):
             % (os.path.basename(source), said))
 
 
-def read_meshes(m, source, fields, boxes=None, blank=None):
+def read_meshes(m, source, fields, boxes=None, blank=None, rebuild_all=False):
     """{(bodypart, model): vertices} for every model of `m` the scene supplies, plus the
     models it does not, the fields the file cannot carry, the objects holding a vertex whose
     fifth bone group no record can hold, the vertices whose normal moved by more than the
@@ -2045,7 +2048,8 @@ def read_meshes(m, source, fields, boxes=None, blank=None):
 
     `blank`, a list where the scene's import made an object for every model with a
     vertex, collects (bodypart, model, name) for each such model whose object is gone
-    instead of naming it missing."""
+    instead of naming it missing. `rebuild_all` sends every model the scene supplies down
+    the rebuild path, for a `.vtx` written from nothing."""
     found = mesh_objects(m, source)
     bone_index = {b.name: b.index for b in m.bones}
     donor_meshes = {}
@@ -2077,8 +2081,9 @@ def read_meshes(m, source, fields, boxes=None, blank=None):
         odd = stray_groups(obj, bone_index)
         if odd:
             stray.append((obj.name, odd))
-        if (_must_rebuild(obj, mo, ok, donor_faces.get((bi, mi)),
-                          (boxes or {}).get((bi, mi)), donor_meshes.get((bi, mi)))
+        if (rebuild_all
+                or _must_rebuild(obj, mo, ok, donor_faces.get((bi, mi)),
+                                 (boxes or {}).get((bi, mi)), donor_meshes.get((bi, mi)))
                 or ("weights" in fields and off_bone0(obj, mo, bone_index))):
             # The split writes 44-byte records, so a quantised model gains the weights and
             # normals its own record has no field for; nothing is unsupported there.
@@ -5131,6 +5136,88 @@ def vtx_path(path, flavour="dx80"):
     return "%s.%s.vtx" % (stem, flavour)
 
 
+def _header_u32(path, at):
+    with open(path, "rb") as f:
+        head = f.read(at + 4)
+    return struct.unpack_from("<I", head, at)[0] if len(head) >= at + 4 else None
+
+
+def mismatched_vtx_files(source):
+    """[(flavour, path, .vtx checksum, .mdl checksum)] for each `VTX_FLAVOURS` file beside
+    `source` whose checksum at +0x10 is not the .mdl's at +8. StudioRender draws no geometry
+    from such a pair (`0x2c014660`, recon 32), and the import reads no faces from it."""
+    if not source or not os.path.exists(source):
+        return []
+    want = _header_u32(source, 8)
+    out = []
+    for flavour in VTX_FLAVOURS:
+        p = vtx_path(source, flavour)
+        if os.path.exists(p):
+            got = _header_u32(p, 0x10)
+            if got != want:
+                out.append((flavour, p, got, want))
+    return out
+
+
+def mismatched_vtx_text(rows, source):
+    files = "; ".join("%s's checksum is %s and the .mdl's %#x"
+                      % (os.path.basename(p), "unreadable" if got is None else "%#x" % got,
+                         want) for _f, p, got, want in rows)
+    return ("%s: %s. The game draws no geometry from such a pair and the import read no faces "
+            "from it, so nothing was written. Put the model's own .vtx beside it, or export "
+            "from the dialog and choose to write a new .vtx from the scene's meshes"
+            % (os.path.basename(source), files))
+
+
+def unmeshed_models(m, source, arm_obj):
+    """Names of the models with a vertex that no scene object supplies, where a missing
+    object does not mean the user deleted it (`blanks_here`)."""
+    if blanks_here(arm_obj, source):
+        return []
+    found = mesh_objects(m, source)
+    return [mo.name or "model %d of bodypart %d" % (mi, bi)
+            for bi, mi, _bp, mo in mesh_mod.models_of(m)
+            if mo.numvertices and (bi, mi) not in found]
+
+
+def unmeshed_text(names, source):
+    return ("%s: the .vtx beside it is another model's, and the scene holds no mesh of %s. "
+            "Those triangles exist only in a .vtx, so a new one would draw nothing for %s, "
+            "and nothing was written. Put the model's own .vtx beside it and import it again"
+            % (os.path.basename(source), ", ".join(repr(n) for n in names),
+               "it" if len(names) == 1 else "them"))
+
+
+def scratch_vtx(dest, data, revised, flavours, drop, replaced):
+    """Every flavour written from nothing off the model as written, in place of a `.vtx`
+    that was another model's. `revised` is keyed by the donor's mesh numbering, which
+    `drop` maps to the written one as `vtx_rebuild.revise` does."""
+    written = mdl_mod.Mdl("<written>", data=data)
+    faces = []
+    for i, bp in enumerate(written.bodyparts):
+        faces.append([])
+        for j, mo in enumerate(bp.models):
+            gone = sorted((drop or {}).get((i, j)) or ())
+            kept = [k for k in range(len(mo.meshes) + len(gone)) if k not in gone]
+            faces[i].append([list(revised.get((i, j, k), ())) for k in kept])
+            unfed = [k for k, e in zip(kept, mo.meshes) if e.numvertices
+                     and (i, j, k) not in revised]
+            if unfed:
+                raise ValueError("model %d of bodypart %d: mesh%s %s carry vertices and no "
+                                 "triangles from the scene" % (j, i, "es" if len(unfed) > 1
+                                                               else "", unfed))
+    out = []
+    for flavour in flavours:
+        blob, st = vtxr_mod.scratch(written, faces, written.checksum, flavour)
+        path = vtx_path(dest, flavour)
+        with open(path, "wb") as f:
+            f.write(blob)
+        st.update(path=path, bytes=len(blob), flavour=flavour,
+                  replaced=replaced.get(flavour))
+        out.append(st)
+    return out
+
+
 def stale_flavours(dest, written=("dx80",)):
     """Other .vtx flavours beside the file just written, which now disagree with it.
 
@@ -6037,7 +6124,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    root_motion="keep", mesh_fields=(), verify=True, add=(), drop="",
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
                    write_cloth=True, vtx_flavours=("dx80",), placed=None,
-                   before_write=None, content=None):
+                   before_write=None, content=None, mismatched_vtx="stop"):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -6078,8 +6165,20 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
 
     `content` is a `blender_import.Content` over the donor's roots, where `donor_phy` looks
     for a `.phy` that is not beside it.
+
+    `mismatched_vtx` says what a `.vtx` beside the source with another checksum than the
+    .mdl's gets: "stop" refuses before anything is written, and "rewrite" rebuilds every
+    model from the scene and writes every flavour that sat beside the source from nothing.
+    "rewrite" refuses too when a model with a vertex has no scene mesh.
     """
     m = mdl_mod.Mdl(source)
+    mismatched = mismatched_vtx_files(source)
+    if mismatched and mismatched_vtx != "rewrite":
+        raise SceneRefused(mismatched_vtx_text(mismatched, source))
+    if mismatched:
+        lacking = unmeshed_models(m, source, arm_obj)
+        if lacking:
+            raise SceneRefused(unmeshed_text(lacking, source))
     if verify:
         bad = verify_writer(bytes(m.d))
         if bad:
@@ -6419,7 +6518,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     cells, rebuild, mesh["missing"], mesh["unsupported"], mesh["normals"], \
         mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
         mesh["unskinned"], mesh["stray_groups"] = read_meshes(
-            m, source, mesh_fields, boxes, blank)
+            m, source, mesh_fields, boxes, blank, rebuild_all=bool(mismatched))
     if (mesh_fields and not cells and not rebuild and not mesh["missing"] and not blank
             and any(drawn_model(mo, donor_faces, bi, mi)
                     for bi, mi, _bp, mo in mesh_mod.models_of(m))):
@@ -6598,9 +6697,15 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # to the .mdl's numbering, and a group without flag 0x02 carries the bone id per vertex.
     # `vtx_rebuild.revise` rebinds all of them off the model as written whether or not a cell
     # was named, so an empty face map is the whole of what either needs.
-    touched = (revise_vtx(source, dest, data, revised, vtx_flavours, drops)
-               if (revised or removed or added_bones or cloth_removed or drops
-                   or unflexed_records(source, data, vtx_flavours, drops)) else [])
+    if mismatched:
+        flavours = [f for f in VTX_FLAVOURS
+                    if f == "dx80" or f in vtx_flavours or os.path.exists(vtx_path(source, f))]
+        touched = scratch_vtx(dest, data, revised, flavours, drops,
+                              {f: (os.path.basename(p), got) for f, p, got, _w in mismatched})
+    else:
+        touched = (revise_vtx(source, dest, data, revised, vtx_flavours, drops)
+                   if (revised or removed or added_bones or cloth_removed or drops
+                       or unflexed_records(source, data, vtx_flavours, drops)) else [])
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
     # wrote.
