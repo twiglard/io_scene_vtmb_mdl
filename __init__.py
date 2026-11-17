@@ -892,7 +892,7 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
     bl_options = {"INTERNAL"}
 
     case: bpy.props.EnumProperty(
-        items=(("DX80", "dx80", ""), ("DX7", "dx7_2bone", "")),
+        items=(("DX80", "dx80", ""), ("DX7", "dx7_2bone", ""), ("MISSING", "missing", "")),
         options={"HIDDEN", "SKIP_SAVE"})
     choice: bpy.props.EnumProperty(
         name="Choice", options={"SKIP_SAVE"},
@@ -905,13 +905,16 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
                ("REMAKE", "Remake the .dx7_2bone.vtx (recommended)",
                 "Written from nothing off the triangles of the .dx80.vtx"),
                ("KEEP", "Keep it as it is",
-                "Under -dxlevel 70 the game draws no geometry for this model")))
+                "Under -dxlevel 70 the game draws no geometry for this model"),
+               ("NO_VTX", "Export without a .vtx",
+                "The game draws no geometry for this model")))
     lines: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
     can_rewrite: bpy.props.BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
 
     def invoke(self, context, event):
         self.choice = ("REMAKE" if self.case == "DX7" else
-                       "REWRITE" if self.can_rewrite else "ANIMATIONS_ONLY")
+                       "REWRITE" if self.can_rewrite else
+                       "NO_VTX" if self.case == "MISSING" else "ANIMATIONS_ONLY")
         if blender_dialogs.skip_dialogs:
             return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(
@@ -923,6 +926,8 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
             col.label(text=line)
         col.separator()
         offered = (("REMAKE", "KEEP") if self.case == "DX7" else
+                   ("REWRITE", "NO_VTX") if self.case == "MISSING" and self.can_rewrite else
+                   ("NO_VTX",) if self.case == "MISSING" else
                    ("REWRITE", "ANIMATIONS_ONLY") if self.can_rewrite else
                    ("ANIMATIONS_ONLY",))
         for value in offered:
@@ -933,6 +938,9 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
             bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_dx7=self.choice)
         elif self.choice == "REWRITE" and not self.can_rewrite:
             return {"CANCELLED"}
+        elif self.case == "MISSING":
+            bpy.ops.export_scene.vtmb_mdl(
+                "INVOKE_DEFAULT", missing_vtx="REWRITE" if self.choice == "REWRITE" else "KEEP")
         else:
             bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_vtx=self.choice)
         return {"FINISHED"}
@@ -1015,6 +1023,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         description="What the export does when the .dx80.vtx beside the source has another "
                     "checksum than the .mdl's. The game draws no geometry from such a pair. "
                     "Set by the message box the dialog opens on one")
+    missing_vtx: bpy.props.EnumProperty(
+        name="No .vtx", default="ASK", options={"HIDDEN", "SKIP_SAVE"},
+        items=(("ASK", "Ask", "The dialog asks. A script that runs the export straight gets Keep"),
+               ("KEEP", "Keep", "Write the .mdl with no .vtx"),
+               ("REWRITE", "Write a new .vtx",
+                "Rebuild every model from the scene and write a .vtx beside the export")),
+        description="What the export does when no .dx80.vtx of the source is beside it, on a "
+                    "content root or in a pack. Set by the message box the dialog opens on one")
     mismatched_dx7: bpy.props.EnumProperty(
         name="Another model's .dx7_2bone.vtx", default="STOP",
         options={"HIDDEN", "SKIP_SAVE"},
@@ -1185,6 +1201,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         self.cdtexture = ";".join(
             blender_scratch.scene_cdtextures(_export_armature(context)))
         base, why = _base_from(self, context)
+        if base:
+            blender_export.find_donor_vtx(
+                base, blender_import.Content(paths.roots(base, *_prefs(context))))
         rows = blender_export.mismatched_vtx_files(base) if base else []
         dx80 = [r for r in rows if r[0] == "dx80"]
         dx7 = [] if dx80 else [r for r in rows if r[0] == "dx7_2bone"]
@@ -1204,6 +1223,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 lines.append("The scene has no mesh of this model, so no new .vtx can be "
                              "written.")
             bpy.ops.vtmb.mismatched_vtx("INVOKE_DEFAULT", case="DX80",
+                                        can_rewrite=bool(meshed), lines="\n".join(lines))
+            return {"CANCELLED"}
+        if (base and not dx80 and self.missing_vtx == "ASK"
+                and not os.path.exists(blender_export.donor_vtx(base))):
+            m = mdl.Mdl(base)
+            meshed = blender_export.meshed_models(m, base)
+            lines = ["No .dx80.vtx of %s was found beside it, on a content root or in a pack."
+                     % os.path.basename(base),
+                     "The game draws no geometry for a model without one."]
+            if not meshed:
+                lines.append("The scene has no mesh of this model, so no new .vtx can be "
+                             "written.")
+            bpy.ops.vtmb.mismatched_vtx("INVOKE_DEFAULT", case="MISSING",
                                         can_rewrite=bool(meshed), lines="\n".join(lines))
             return {"CANCELLED"}
         if dx7 and self.mismatched_dx7 == "STOP":
@@ -1520,7 +1552,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     frame_end=context.scene.frame_end if self.use_range and one else None,
                     content=blender_import.Content(paths.roots(src, *_prefs(context))),
                     mismatched_vtx=self.mismatched_vtx.lower(),
-                    mismatched_dx7=self.mismatched_dx7.lower())
+                    mismatched_dx7=self.mismatched_dx7.lower(),
+                    missing_vtx="rewrite" if self.missing_vtx == "REWRITE" else "keep")
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}

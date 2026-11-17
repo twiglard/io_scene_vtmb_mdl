@@ -16,10 +16,13 @@ import collections
 import contextlib
 import copy
 import hashlib
+import atexit
 import math
 import os
 import re
+import shutil
 import struct
+import tempfile
 import types
 import zlib
 
@@ -1384,7 +1387,7 @@ def _donor_faces(source, m, meshes=None):
     `meshes`, if given, is filled with {(bodypart, model): {triangle: {file mesh index}}},
     which is what says a face has moved to another material slot.
     """
-    path = vtx_path(source)
+    path = donor_vtx(source)
     if not source or not os.path.exists(path):
         return {}
     reader = vtx_mod.Vtx(path)
@@ -5136,6 +5139,48 @@ def vtx_path(path, flavour="dx80"):
     return "%s.%s.vtx" % (stem, flavour)
 
 
+_found_vtx = {}
+_found_dir = []
+
+
+def _source_key(source):
+    return os.path.normcase(os.path.abspath(source)) if source else ""
+
+
+def donor_vtx(source, flavour="dx80"):
+    """The donor's .vtx as the import found it: beside the source, else where
+    `find_donor_vtx` found it. The beside path when there is none."""
+    beside = vtx_path(source, flavour)
+    if os.path.exists(beside):
+        return beside
+    return _found_vtx.get((_source_key(source), flavour), beside)
+
+
+def find_donor_vtx(source, content):
+    """Looks up each flavour with no .vtx beside `source` the way the import does, on every
+    content root and in its packs. A packed one is copied to a temporary file."""
+    key = _source_key(source)
+    for flavour in VTX_FLAVOURS:
+        _found_vtx.pop((key, flavour), None)
+    if not source or content is None:
+        return
+    for flavour in VTX_FLAVOURS:
+        if os.path.exists(vtx_path(source, flavour)):
+            continue
+        path, blob = content.companion(types.SimpleNamespace(path=source),
+                                       (".%s.vtx" % flavour,))
+        if path is None:
+            continue
+        if blob is not None:
+            if not _found_dir:
+                _found_dir.append(tempfile.mkdtemp(prefix="vtmb-packed-vtx-"))
+                atexit.register(shutil.rmtree, _found_dir[0], True)
+            path = os.path.join(_found_dir[0], "%08x.%s.vtx" % (abs(hash(key)), flavour))
+            with open(path, "wb") as f:
+                f.write(blob)
+        _found_vtx[(key, flavour)] = path
+
+
 def _header_u32(path, at):
     with open(path, "rb") as f:
         head = f.read(at + 4)
@@ -5143,15 +5188,15 @@ def _header_u32(path, at):
 
 
 def mismatched_vtx_files(source):
-    """[(flavour, path, .vtx checksum, .mdl checksum)] for each `VTX_FLAVOURS` file beside
-    `source` whose checksum at +0x10 is not the .mdl's at +8. StudioRender draws no geometry
-    from such a pair (`0x2c014660`, recon 32), and the import reads no faces from it."""
+    """[(flavour, path, .vtx checksum, .mdl checksum)] for each `VTX_FLAVOURS` file of
+    `source` (`donor_vtx`) whose checksum at +0x10 is not the .mdl's at +8. StudioRender
+    draws no geometry from such a pair (`0x2c014660`, recon 32), and the import reads no faces from it."""
     if not source or not os.path.exists(source):
         return []
     want = _header_u32(source, 8)
     out = []
     for flavour in VTX_FLAVOURS:
-        p = vtx_path(source, flavour)
+        p = donor_vtx(source, flavour)
         if os.path.exists(p):
             got = _header_u32(p, 0x10)
             if got != want:
@@ -5295,8 +5340,10 @@ def cut_vtx_lods(source, dest, written=(), carry=True):
     """
     out = []
     for flavour in VTX_FLAVOURS:
-        src_p, dst_p = vtx_path(source, flavour), vtx_path(dest, flavour)
+        src_p, dst_p = donor_vtx(source, flavour), vtx_path(dest, flavour)
         at = dst_p if flavour in written else src_p if carry else dst_p
+        found = at == src_p and os.path.normcase(os.path.abspath(
+            vtx_path(source, flavour))) == os.path.normcase(os.path.abspath(dst_p))
         if not os.path.exists(at):
             continue
         with open(at, "rb") as f:
@@ -5307,7 +5354,7 @@ def cut_vtx_lods(source, dest, written=(), carry=True):
             out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": None,
                         "dropped": [], "why": str(exc)})
             continue
-        if cut != data or at != dst_p:
+        if cut != data or (at != dst_p and not found):
             with open(dst_p, "wb") as f:
                 f.write(cut)
         out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": was,
@@ -6138,7 +6185,7 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
     written = mdl_mod.Mdl("<written>", data=data)
     out = []
     for flavour in flavours:
-        src = vtx_path(source, flavour)
+        src = donor_vtx(source, flavour)
         if not os.path.exists(src):
             continue
         blob, st = vtxr_mod.revise(written, src, revised, lod0_only=True, drop=drop)
@@ -6157,7 +6204,7 @@ def unflexed_records(source, data, flavours=("dx80",), drop=None):
     draws in a strip group the engine does not morph, in any flavour asked for."""
     written = None
     for flavour in flavours:
-        src = vtx_path(source, flavour)
+        src = donor_vtx(source, flavour)
         if not os.path.exists(src):
             continue
         if written is None:
@@ -6173,7 +6220,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
                    write_cloth=True, vtx_flavours=("dx80",), placed=None,
                    before_write=None, content=None, mismatched_vtx="stop",
-                   mismatched_dx7="stop"):
+                   mismatched_dx7="stop", missing_vtx="keep"):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -6223,6 +6270,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     else of the scene, and copies every `.vtx` and the `.phy` as they are, so the game still
     draws no geometry for the model.
 
+    `missing_vtx` says what it does when no `.dx80.vtx` of the source is found beside it, on
+    a content root or in a pack: "keep" writes the .mdl with no .vtx and reports it, "rewrite"
+    rebuilds every model as "rewrite" above does.
+
     `mismatched_dx7` does the same for a `.dx7_2bone.vtx` with another checksum beside a
     `.dx80.vtx` that is the model's own: "stop", "remake" from the `.dx80.vtx` written, or
     "keep" it as it is.
@@ -6231,7 +6282,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise ValueError("mismatched_vtx=%r" % (mismatched_vtx,))
     if mismatched_dx7 not in ("stop", "remake", "keep"):
         raise ValueError("mismatched_dx7=%r" % (mismatched_dx7,))
+    if missing_vtx not in ("keep", "rewrite"):
+        raise ValueError("missing_vtx=%r" % (missing_vtx,))
     m = mdl_mod.Mdl(source)
+    find_donor_vtx(source, content)
     mismatched = mismatched_vtx_files(source)
     foreign = mismatched if any(f == "dx80" for f, *_r in mismatched) else []
     dx7 = [] if foreign else [r for r in mismatched if r[0] == "dx7_2bone"]
@@ -6239,14 +6293,16 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise SceneRefused(mismatched_vtx_text(foreign, source))
     if dx7 and mismatched_dx7 == "stop":
         raise SceneRefused(mismatched_dx7_text(dx7, source))
-    rewrite = bool(foreign) and mismatched_vtx == "rewrite"
+    missing = not os.path.exists(donor_vtx(source))
+    rewrite = ((bool(foreign) and mismatched_vtx == "rewrite")
+               or (missing and missing_vtx == "rewrite"))
     anim_only = bool(foreign) and mismatched_vtx == "animations_only"
     if anim_only:
         mesh_fields, write_flexes, write_cloth = (), False, False
         model_name, hull, cdtexture = "", None, None
     if rewrite and not meshed_models(m, source):
         raise SceneRefused(unmeshed_text(source))
-    if dx7 and mismatched_dx7 == "remake" and not os.path.exists(vtx_path(source)):
+    if dx7 and mismatched_dx7 == "remake" and missing:
         raise SceneRefused("%s: no .dx80.vtx beside it to remake the .dx7_2bone.vtx from, "
                            "and nothing was written" % os.path.basename(source))
     if verify:
@@ -6789,7 +6845,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     own = [f for f in vtx_flavours if f not in replaced]
     if rewrite:
         flavours = [f for f in VTX_FLAVOURS
-                    if f == "dx80" or f in vtx_flavours or os.path.exists(vtx_path(source, f))]
+                    if f == "dx80" or f in vtx_flavours or os.path.exists(donor_vtx(source, f))]
         touched = scratch_vtx(dest, data, revised, flavours, drops, replaced)
     elif foreign:
         touched = []
@@ -6799,7 +6855,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                        or unflexed_records(source, data, own, drops)) else [])
     remade = []
     if dx7 and mismatched_dx7 == "remake":
-        at = next((x["path"] for x in touched if x["flavour"] == "dx80"), vtx_path(source))
+        at = next((x["path"] for x in touched if x["flavour"] == "dx80"), donor_vtx(source))
         remade = remake_vtx(dest, data, at, ["dx7_2bone"], replaced)
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
@@ -6807,7 +6863,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     lods = cut_vtx_lods(source, dest, [x["flavour"] for x in touched + remade],
                         carry=not touched)
     eye_flags = vtx_eye_flags(d, dest)
-    no_vtx =not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
+    no_vtx = missing and not os.path.exists(vtx_path(dest))
     with open(dest, "wb") as f:
         f.write(data)
     # After the .mdl, so a write that fails there leaves the donor's `.phy` as it was.
