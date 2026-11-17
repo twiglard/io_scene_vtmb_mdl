@@ -16,10 +16,13 @@ import collections
 import contextlib
 import copy
 import hashlib
+import atexit
 import math
 import os
 import re
+import shutil
 import struct
+import tempfile
 import types
 import zlib
 
@@ -91,6 +94,31 @@ class SceneRefused(build_mod.Refused, ValueError):
     with no traceback, and ValueError, so a caller that catches one still does."""
 
 
+class Question(SceneRefused):
+    """A refusal the user can answer: `choices` is [(value, label, description)], and the
+    operator asks, then runs the export again with `answers[key]` set to the value."""
+
+    def __init__(self, site, key, text, choices):
+        SceneRefused.__init__(self, text)
+        self.site, self.key, self.choices = site, key, list(choices)
+
+
+answers = {}
+
+
+def ask(site, instance, text, choices):
+    """The value `answers` holds for this instance of the site, else for the site, else
+    raises `Question` with `text`."""
+    key = site if instance is None else "%s/%s" % (site, instance)
+    got = answers.get(key, answers.get(site))
+    if got is None:
+        raise Question(site, key, text, choices)
+    if got not in [c[0] for c in choices]:
+        raise SceneRefused("%s: the answer %r is none of %s"
+                           % (text, got, ", ".join(c[0] for c in choices)))
+    return got
+
+
 def root_motion_mode(action, chosen, donor=True, default="keep"):
     """Which of the four writes this action's travel takes.
 
@@ -115,8 +143,13 @@ def root_motion_mode(action, chosen, donor=True, default="keep"):
         mode = default if nmv is None else ("keep" if nmv else "none")
     mode = str(mode)
     if mode not in ROOT_MOTION_MODES:
-        raise SceneRefused("action %r carries %s %r, which is none of %s"
-                           % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)))
+        ask("root_motion_mode", action.name,
+            "action %r carries %s %r, which is none of %s"
+            % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)),
+            [("unstamped", "Write it as an action with no stamp",
+              "The mode its vtmb_movements count gives, else the export's default")])
+        nmv = action.get("vtmb_movements")
+        mode = default if nmv is None else ("keep" if nmv else "none")
     return "extract" if (mode == "keep" and not donor) else mode
 
 
@@ -289,25 +322,34 @@ def unwritable_scale(pbs, world, frame):
     return None
 
 
-def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False):
+def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False,
+               keep_missing=False):
     """Local (pos, quat) per bone per frame, inverting everything the importer applied.
 
     `pose.bones[].matrix` is object space, and the importer's rest_local_inv and
     matrix_local factors cancel down the chain, so it is exactly the world matrix the
     importer built -- no reconstruction from matrix_basis needed.
+
+    `keep_missing` with `anim`: a bone of `m` the armature lacks keeps `anim`'s own pose.
     """
     bmap = bone_map(m, arm_obj)
     missing = [b.name for b in m.bones if b.name not in bmap]
-    if missing:
+    if missing and not (keep_missing and anim is not None):
         raise SceneRefused("armature has no bone %s (and %d more)"
                            % (missing[0], len(missing) - 1))
-    pbs = [arm_obj.pose.bones[bmap[b.name]] for b in m.bones]
+    pbs = [arm_obj.pose.bones[bmap[b.name]] if b.name in bmap else None for b in m.bones]
     scene = context.scene
     out = []
     for f in frames:
         scene.frame_set(f)
-        world = [_rows(pb.matrix, scale) for pb in pbs]
-        bad = unwritable_scale(pbs, world, f)
+        own = None
+        if missing:
+            own = m.local_pose(anim, min(max(f - frames[0], 0), anim.numframes - 1))
+            own_world = m.world_matrices(own)
+        world = [_rows(pb.matrix, scale) if pb is not None else own_world[i]
+                 for i, pb in enumerate(pbs)]
+        bad = unwritable_scale([pb for pb in pbs if pb is not None],
+                               [w for pb, w in zip(pbs, world) if pb is not None], f)
         if bad:
             # `Refused` and not ValueError: both operators turn it into one clean line and
             # no traceback, which is what a limit of the format deserves.
@@ -315,7 +357,11 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_key
         if root_motion_in_keys and anim is not None and anim.movements:
             off = mdl_mod.mat_inverse(mdl_mod.root_motion_matrix(anim, f))
             world = [mdl_mod.mat_mul(off, w) for w in world]
-        out.append(write_mod.local_from_world(m, world))
+        local = write_mod.local_from_world(m, world)
+        for i, pb in enumerate(pbs if own is not None else ()):
+            if pb is None:
+                local[i] = own[i]
+        out.append(local)
     return write_mod.unwind_signs(out)
 
 
@@ -385,11 +431,14 @@ def reparented(m, k, db, file_of):
         return None
     if now >= k:
         was = m.bones[b.parent].name if b.parent >= 0 else "nothing"
-        raise SceneRefused(
+        ask("reparented", b.name,
             "bone %r was reparented from %s to %r, which sits at index %d against its own "
             "%d -- the engine builds each bone's world matrix off its parent's while "
             "walking the array in order, so a parent must come first, and nothing here "
-            "renumbers the bone array" % (b.name, was, m.bones[now].name, now, k))
+            "renumbers the bone array" % (b.name, was, m.bones[now].name, now, k),
+            [("keep", "Keep the file's parent",
+              "The bone keeps %s as its parent, and its rest is taken against it" % was)])
+        return None
     return now
 
 
@@ -1049,12 +1098,14 @@ def renamed_bodyparts(m, source):
     out = {}
     for bi, names in sorted(got.items()):
         if len(names) > 1:
-            raise build_mod.Refused(
+            ask("renamed_bodyparts", m.bodyparts[bi].name,
                 "bodypart %r is renamed %s; a bodypart has one name, and the Bodypart "
                 "field sets it on every object of the bodypart at once"
                 % (m.bodyparts[bi].name,
                    " and ".join("%r by %s" % (n, ", ".join(sorted(objs)))
-                                for n, objs in sorted(names.items()))))
+                                for n, objs in sorted(names.items()))),
+                [("keep", "Keep the file's name", "Neither rename is written")])
+            continue
         out[bi] = next(iter(names))
     return out
 
@@ -1384,7 +1435,7 @@ def _donor_faces(source, m, meshes=None):
     `meshes`, if given, is filled with {(bodypart, model): {triangle: {file mesh index}}},
     which is what says a face has moved to another material slot.
     """
-    path = vtx_path(source)
+    path = donor_vtx(source)
     if not source or not os.path.exists(path):
         return {}
     reader = vtx_mod.Vtx(path)
@@ -2180,6 +2231,93 @@ def armature_actions(arm_obj):
 def skipped_actions(arm_obj, source):
     """The armature's actions an export of `source` leaves out, by `from_another_file`."""
     return [a for a in armature_actions(arm_obj) if from_another_file(a, source)]
+
+
+def _include_dest(inc, source, content):
+    """Where a write into the include `inc` goes: the file itself, or for a packed one the
+    loose path at its place under the content root `source` sits on."""
+    if "!" not in inc:
+        return inc
+    own = paths_mod.relative(source, content.roots) if content is not None else None
+    for r in content.roots if own else ():
+        if same_file(os.path.join(r, *own.split("/")), source):
+            return os.path.join(r, *inc.split("!", 1)[1].split("/"))
+    return None
+
+
+def write_include_actions(context, arm_obj, source, scale, content=None, root_motion="keep",
+                          root_motion_in_keys=True):
+    """Writes each action an export of `source` skips into the include it was imported from,
+    animations only: poses by bone name, the include's animation names kept, no armature
+    stash read. [(include, [(animation, action)], why not written or None)]."""
+    groups = {}
+    for act in skipped_actions(arm_obj, source):
+        groups.setdefault(act["vtmb_source"], []).append(act)
+    ad = arm_obj.animation_data
+    restore = ad.action if ad else None
+    out = []
+    try:
+        for inc, acts in sorted(groups.items()):
+            dest = _include_dest(inc, source, content)
+            try:
+                blob = content.find(inc.split("!", 1)[1])[1] if "!" in inc else None
+                m = mdl_mod.Mdl(inc, blob)
+            except (OSError, ValueError, TypeError) as exc:
+                out.append((inc, [], "unreadable: %s" % exc))
+                continue
+            if dest is None:
+                out.append((inc, [], "it is in a pack and no content root holds %s"
+                            % os.path.basename(source)))
+                continue
+            bad = verify_writer(bytes(m.d))
+            if bad:
+                out.append((inc, [], "the writer does not reproduce it: %s" % "; ".join(bad)))
+                continue
+            names = [a.name for a in m.anims]
+            slots = {}
+            for act in acts:
+                slots.setdefault(stamped_index(names, act), []).append(act)
+            edits, wrote, why = {}, [], []
+            for index, claim in sorted(slots.items(), key=lambda kv: (kv[0] is None, kv[0] or 0)):
+                if index is None or len(claim) > 1:
+                    why += ["%s claims %s" % (a.name, "no animation" if index is None
+                                              else "%s with %d others" % (names[index],
+                                                                          len(claim) - 1))
+                            for a in claim]
+                    continue
+                act = claim[0]
+                ad.action = act
+                lo, hi = act.frame_range
+                frames = list(range(int(round(lo)), int(round(hi)) + 1))
+                mode = root_motion_mode(act, root_motion)
+                try:
+                    poses = read_poses(context, arm_obj, m, frames, scale, m.anims[index],
+                                       root_motion_in_keys=(mode == "keep" and root_motion_in_keys
+                                                            and bool(act.get("vtmb_root_motion"))),
+                                       keep_missing=True)
+                except SceneRefused as exc:
+                    why.append("%s: %s" % (act.name, exc))
+                    continue
+                movements = None
+                if mode == "extract":
+                    movements, poses = write_mod.extract_root_motion(m, poses)
+                elif mode in ("in_place", "none"):
+                    if mode == "in_place":
+                        _mv, poses = write_mod.extract_root_motion(m, poses)
+                    movements = []
+                edits[index] = {"poses": poses, "movements": movements,
+                                "fps": act.get("vtmb_fps"), "flags": act.get("vtmb_flags")}
+                wrote.append((names[index], act.name))
+            if edits:
+                d = build_mod.apply_anims(build_mod.from_bytes(bytes(m.d)), edits, inc)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(build_mod.emit(d, checksum=d.checksum))
+            out.append((dest, wrote, "; ".join(why) or None))
+    finally:
+        if ad is not None and ad.action is not restore:
+            ad.action = restore
+    return out
 
 
 def match_indices(anim_names, source, arm_obj=None):
@@ -5136,6 +5274,48 @@ def vtx_path(path, flavour="dx80"):
     return "%s.%s.vtx" % (stem, flavour)
 
 
+_found_vtx = {}
+_found_dir = []
+
+
+def _source_key(source):
+    return os.path.normcase(os.path.abspath(source)) if source else ""
+
+
+def donor_vtx(source, flavour="dx80"):
+    """The donor's .vtx as the import found it: beside the source, else where
+    `find_donor_vtx` found it. The beside path when there is none."""
+    beside = vtx_path(source, flavour)
+    if os.path.exists(beside):
+        return beside
+    return _found_vtx.get((_source_key(source), flavour), beside)
+
+
+def find_donor_vtx(source, content):
+    """Looks up each flavour with no .vtx beside `source` the way the import does, on every
+    content root and in its packs. A packed one is copied to a temporary file."""
+    key = _source_key(source)
+    for flavour in VTX_FLAVOURS:
+        _found_vtx.pop((key, flavour), None)
+    if not source or content is None:
+        return
+    for flavour in VTX_FLAVOURS:
+        if os.path.exists(vtx_path(source, flavour)):
+            continue
+        path, blob = content.companion(types.SimpleNamespace(path=source),
+                                       (".%s.vtx" % flavour,))
+        if path is None:
+            continue
+        if blob is not None:
+            if not _found_dir:
+                _found_dir.append(tempfile.mkdtemp(prefix="vtmb-packed-vtx-"))
+                atexit.register(shutil.rmtree, _found_dir[0], True)
+            path = os.path.join(_found_dir[0], "%08x.%s.vtx" % (abs(hash(key)), flavour))
+            with open(path, "wb") as f:
+                f.write(blob)
+        _found_vtx[(key, flavour)] = path
+
+
 def _header_u32(path, at):
     with open(path, "rb") as f:
         head = f.read(at + 4)
@@ -5143,15 +5323,16 @@ def _header_u32(path, at):
 
 
 def mismatched_vtx_files(source):
-    """[(flavour, path, .vtx checksum, .mdl checksum)] for each `VTX_FLAVOURS` file beside
-    `source` whose checksum at +0x10 is not the .mdl's at +8. StudioRender draws no geometry
-    from such a pair (`0x2c014660`, recon 32), and the import reads no faces from it."""
+    """[(flavour, path, .vtx checksum, .mdl checksum)] for each `VTX_FLAVOURS` file of
+    `source` (`donor_vtx`) whose checksum at +0x10 is not the .mdl's at +8. StudioRender
+    draws no geometry from such a pair (`0x2c014660`, recon 32), and the import reads no
+    faces from it."""
     if not source or not os.path.exists(source):
         return []
     want = _header_u32(source, 8)
     out = []
     for flavour in VTX_FLAVOURS:
-        p = vtx_path(source, flavour)
+        p = donor_vtx(source, flavour)
         if os.path.exists(p):
             got = _header_u32(p, 0x10)
             if got != want:
@@ -5295,8 +5476,10 @@ def cut_vtx_lods(source, dest, written=(), carry=True):
     """
     out = []
     for flavour in VTX_FLAVOURS:
-        src_p, dst_p = vtx_path(source, flavour), vtx_path(dest, flavour)
+        src_p, dst_p = donor_vtx(source, flavour), vtx_path(dest, flavour)
         at = dst_p if flavour in written else src_p if carry else dst_p
+        found = at == src_p and os.path.normcase(os.path.abspath(
+            vtx_path(source, flavour))) == os.path.normcase(os.path.abspath(dst_p))
         if not os.path.exists(at):
             continue
         with open(at, "rb") as f:
@@ -5307,7 +5490,7 @@ def cut_vtx_lods(source, dest, written=(), carry=True):
             out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": None,
                         "dropped": [], "why": str(exc)})
             continue
-        if cut != data or at != dst_p:
+        if cut != data or (at != dst_p and not found):
             with open(dst_p, "wb") as f:
                 f.write(cut)
         out.append({"flavour": flavour, "file": os.path.basename(dst_p), "was": was,
@@ -6138,7 +6321,7 @@ def revise_vtx(source, dest, data, revised, flavours=("dx80",), drop=None):
     written = mdl_mod.Mdl("<written>", data=data)
     out = []
     for flavour in flavours:
-        src = vtx_path(source, flavour)
+        src = donor_vtx(source, flavour)
         if not os.path.exists(src):
             continue
         blob, st = vtxr_mod.revise(written, src, revised, lod0_only=True, drop=drop)
@@ -6157,7 +6340,7 @@ def unflexed_records(source, data, flavours=("dx80",), drop=None):
     draws in a strip group the engine does not morph, in any flavour asked for."""
     written = None
     for flavour in flavours:
-        src = vtx_path(source, flavour)
+        src = donor_vtx(source, flavour)
         if not os.path.exists(src):
             continue
         if written is None:
@@ -6173,7 +6356,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                    model_name="", hull=None, cdtexture=None, write_flexes=False,
                    write_cloth=True, vtx_flavours=("dx80",), placed=None,
                    before_write=None, content=None, mismatched_vtx="stop",
-                   mismatched_dx7="stop"):
+                   mismatched_dx7="stop", missing_vtx="keep"):
     """Author `source` again with `actions`, an {animation index: action} map, applied.
 
     `add` is actions appended as new animations rather than replacing one, each with a
@@ -6219,8 +6402,13 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     another checksum than the .mdl's: "stop" refuses before anything is written. "rewrite"
     rebuilds every model from the scene and writes every flavour that sat beside the source
     from nothing, a model with no scene mesh written with no mesh; it refuses when no model
-    has one. "animations_only" copies every `.vtx` as it is, so the game still draws no
-    geometry for the model.
+    has one. "animations_only" writes the armature's bones and the animations and nothing
+    else of the scene, and copies every `.vtx` and the `.phy` as they are, so the game still
+    draws no geometry for the model.
+
+    `missing_vtx` says what it does when no `.dx80.vtx` of the source is found beside it, on
+    a content root or in a pack: "keep" writes the .mdl with no .vtx and reports it, "rewrite"
+    rebuilds every model as "rewrite" above does.
 
     `mismatched_dx7` does the same for a `.dx7_2bone.vtx` with another checksum beside a
     `.dx80.vtx` that is the model's own: "stop", "remake" from the `.dx80.vtx` written, or
@@ -6230,7 +6418,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise ValueError("mismatched_vtx=%r" % (mismatched_vtx,))
     if mismatched_dx7 not in ("stop", "remake", "keep"):
         raise ValueError("mismatched_dx7=%r" % (mismatched_dx7,))
+    if missing_vtx not in ("keep", "rewrite"):
+        raise ValueError("missing_vtx=%r" % (missing_vtx,))
     m = mdl_mod.Mdl(source)
+    find_donor_vtx(source, content)
     mismatched = mismatched_vtx_files(source)
     foreign = mismatched if any(f == "dx80" for f, *_r in mismatched) else []
     dx7 = [] if foreign else [r for r in mismatched if r[0] == "dx7_2bone"]
@@ -6238,10 +6429,16 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         raise SceneRefused(mismatched_vtx_text(foreign, source))
     if dx7 and mismatched_dx7 == "stop":
         raise SceneRefused(mismatched_dx7_text(dx7, source))
-    rewrite = bool(foreign) and mismatched_vtx == "rewrite"
+    missing = not os.path.exists(donor_vtx(source))
+    rewrite = ((bool(foreign) and mismatched_vtx == "rewrite")
+               or (missing and missing_vtx == "rewrite"))
+    anim_only = bool(foreign) and mismatched_vtx == "animations_only"
+    if anim_only:
+        mesh_fields, write_flexes, write_cloth = (), False, False
+        model_name, hull, cdtexture = "", None, None
     if rewrite and not meshed_models(m, source):
         raise SceneRefused(unmeshed_text(source))
-    if dx7 and mismatched_dx7 == "remake" and not os.path.exists(vtx_path(source)):
+    if dx7 and mismatched_dx7 == "remake" and missing:
         raise SceneRefused("%s: no .dx80.vtx beside it to remake the .dx7_2bone.vtx from, "
                            "and nothing was written" % os.path.basename(source))
     if verify:
@@ -6274,7 +6471,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # Before `bone_map` raises on an unresolvable one, and before the appends make each copy
     # a bone of the file in its own right.
     dup_bones = duplicate_bones(m, arm_obj)
-    new_objs = new_model_objects(m, source, arm_obj)
+    new_objs = [] if anim_only else new_model_objects(m, source, arm_obj)
     eye_models = resolve_eyeball_models(m, arm_obj, new_objs)
     appending = set(o.name for o in new_objs)
     dup_models = [x for x in dup_models if x[0] not in appending]
@@ -6303,11 +6500,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     renamed = [(m.bones[k].name, name) for k, name in sorted(renamed.items())]
 
     # Both names are `char name[128]` inline, so writing either moves nothing.
-    remodelled = renamed_models(m, source)
+    remodelled = {} if anim_only else renamed_models(m, source)
     for (bi, mi), name in sorted(remodelled.items()):
         build_mod.set_model_name(d, bi, mi, name)
     # A bodypart's name is a string-table offset, and `mdl_build.emit` lays the table out.
-    rebodied = renamed_bodyparts(m, source)
+    rebodied = {} if anim_only else renamed_bodyparts(m, source)
     for bi, name in sorted(rebodied.items()):
         d.bodyparts[bi].name = name
     if model_name and model_name != d.name:
@@ -6325,7 +6522,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         d.refit_boxes = True
     # Compared as the f32 bytes, so an unedited stamp writes nothing. A typed hull moves no
     # vertex and leaves the sequence boxes alone; Fit hull, when ticked, wins over it.
-    typed = header_vectors(arm_obj, scale)
+    typed = {} if anim_only else header_vectors(arm_obj, scale)
     header = {}
     for off, v in sorted(typed.items()):
         if hull is not None and off != mdl_mod.HDR_EYEPOSITION:
@@ -6459,62 +6656,71 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The table before the renames, so a slot showing a record a cell added reads through
     # the row that names it, and before new_materials, whose records append a column to
     # every row this replaces.
-    if len(skin_table(arm_obj)[0]) > 1:
-        sync_skin_table(arm_obj, armature_meshes(context.scene, arm_obj), bpy.data.materials)
-    if skin_edited(arm_obj):
-        d.skin, added = resolve_skin_table(d, arm_obj)
-        scene["skin_families"] = len(d.skin)
-        scene["added_materials"] += added
-    if skin_edited(arm_obj):
-        named, scene["slots_moved"], scene["slots_gone"] = read_materials(
-            m, source, skin_family(m, arm_obj), rows=d.skin)
+    if anim_only:
+        face = {"eye_gone": (), "materials": []}
+        eye_names = []
+        scene.update({"spring_end_renamed": [], "cloth_volumes": 0, "cloth_volumes_unread": 0,
+                      "cloth_two_bone": [], "face": 0, "eyes_added": [], "mouth_added": False,
+                      "mouth_removed": False, "eye_meshes": 0, "eye_radius_keys": [],
+                      "eye_lid_targets": [], "eye_empties": [], "eye_records": [],
+                      "eyes_removed": [], "flex": (0, 0, 0)})
     else:
-        named, scene["slots_moved"], scene["slots_gone"] = read_materials(
-            m, source, skin_family(m, arm_obj))
-    named.update(skin_renames(d, arm_obj, set(named)))
-    for ref, name in sorted(named.items()):
-        if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
-            d.textures[ref].name = name
-            scene["materials"] += 1
-    # After the rename loop, so a slot renamed onto an existing texture is a rename and
-    # not an addition. `cdtexture` has already been applied to d.cdtextures above, so None
-    # here leaves the list the scene asked for alone.
-    have = {t.name for t in d.textures}
-    for name in new_materials(m, source):
-        if name in have:
-            continue
-        build_mod.add_material(d, name, None)
-        have.add(name)
-        scene["added_materials"].append(name)
-    sp = apply_springbones(d, m, arm_obj)
-    scene["springs"] = sp["changed"]
-    for key in ("ends", "switched", "unclaimed", "added", "removed", "stamps",
-                "gone", "over_mask", "end_renamed"):
-        scene["spring_" + key] = sp[key]
-    scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
-    vol = apply_cloth_volumes(d, m, arm_obj, scale)
-    scene["cloth_volumes"], scene["cloth_volumes_unread"] = vol["changed"], vol["unread"]
-    scene["cloth_two_bone"] = vol.get("two_bone") or []
-    # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
-    scene["hitboxsets"] = len(d.hitboxsets)
-    face = apply_face(d, m, arm_obj, scale, source, eye_models)
-    scene["face"] = face["changed"]
-    scene["eyes_added"] = face["eyes_added"]
-    scene["mouth_added"] = face["mouth_added"]
-    scene["mouth_removed"] = face["mouth_removed"]
-    scene["eye_meshes"] = face["eye_meshes"]
-    scene["eye_radius_keys"] = face["radius_keys"]
-    scene["eye_lid_targets"] = face["lid_targets"]
-    scene["eye_empties"] = face["eye_empties"]
-    scene["eye_records"] = face["eye_records"]
-    scene["eyes_removed"] = face["eyes_removed"]
-    # After the mesh pass above rather than beside it: an eyeball is the one thing that
-    # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
-    eye_names = list(face["materials"])
-    for name in face["materials"]:
-        if name not in scene["added_materials"]:
+        if len(skin_table(arm_obj)[0]) > 1:
+            sync_skin_table(arm_obj, armature_meshes(context.scene, arm_obj), bpy.data.materials)
+        if skin_edited(arm_obj):
+            d.skin, added = resolve_skin_table(d, arm_obj)
+            scene["skin_families"] = len(d.skin)
+            scene["added_materials"] += added
+        if skin_edited(arm_obj):
+            named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+                m, source, skin_family(m, arm_obj), rows=d.skin)
+        else:
+            named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+                m, source, skin_family(m, arm_obj))
+        named.update(skin_renames(d, arm_obj, set(named)))
+        for ref, name in sorted(named.items()):
+            if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
+                d.textures[ref].name = name
+                scene["materials"] += 1
+        # After the rename loop, so a slot renamed onto an existing texture is a rename and
+        # not an addition. `cdtexture` has already been applied to d.cdtextures above, so None
+        # here leaves the list the scene asked for alone.
+        have = {t.name for t in d.textures}
+        for name in new_materials(m, source):
+            if name in have:
+                continue
+            build_mod.add_material(d, name, None)
+            have.add(name)
             scene["added_materials"].append(name)
-    scene["flex"] = apply_flex(d, m, arm_obj)
+        sp = apply_springbones(d, m, arm_obj)
+        scene["springs"] = sp["changed"]
+        for key in ("ends", "switched", "unclaimed", "added", "removed", "stamps",
+                    "gone", "over_mask", "end_renamed"):
+            scene["spring_" + key] = sp[key]
+        scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
+        vol = apply_cloth_volumes(d, m, arm_obj, scale)
+        scene["cloth_volumes"], scene["cloth_volumes_unread"] = vol["changed"], vol["unread"]
+        scene["cloth_two_bone"] = vol.get("two_bone") or []
+        # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
+        scene["hitboxsets"] = len(d.hitboxsets)
+        face = apply_face(d, m, arm_obj, scale, source, eye_models)
+        scene["face"] = face["changed"]
+        scene["eyes_added"] = face["eyes_added"]
+        scene["mouth_added"] = face["mouth_added"]
+        scene["mouth_removed"] = face["mouth_removed"]
+        scene["eye_meshes"] = face["eye_meshes"]
+        scene["eye_radius_keys"] = face["radius_keys"]
+        scene["eye_lid_targets"] = face["lid_targets"]
+        scene["eye_empties"] = face["eye_empties"]
+        scene["eye_records"] = face["eye_records"]
+        scene["eyes_removed"] = face["eyes_removed"]
+        # After the mesh pass above rather than beside it: an eyeball is the one thing that
+        # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
+        eye_names = list(face["materials"])
+        for name in face["materials"]:
+            if name not in scene["added_materials"]:
+                scene["added_materials"].append(name)
+        scene["flex"] = apply_flex(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     anim_names = [r.name for r in d.anims]
@@ -6580,7 +6786,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # added, deleted or re-wound moves no .mdl byte and no checkbox names one -- and a
     # mesh the scene changed is rebuilt from the scene rather than from the file, which
     # is what leaves the written model independent of the donor's own geometry.
-    blanks = blanks_here(arm_obj, source)
+    blanks = () if anim_only else blanks_here(arm_obj, source)
     # Under "rewrite" a model the scene has no mesh of leaves the file as a deleted one
     # does: its triangles were in another model's .vtx, so nothing of it can be drawn.
     blank = [] if blanks or rewrite else None
@@ -6588,6 +6794,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
         mesh["unskinned"], mesh["stray_groups"] = read_meshes(
             m, source, mesh_fields, boxes, blank, rebuild_all=rewrite)
+    if anim_only:
+        cells, rebuild = {}, {}
     if (mesh_fields and not cells and not rebuild and not mesh["missing"] and not blank
             and any(drawn_model(mo, donor_faces, bi, mi)
                     for bi, mi, _bp, mo in mesh_mod.models_of(m))):
@@ -6739,11 +6947,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     for (bi, mi), ks in sorted(drops.items()):
         build_mod.drop_meshes(d, bi, mi, ks)
     # Before `before_write`, which writes `.vmt` files: a dent refuses with nothing on disk.
-    hulls = scene_hulls(arm_obj, m, source, content, scale)
-    # A donor with no `.phy`: the hull objects are the whole of it (the user, 2026-10-29).
-    built = (hulls_phy(arm_obj, d, scale, os.path.splitext(os.path.basename(dest))[0])
-             if hulls is None else None)
-    collision = scene_collision_text(arm_obj, source, content) if built is None else None
+    if anim_only:
+        hulls = built = collision = None
+    else:
+        hulls = scene_hulls(arm_obj, m, source, content, scale)
+        # A donor with no `.phy`: the hull objects are the whole of it (the user, 2026-10-29).
+        built = (hulls_phy(arm_obj, d, scale, os.path.splitext(os.path.basename(dest))[0])
+                 if hulls is None else None)
+        collision = scene_collision_text(arm_obj, source, content) if built is None else None
     drawn = drawn_names(d)
     scene["eye_record_materials"] = [n for n in dict.fromkeys(eye_names) if n not in drawn]
     if before_write is not None:
@@ -6751,7 +6962,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
                               [g["name"] for g in removed], phy_moves(d, m, donor_pose),
                               hulls, m, bone_rests(d, m) if hulls and hulls["add"] else None,
-                              collision, arm_obj.get("vtmb_phy_totalmass"))
+                              collision, None if anim_only else arm_obj.get("vtmb_phy_totalmass"))
     if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]
                                     or phy_rewrite["added"]):
         build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
@@ -6770,7 +6981,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     own = [f for f in vtx_flavours if f not in replaced]
     if rewrite:
         flavours = [f for f in VTX_FLAVOURS
-                    if f == "dx80" or f in vtx_flavours or os.path.exists(vtx_path(source, f))]
+                    if f == "dx80" or f in vtx_flavours or os.path.exists(donor_vtx(source, f))]
         touched = scratch_vtx(dest, data, revised, flavours, drops, replaced)
     elif foreign:
         touched = []
@@ -6780,7 +6991,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
                        or unflexed_records(source, data, own, drops)) else [])
     remade = []
     if dx7 and mismatched_dx7 == "remake":
-        at = next((x["path"] for x in touched if x["flavour"] == "dx80"), vtx_path(source))
+        at = next((x["path"] for x in touched if x["flavour"] == "dx80"), donor_vtx(source))
         remade = remake_vtx(dest, data, at, ["dx7_2bone"], replaced)
     vtx = next((x for x in touched if x["flavour"] == "dx80"), None)
     # After the geometry pass, which writes whole .vtx files: the cut re-lays what that pass
@@ -6788,7 +6999,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     lods = cut_vtx_lods(source, dest, [x["flavour"] for x in touched + remade],
                         carry=not touched)
     eye_flags = vtx_eye_flags(d, dest)
-    no_vtx =not os.path.exists(vtx_path(source)) and not os.path.exists(vtx_path(dest))
+    no_vtx = missing and not os.path.exists(vtx_path(dest))
     with open(dest, "wb") as f:
         f.write(data)
     # After the .mdl, so a write that fails there leaves the donor's `.phy` as it was.
