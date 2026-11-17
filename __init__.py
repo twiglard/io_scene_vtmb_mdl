@@ -26,7 +26,7 @@ bl_info = {
 from . import (checksum, cloth, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_write,
                normal_table, paths, phy,
                relocs, sections, tth, vmt_write, vpk, vtx, vtx_rebuild, vtx_write,
-               bone_templates,
+               bone_templates, blender_dialogs,
                blender_import, blender_export, blender_flex_preview, blender_scratch,
                blender_templates,
                blender_panel)
@@ -855,6 +855,11 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
             lay.label(text="Animations off: the four above only pick animations",
                       icon="INFO")
 
+    def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
+        return super().invoke(context, event)
+
     def execute(self, context):
         game_root, mods, extract = _prefs(context)
         try:
@@ -907,6 +912,8 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
     def invoke(self, context, event):
         self.choice = ("REMAKE" if self.case == "DX7" else
                        "REWRITE" if self.can_rewrite else "ANIMATIONS_ONLY")
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(
             self, width=520, title=self.bl_label, confirm_text="Export")
 
@@ -1211,6 +1218,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         self.reading = ("%s (the active action's)" % os.path.basename(base)
                         if why == "action" else os.path.basename(base) or "(none)")
         self.filepath = base or self.filepath
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -2677,6 +2686,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         self.scale = float(obj.get("vtmb_scale", 1.0) or 1.0)
         self.cdtexture = _scratch_cdtexture(obj)
         self.fit_hull = _scratch_fit_hull(obj)
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -3055,7 +3066,7 @@ def register():
     # importer keeps the old object and the reload buys nothing.
     for m in (checksum, sections, relocs, normal_table, cloth, mdl, mdl_write, mdl_build,
               mdl_rebuild, mesh_write, paths, phy, tth, vmt_write, vpk, vtx, vtx_write,
-              vtx_rebuild, bone_templates,
+              vtx_rebuild, bone_templates, blender_dialogs,
               blender_import, blender_export, blender_flex_preview, blender_scratch,
               blender_templates, blender_panel):
         importlib.reload(m)

@@ -17,6 +17,7 @@ import zlib
 import bpy
 import mathutils
 
+from . import blender_dialogs
 from . import blender_export
 from . import blender_flex_preview as preview_mod
 from . import blender_import
@@ -575,6 +576,8 @@ class VTMB_OT_set_skin_cell(bpy.types.Operator):
     material: bpy.props.EnumProperty(name="Material", items=_skin_material_items)
 
     def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         context.window_manager.invoke_search_popup(self)
         return {"RUNNING_MODAL"}
 
@@ -1655,6 +1658,8 @@ class VTMB_OT_add_eyeball(bpy.types.Operator):
                 and context.active_bone is not None)
 
     def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -2069,6 +2074,8 @@ class VTMB_OT_move_by_bone_rest(bpy.types.Operator):
         return obj is not None and obj.type == "MESH" and owning_armature(obj) is not None
 
     def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -2262,6 +2269,8 @@ class VTMB_OT_edit_flex_line(bpy.types.Operator):
                     self.name = line
             elif "=" in line:
                 self.name, self.expr = (x.strip() for x in line.split("=", 1))
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     draw = _draw_flex_dialog
@@ -2323,6 +2332,8 @@ class VTMB_OT_add_flex_line(bpy.types.Operator):
         return _flex_armature(context) is not None
 
     def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     draw = _draw_flex_dialog
@@ -2655,6 +2666,8 @@ class VTMB_OT_set_key_window(bpy.types.Operator):
         obj = context.object
         fd, t, _filed = _key_stamp(obj, obj.active_shape_key_index)
         self.flex, self.window = fd, t
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -2746,6 +2759,8 @@ class VTMB_OT_add_cdtexture(bpy.types.Operator):
             if game_root and os.path.isdir(start):
                 self.directory = start + os.sep
                 break
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -2794,6 +2809,8 @@ class VTMB_OT_add_include(bpy.types.Operator):
             if game_root and os.path.isdir(start):
                 self.filepath = start + os.sep
                 break
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -3228,6 +3245,8 @@ class VTMB_OT_add_event(bpy.types.Operator):
         return {"FINISHED"}
 
     def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
 
@@ -3922,6 +3941,8 @@ class VTMB_OT_rename_sequence(bpy.types.Operator):
             self.report({"ERROR"}, "no imported sequence names this action")
             return {"CANCELLED"}
         self.name = str(stash[k].get("label") or "")
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -3967,6 +3988,8 @@ class VTMB_OT_add_sequence(bpy.types.Operator):
             self.report({"ERROR"}, "no imported sequence names this action")
             return {"CANCELLED"}
         self.name = "%s_2" % str(stash[k].get("label") or "sequence")
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -4081,6 +4104,8 @@ class VTMB_OT_set_blend(bpy.types.Operator):
             was = str(cells[self.x][self.y])
             if was in _file_anims(arm_obj):
                 self.anim = was
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -4123,6 +4148,8 @@ class VTMB_OT_resize_blends(bpy.types.Operator):
         cells = [list(c) for c in stash[k].get("blends") or ()]
         self.gx = max(1, len(cells))
         self.gy = max(1, max((len(c) for c in cells), default=1))
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):

@@ -9,6 +9,7 @@ import os
 import bpy
 from bpy_extras.io_utils import ImportHelper
 
+from . import blender_dialogs
 from . import blender_import as import_mod
 from . import bone_templates as tpl_mod
 from . import mdl as mdl_mod
@@ -160,6 +161,8 @@ class OBJECT_OT_vtmb_add_skeleton(bpy.types.Operator):
         arm = _armature_of(context)
         if arm is not None:
             self.scale = float(arm.get("vtmb_scale", 1.0) or 1.0)
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
         return context.window_manager.invoke_props_dialog(self, width=460)
 
     def draw(self, context):
@@ -360,6 +363,11 @@ class OBJECT_OT_vtmb_merge_skeleton(bpy.types.Operator, ImportHelper):
     @classmethod
     def poll(cls, context):
         return _armature_of(context) is not None
+
+    def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
+        return super().invoke(context, event)
 
     def execute(self, context):
         arm = _armature_of(context)
