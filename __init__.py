@@ -880,22 +880,54 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
-class VTMB_OT_confirm_vtx_rewrite(bpy.types.Operator):
-    """Ask whether to replace a .vtx that belongs to another model, then open the export"""
-    bl_idname = "vtmb.confirm_vtx_rewrite"
-    bl_label = "Write a new .vtx"
+class VTMB_OT_mismatched_vtx(bpy.types.Operator):
+    """Ask what to do with a .vtx that belongs to another model, then open the export"""
+    bl_idname = "vtmb.mismatched_vtx"
+    bl_label = "Another model's .vtx"
     bl_options = {"INTERNAL"}
 
-    title: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
-    message: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    case: bpy.props.EnumProperty(
+        items=(("DX80", "dx80", ""), ("DX7", "dx7_2bone", "")),
+        options={"HIDDEN", "SKIP_SAVE"})
+    choice: bpy.props.EnumProperty(
+        name="Choice", options={"SKIP_SAVE"},
+        items=(("REWRITE", "Write a new .vtx from the scene's meshes",
+                "Every model is rebuilt from the scene, and a model the scene has no mesh "
+                "of is written with no mesh"),
+               ("ANIMATIONS_ONLY", "Export the animations only",
+                "The .vtx is copied as it is, so the game still draws no geometry for "
+                "this model"),
+               ("REMAKE", "Remake the .dx7_2bone.vtx (recommended)",
+                "Written from nothing off the triangles of the .dx80.vtx"),
+               ("KEEP", "Keep it as it is",
+                "Under -dxlevel 70 the game draws no geometry for this model")))
+    lines: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    can_rewrite: bpy.props.BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(
-            self, event, title=self.title, message=self.message,
-            confirm_text="Write a new .vtx", icon="WARNING")
+        self.choice = ("REMAKE" if self.case == "DX7" else
+                       "REWRITE" if self.can_rewrite else "ANIMATIONS_ONLY")
+        return context.window_manager.invoke_props_dialog(
+            self, width=520, title=self.bl_label, confirm_text="Export")
+
+    def draw(self, context):
+        col = self.layout.column()
+        for line in self.lines.split("\n"):
+            col.label(text=line)
+        col.separator()
+        offered = (("REMAKE", "KEEP") if self.case == "DX7" else
+                   ("REWRITE", "ANIMATIONS_ONLY") if self.can_rewrite else
+                   ("ANIMATIONS_ONLY",))
+        for value in offered:
+            col.prop_enum(self, "choice", value)
 
     def execute(self, context):
-        bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_vtx="REWRITE")
+        if self.case == "DX7":
+            bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_dx7=self.choice)
+        elif self.choice == "REWRITE" and not self.can_rewrite:
+            return {"CANCELLED"}
+        else:
+            bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_vtx=self.choice)
         return {"FINISHED"}
 
 
@@ -969,10 +1001,21 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         items=(("STOP", "Stop", "Refuse the export and write nothing"),
                ("REWRITE", "Write a new .vtx",
                 "Rebuild every model from the scene and write each .vtx flavour beside the "
-                "source from nothing")),
-        description="What a .vtx beside the source whose checksum is not the .mdl's gets. "
-                    "The game draws no geometry from such a pair. Set by the popup the "
-                    "dialog opens on one")
+                "source from nothing"),
+               ("ANIMATIONS_ONLY", "Export the animations only",
+                "Copy every .vtx as it is, so the game still draws no geometry")),
+        description="What the export does when the .dx80.vtx beside the source has another "
+                    "checksum than the .mdl's. The game draws no geometry from such a pair. "
+                    "Set by the message box the dialog opens on one")
+    mismatched_dx7: bpy.props.EnumProperty(
+        name="Another model's .dx7_2bone.vtx", default="STOP",
+        options={"HIDDEN", "SKIP_SAVE"},
+        items=(("STOP", "Stop", "Refuse the export and write nothing"),
+               ("REMAKE", "Remake", "Write it from nothing off the .dx80.vtx"),
+               ("KEEP", "Keep", "Copy it as it is")),
+        description="What the export does when the .dx7_2bone.vtx beside the source has "
+                    "another checksum than the .mdl's and the .dx80.vtx is the model's own. "
+                    "Set by the message box the dialog opens on one")
     write_2bone_vtx: bpy.props.BoolProperty(
         name="Also rewrite .dx7_2bone.vtx", default=False,
         description="Rewrite the second strip file beside the model as well as the "
@@ -1135,18 +1178,35 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             blender_scratch.scene_cdtextures(_export_armature(context)))
         base, why = _base_from(self, context)
         rows = blender_export.mismatched_vtx_files(base) if base else []
-        if rows and self.mismatched_vtx != "REWRITE":
-            lacking = blender_export.unmeshed_models(mdl.Mdl(base), base,
-                                                     _export_armature(context))
-            if lacking:
-                self.report({"ERROR"}, blender_export.unmeshed_text(lacking, base))
-                return {"CANCELLED"}
-            _flavour, path, got, want = rows[0]
-            bpy.ops.vtmb.confirm_vtx_rewrite(
-                "INVOKE_DEFAULT", title="%s belongs to another model" % os.path.basename(path),
-                message="Its checksum is %s and the .mdl's %#x, so the game draws no geometry "
-                        "with it. A new one is built from the scene's meshes"
-                        % ("unreadable" if got is None else "%#x" % got, want))
+        dx80 = [r for r in rows if r[0] == "dx80"]
+        dx7 = [] if dx80 else [r for r in rows if r[0] == "dx7_2bone"]
+        if dx80 and self.mismatched_vtx == "STOP":
+            m = mdl.Mdl(base)
+            meshed = blender_export.meshed_models(m, base)
+            lacking = blender_export.unmeshed_models(m, base)
+            _flavour, path, got, want = dx80[0]
+            lines = ["%s is another model's: its checksum is %s and the .mdl's %#x."
+                     % (os.path.basename(path), "unreadable" if got is None else "%#x" % got,
+                        want),
+                     "The game draws no geometry with it."]
+            if meshed and lacking:
+                lines.append("A new .vtx draws nothing for %s, which the scene has no mesh "
+                             "of." % ", ".join(lacking[:4]))
+            if not meshed:
+                lines.append("The scene has no mesh of this model, so no new .vtx can be "
+                             "written.")
+            bpy.ops.vtmb.mismatched_vtx("INVOKE_DEFAULT", case="DX80",
+                                        can_rewrite=bool(meshed), lines="\n".join(lines))
+            return {"CANCELLED"}
+        if dx7 and self.mismatched_dx7 == "STOP":
+            _flavour, path, got, want = dx7[0]
+            bpy.ops.vtmb.mismatched_vtx(
+                "INVOKE_DEFAULT", case="DX7",
+                lines="%s is another model's: its checksum is %s and the .mdl's %#x.\n"
+                      "The .dx80.vtx is the model's own. Under -dxlevel 70 the game opens the "
+                      ".dx7_2bone.vtx and draws no geometry with it."
+                      % (os.path.basename(path), "unreadable" if got is None else "%#x" % got,
+                         want))
             return {"CANCELLED"}
         self.reading = ("%s (the active action's)" % os.path.basename(base)
                         if why == "action" else os.path.basename(base) or "(none)")
@@ -1449,7 +1509,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     frame_start=context.scene.frame_start if self.use_range and one else None,
                     frame_end=context.scene.frame_end if self.use_range and one else None,
                     content=blender_import.Content(paths.roots(src, *_prefs(context))),
-                    mismatched_vtx=self.mismatched_vtx.lower())
+                    mismatched_vtx=self.mismatched_vtx.lower(),
+                    mismatched_dx7=self.mismatched_dx7.lower())
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -1474,6 +1535,19 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                   "deleted from the scene: %s"
                         % (len(mesh["blanked"]), "" if len(mesh["blanked"]) == 1 else "s",
                            os.path.basename(src), ", ".join(mesh["blanked"][:4])))
+        if mesh.get("unmeshed"):
+            self.report({"WARNING"}, "%d model%s of %s written with no mesh, the scene having "
+                                     "none of %s, so the game draws nothing for %s: %s"
+                        % (len(mesh["unmeshed"]), "" if len(mesh["unmeshed"]) == 1 else "s",
+                           os.path.basename(src),
+                           *(("it", "it") if len(mesh["unmeshed"]) == 1 else ("them", "them")),
+                           ", ".join(mesh["unmeshed"][:4])))
+        foreign = r.get("vtx_foreign")
+        if foreign and foreign[0] == "animations_only":
+            self.report({"WARNING"}, "Only the animations were exported: %s is another "
+                                     "model's and was copied as it is, so the game draws no "
+                                     "geometry for this model"
+                        % ", ".join(name for name, _got, _want in foreign[1]))
         if mesh["missing"] and mesh["fields"]:
             self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "
                                      "the file's own: %s"
@@ -1683,10 +1757,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         for x in ([vtx] if vtx is not None else []) + list(r.get("vtx_more") or ()):
             if x.get("replaced"):
                 _was, ck = x["replaced"]
-                self.report({"WARNING"}, "%s written from the scene's meshes in place of the "
-                                         "one beside the source, whose checksum %s was "
-                                         "another model's"
+                self.report({"WARNING"}, "%s written from %s in place of the one beside "
+                                         "the source, whose checksum %s was another model's"
                             % (os.path.basename(x["path"]),
+                               "the scene's meshes" if r.get("vtx_foreign")
+                               else "the .dx80.vtx's triangles",
                                "unreadable" if ck is None else "%#x" % ck))
         if vtx is not None:
             self.report({"INFO"}, "%s rewritten, %d bytes over %d strip groups"
@@ -2926,7 +3001,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
 
 
 CLASSES = ([VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
-            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_confirm_vtx_rewrite]
+            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_mismatched_vtx]
            + list(blender_templates.CLASSES) + list(blender_panel.CLASSES))
 
 if hasattr(bpy.types, "FileHandler"):
