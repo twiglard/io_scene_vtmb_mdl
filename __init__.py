@@ -17,8 +17,8 @@ bl_info = {
                    "and optionally vertex positions, normals, UVs and weights. A "
                    "second exporter authors a .mdl and both .vtx from the scene with "
                    "no donor file at all",
-    "version": (0, 2, 51),
-    "warning": "Prerelease: what is past the 0.2.51 tag has not had its major test "
+    "version": (0, 2, 52),
+    "warning": "Prerelease: no build is released, and 0.2.52 has not had its major test "
                "in Blender yet",
     "category": "Import-Export",
 }
