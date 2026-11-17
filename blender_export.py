@@ -292,25 +292,34 @@ def unwritable_scale(pbs, world, frame):
     return None
 
 
-def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False):
+def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_keys=False,
+               keep_missing=False):
     """Local (pos, quat) per bone per frame, inverting everything the importer applied.
 
     `pose.bones[].matrix` is object space, and the importer's rest_local_inv and
     matrix_local factors cancel down the chain, so it is exactly the world matrix the
     importer built -- no reconstruction from matrix_basis needed.
+
+    `keep_missing` with `anim`: a bone of `m` the armature lacks keeps `anim`'s own pose.
     """
     bmap = bone_map(m, arm_obj)
     missing = [b.name for b in m.bones if b.name not in bmap]
-    if missing:
+    if missing and not (keep_missing and anim is not None):
         raise SceneRefused("armature has no bone %s (and %d more)"
                            % (missing[0], len(missing) - 1))
-    pbs = [arm_obj.pose.bones[bmap[b.name]] for b in m.bones]
+    pbs = [arm_obj.pose.bones[bmap[b.name]] if b.name in bmap else None for b in m.bones]
     scene = context.scene
     out = []
     for f in frames:
         scene.frame_set(f)
-        world = [_rows(pb.matrix, scale) for pb in pbs]
-        bad = unwritable_scale(pbs, world, f)
+        own = None
+        if missing:
+            own = m.local_pose(anim, min(max(f - frames[0], 0), anim.numframes - 1))
+            own_world = m.world_matrices(own)
+        world = [_rows(pb.matrix, scale) if pb is not None else own_world[i]
+                 for i, pb in enumerate(pbs)]
+        bad = unwritable_scale([pb for pb in pbs if pb is not None],
+                               [w for pb, w in zip(pbs, world) if pb is not None], f)
         if bad:
             # `Refused` and not ValueError: both operators turn it into one clean line and
             # no traceback, which is what a limit of the format deserves.
@@ -318,7 +327,11 @@ def read_poses(context, arm_obj, m, frames, scale, anim=None, root_motion_in_key
         if root_motion_in_keys and anim is not None and anim.movements:
             off = mdl_mod.mat_inverse(mdl_mod.root_motion_matrix(anim, f))
             world = [mdl_mod.mat_mul(off, w) for w in world]
-        out.append(write_mod.local_from_world(m, world))
+        local = write_mod.local_from_world(m, world)
+        for i, pb in enumerate(pbs if own is not None else ()):
+            if pb is None:
+                local[i] = own[i]
+        out.append(local)
     return write_mod.unwind_signs(out)
 
 
@@ -2183,6 +2196,93 @@ def armature_actions(arm_obj):
 def skipped_actions(arm_obj, source):
     """The armature's actions an export of `source` leaves out, by `from_another_file`."""
     return [a for a in armature_actions(arm_obj) if from_another_file(a, source)]
+
+
+def _include_dest(inc, source, content):
+    """Where a write into the include `inc` goes: the file itself, or for a packed one the
+    loose path at its place under the content root `source` sits on."""
+    if "!" not in inc:
+        return inc
+    own = paths_mod.relative(source, content.roots) if content is not None else None
+    for r in content.roots if own else ():
+        if same_file(os.path.join(r, *own.split("/")), source):
+            return os.path.join(r, *inc.split("!", 1)[1].split("/"))
+    return None
+
+
+def write_include_actions(context, arm_obj, source, scale, content=None, root_motion="keep",
+                          root_motion_in_keys=True):
+    """Writes each action an export of `source` skips into the include it was imported from,
+    animations only: poses by bone name, the include's animation names kept, no armature
+    stash read. [(include, [(animation, action)], why not written or None)]."""
+    groups = {}
+    for act in skipped_actions(arm_obj, source):
+        groups.setdefault(act["vtmb_source"], []).append(act)
+    ad = arm_obj.animation_data
+    restore = ad.action if ad else None
+    out = []
+    try:
+        for inc, acts in sorted(groups.items()):
+            dest = _include_dest(inc, source, content)
+            try:
+                blob = content.find(inc.split("!", 1)[1])[1] if "!" in inc else None
+                m = mdl_mod.Mdl(inc, blob)
+            except (OSError, ValueError, TypeError) as exc:
+                out.append((inc, [], "unreadable: %s" % exc))
+                continue
+            if dest is None:
+                out.append((inc, [], "it is in a pack and no content root holds %s"
+                            % os.path.basename(source)))
+                continue
+            bad = verify_writer(bytes(m.d))
+            if bad:
+                out.append((inc, [], "the writer does not reproduce it: %s" % "; ".join(bad)))
+                continue
+            names = [a.name for a in m.anims]
+            slots = {}
+            for act in acts:
+                slots.setdefault(stamped_index(names, act), []).append(act)
+            edits, wrote, why = {}, [], []
+            for index, claim in sorted(slots.items(), key=lambda kv: (kv[0] is None, kv[0] or 0)):
+                if index is None or len(claim) > 1:
+                    why += ["%s claims %s" % (a.name, "no animation" if index is None
+                                              else "%s with %d others" % (names[index],
+                                                                          len(claim) - 1))
+                            for a in claim]
+                    continue
+                act = claim[0]
+                ad.action = act
+                lo, hi = act.frame_range
+                frames = list(range(int(round(lo)), int(round(hi)) + 1))
+                mode = root_motion_mode(act, root_motion)
+                try:
+                    poses = read_poses(context, arm_obj, m, frames, scale, m.anims[index],
+                                       root_motion_in_keys=(mode == "keep" and root_motion_in_keys
+                                                            and bool(act.get("vtmb_root_motion"))),
+                                       keep_missing=True)
+                except SceneRefused as exc:
+                    why.append("%s: %s" % (act.name, exc))
+                    continue
+                movements = None
+                if mode == "extract":
+                    movements, poses = write_mod.extract_root_motion(m, poses)
+                elif mode in ("in_place", "none"):
+                    if mode == "in_place":
+                        _mv, poses = write_mod.extract_root_motion(m, poses)
+                    movements = []
+                edits[index] = {"poses": poses, "movements": movements,
+                                "fps": act.get("vtmb_fps"), "flags": act.get("vtmb_flags")}
+                wrote.append((names[index], act.name))
+            if edits:
+                d = build_mod.apply_anims(build_mod.from_bytes(bytes(m.d)), edits, inc)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(build_mod.emit(d, checksum=d.checksum))
+            out.append((dest, wrote, "; ".join(why) or None))
+    finally:
+        if ad is not None and ad.action is not restore:
+            ad.action = restore
+    return out
 
 
 def match_indices(anim_names, source, arm_obj=None):
@@ -5190,7 +5290,8 @@ def _header_u32(path, at):
 def mismatched_vtx_files(source):
     """[(flavour, path, .vtx checksum, .mdl checksum)] for each `VTX_FLAVOURS` file of
     `source` (`donor_vtx`) whose checksum at +0x10 is not the .mdl's at +8. StudioRender
-    draws no geometry from such a pair (`0x2c014660`, recon 32), and the import reads no faces from it."""
+    draws no geometry from such a pair (`0x2c014660`, recon 32), and the import reads no
+    faces from it."""
     if not source or not os.path.exists(source):
         return []
     want = _header_u32(source, 8)

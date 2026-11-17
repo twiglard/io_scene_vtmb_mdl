@@ -331,6 +331,18 @@ def _report_unkeepable(op, names):
                  + ("" if len(names) <= 3 else " and %d more" % (len(names) - 3))))
 
 
+def _report_includes(op, rows):
+    for dest, wrote, why in rows:
+        name = os.path.basename(dest.split("!")[-1])
+        if wrote:
+            op.report({"INFO"}, "%s: %d animation%s written into it: %s"
+                      % (name, len(wrote), "" if len(wrote) == 1 else "s",
+                         ", ".join("%s from %s" % (anim, act) for anim, act in wrote[:4])
+                         + ("" if len(wrote) <= 4 else " and %d more" % (len(wrote) - 4))))
+        if why:
+            op.report({"WARNING"}, "%s: not written: %s" % (name, why))
+
+
 def _report_skipped(op, acts, src):
     if not acts:
         return
@@ -885,6 +897,57 @@ class IMPORT_OT_vtmb_mdl(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
+_ASKED = {"chained_actions": "vtmb_chained_actions", "mismatched_vtx": "vtmb_mismatched_vtx",
+          "mismatched_dx7": "vtmb_mismatched_dx7", "missing_vtx": "vtmb_missing_vtx"}
+_ASKED_LABELS = {"chained_actions": "Actions of included models",
+                 "mismatched_vtx": "Another model's .dx80.vtx",
+                 "mismatched_dx7": "Another model's .dx7_2bone.vtx",
+                 "missing_vtx": "No .dx80.vtx"}
+
+
+def _asked_default(prop):
+    return "STOP" if prop.startswith("mismatched") else "ASK"
+
+
+class VTMB_OT_chained_actions(bpy.types.Operator):
+    """Ask whether the export writes actions of included models into those models"""
+    bl_idname = "vtmb.chained_actions"
+    bl_label = "Actions of included models"
+    bl_options = {"INTERNAL"}
+
+    choice: bpy.props.EnumProperty(
+        name="Choice", options={"SKIP_SAVE"},
+        items=(("SKIP", "Skip them (recommended)", "Only this model's own actions are written"),
+               ("WRITE", "Write each into its included model",
+                "Animations only, poses matched by bone name, the included model's animation "
+                "names kept")))
+    remember: bpy.props.BoolProperty(
+        name="Remember", options={"SKIP_SAVE"},
+        description="Save this answer in the .blend. The export dialog's Questions section "
+                    "changes it")
+    lines: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
+        return context.window_manager.invoke_props_dialog(
+            self, width=520, title=self.bl_label, confirm_text="Export")
+
+    def draw(self, context):
+        col = self.layout.column()
+        for line in self.lines.split("\n"):
+            col.label(text=line)
+        col.separator()
+        col.prop(self, "choice", expand=True)
+        col.prop(self, "remember")
+
+    def execute(self, context):
+        if self.remember:
+            context.scene[_ASKED["chained_actions"]] = self.choice
+        bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", chained_actions=self.choice)
+        return {"FINISHED"}
+
+
 class VTMB_OT_mismatched_vtx(bpy.types.Operator):
     """Ask what to do with a .vtx that belongs to another model, then open the export"""
     bl_idname = "vtmb.mismatched_vtx"
@@ -910,6 +973,10 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
                 "The game draws no geometry for this model")))
     lines: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
     can_rewrite: bpy.props.BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
+    remember: bpy.props.BoolProperty(
+        name="Remember", options={"SKIP_SAVE"},
+        description="Save this answer in the .blend. The export dialog's Questions section "
+                    "changes it")
 
     def invoke(self, context, event):
         self.choice = ("REMAKE" if self.case == "DX7" else
@@ -932,8 +999,14 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
                    ("ANIMATIONS_ONLY",))
         for value in offered:
             col.prop_enum(self, "choice", value)
+        col.prop(self, "remember")
 
     def execute(self, context):
+        if self.remember and not (self.choice == "REWRITE" and not self.can_rewrite):
+            prop, value = (("mismatched_dx7", self.choice) if self.case == "DX7" else
+                           ("missing_vtx", "REWRITE" if self.choice == "REWRITE" else "KEEP")
+                           if self.case == "MISSING" else ("mismatched_vtx", self.choice))
+            context.scene[_ASKED[prop]] = value
         if self.case == "DX7":
             bpy.ops.export_scene.vtmb_mdl("INVOKE_DEFAULT", mismatched_dx7=self.choice)
         elif self.choice == "REWRITE" and not self.can_rewrite:
@@ -1011,9 +1084,21 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     "none of them feeding Base Color, is named in the report and skipped. "
                     "Neither half of an existing pair is overwritten. Nothing looks for "
                     "the image at all unless a .vmt is there too")
+    chained_actions: bpy.props.EnumProperty(
+        name="Actions of included models", default="ASK", options={"HIDDEN", "SKIP_SAVE"},
+        items=(("ASK", "Ask", "The dialog asks. A script that runs the export straight gets "
+                "Skip"),
+               ("SKIP", "Skip", "Only this model's own actions are written"),
+               ("WRITE", "Write into them",
+                "Each action an included model was imported with is written into that model, "
+                "animations only")),
+        description="What the export does with the armature's actions that were imported "
+                    "from a model this one includes")
+    asked_was: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
     mismatched_vtx: bpy.props.EnumProperty(
         name="Another model's .vtx", default="STOP", options={"HIDDEN", "SKIP_SAVE"},
-        items=(("STOP", "Stop", "Refuse the export and write nothing"),
+        items=(("STOP", "Ask", "The dialog asks. A script that runs the export straight is "
+                "refused, and nothing is written"),
                ("REWRITE", "Write a new .vtx",
                 "Rebuild every model from the scene and write each .vtx flavour beside the "
                 "source from nothing"),
@@ -1034,7 +1119,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
     mismatched_dx7: bpy.props.EnumProperty(
         name="Another model's .dx7_2bone.vtx", default="STOP",
         options={"HIDDEN", "SKIP_SAVE"},
-        items=(("STOP", "Stop", "Refuse the export and write nothing"),
+        items=(("STOP", "Ask", "The dialog asks. A script that runs the export straight is "
+                "refused, and nothing is written"),
                ("REMAKE", "Remake", "Write it from nothing off the .dx80.vtx"),
                ("KEEP", "Keep", "Copy it as it is")),
         description="What the export does when the .dx7_2bone.vtx beside the source has "
@@ -1200,6 +1286,13 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         # carries through. Empty with no stamp, which keeps the donor's.
         self.cdtexture = ";".join(
             blender_scratch.scene_cdtextures(_export_armature(context)))
+        for prop, key in _ASKED.items():
+            if getattr(self, prop) == _asked_default(prop) and context.scene.get(key):
+                try:
+                    setattr(self, prop, context.scene[key])
+                except TypeError:
+                    pass
+        self.asked_was = ";".join(getattr(self, prop) for prop in _ASKED)
         base, why = _base_from(self, context)
         if base:
             blender_export.find_donor_vtx(
@@ -1247,6 +1340,21 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                       ".dx7_2bone.vtx and draws no geometry with it."
                       % (os.path.basename(path), "unreadable" if got is None else "%#x" % got,
                          want))
+            return {"CANCELLED"}
+        chained = (blender_export.skipped_actions(_export_armature(context), base)
+                   if base and self.chained_actions == "ASK" else [])
+        if chained:
+            files = sorted({os.path.basename(a["vtmb_source"].split("!")[-1]) for a in chained})
+            bpy.ops.vtmb.chained_actions(
+                "INVOKE_DEFAULT",
+                lines="%d action%s came from %s, which %s includes: %s.\n"
+                      "Written into %s, they would replace %s animations of the same index."
+                      % (len(chained), "" if len(chained) == 1 else "s", " and ".join(files),
+                         os.path.basename(base),
+                         ", ".join(a.name for a in chained[:3])
+                         + ("" if len(chained) <= 3 else " and %d more" % (len(chained) - 3)),
+                         "them" if len(files) > 1 else "it",
+                         "their" if len(files) > 1 else "its"))
             return {"CANCELLED"}
         self.reading = ("%s (the active action's)" % os.path.basename(base)
                         if why == "action" else os.path.basename(base) or "(none)")
@@ -1448,6 +1556,14 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 _pair(box, "meshes", "per-vertex fields left alone; a changed triangle "
                       "set still rebuilds the model", icon="INFO")
 
+        box = _section(lay, "vtmb_asked", "Questions", icon="QUESTION")
+        if box is not None:
+            box.label(text="An answer set here, or remembered in a question, is saved in "
+                           "the .blend.")
+            for prop in _ASKED:
+                box.label(text=_ASKED_LABELS[prop])
+                box.row().prop(self, prop, expand=True)
+
         lay.label(text="Rebuilt from scratch: every offset recomputed, unreferenced "
                        "spans dropped.", icon="FILE_REFRESH")
         lay.label(text="Skeleton, materials and sequences follow the scene where it "
@@ -1462,6 +1578,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                                    "armature was imported from a .mdl, so there is no "
                                    "model to put it into")
             return {"CANCELLED"}
+        if self.options.is_invoke:
+            was = self.asked_was.split(";")
+            for i, prop in enumerate(_ASKED):
+                if i < len(was) and getattr(self, prop) != was[i]:
+                    context.scene[_ASKED[prop]] = getattr(self, prop)
         one = self.target not in (ALL, NONE)
         frame = context.scene.frame_current
         try:
@@ -1568,8 +1689,15 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
         _report_unkeepable(self, r.get("unkeepable"))
         if self.target != NONE:
             written = set(actions.values()) | set(adds)
-            _report_skipped(self, [a for a in blender_export.skipped_actions(obj, src)
-                                   if a not in written], src)
+            if self.chained_actions == "WRITE":
+                _report_includes(self, blender_export.write_include_actions(
+                    context, obj, src, arm_scale,
+                    content=blender_import.Content(paths.roots(src, *_prefs(context))),
+                    root_motion=self.root_motion,
+                    root_motion_in_keys=self.root_motion_in_keys))
+            else:
+                _report_skipped(self, [a for a in blender_export.skipped_actions(obj, src)
+                                       if a not in written], src)
         mesh = r["mesh"]
         _report_placed(self, moved, mesh["fields"],
                        {row["name"] for row in mesh.get("appended") or ()})
@@ -3046,7 +3174,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
 
 
 CLASSES = ([VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
-            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_mismatched_vtx]
+            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_mismatched_vtx, VTMB_OT_chained_actions]
            + list(blender_templates.CLASSES) + list(blender_panel.CLASSES))
 
 if hasattr(bpy.types, "FileHandler"):
