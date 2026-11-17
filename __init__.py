@@ -789,7 +789,7 @@ def _op_values(op):
 def _question(op, context, exc):
     """Reports the refusal and, with a window, asks the user instead."""
     op.report({"ERROR"}, "refused: %s" % exc)
-    if context.window is None:
+    if context.window is None or bpy.app.background:
         return {"CANCELLED"}
     values = _op_values(op)
     values["answers"] = json.dumps(dict(blender_export.answers))
