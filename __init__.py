@@ -32,6 +32,7 @@ from . import (checksum, cloth, mdl, mdl_build, mdl_rebuild, mdl_write, mesh_wri
                blender_panel)
 
 import importlib
+import json
 import os
 import traceback
 
@@ -747,6 +748,114 @@ def _target_items(self, context):
     return _ANIM_ITEMS
 
 
+_ANSWERS_KEY = "vtmb_answers"
+_pending = {}
+_question_items = []
+
+
+def _remembered(context):
+    try:
+        got = json.loads(context.scene.get(_ANSWERS_KEY) or "{}")
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _set_answers(op, context):
+    """Puts the remembered answers and the operator's own into blender_export.answers."""
+    if op.forget_answers and _ANSWERS_KEY in context.scene:
+        del context.scene[_ANSWERS_KEY]
+    try:
+        given = json.loads(op.answers) if op.answers else {}
+    except ValueError:
+        given = {}
+    blender_export.answers = dict(_remembered(context), **given)
+
+
+def _op_values(op):
+    names = []
+    for cls in reversed(type(op).__mro__):
+        for k in getattr(cls, "__annotations__", {}):
+            if k not in names:
+                names.append(k)
+    out = {}
+    for k in names:
+        v = getattr(op, k, None)
+        if v is not None:
+            out[k] = v if isinstance(v, (str, int, float, bool, set)) else tuple(v)
+    return out
+
+
+def _question(op, context, exc):
+    """Reports the refusal and, with a window, asks the user instead."""
+    op.report({"ERROR"}, "refused: %s" % exc)
+    if context.window is None:
+        return {"CANCELLED"}
+    values = _op_values(op)
+    values["answers"] = json.dumps(dict(blender_export.answers))
+    values["forget_answers"] = False
+    token = "%x" % (len(_pending) + 1)
+    _pending.clear()
+    _pending[token] = {"op": type(op).bl_idname, "values": values, "site": exc.site,
+                       "key": exc.key}
+    _question_items[:] = [tuple(c) for c in exc.choices]
+    bpy.ops.vtmb.export_question("INVOKE_DEFAULT", token=token, lines=str(exc))
+    return {"CANCELLED"}
+
+
+class VTMB_OT_export_question(bpy.types.Operator):
+    """What the export does with something it cannot write as the scene has it"""
+    bl_idname = "vtmb.export_question"
+    bl_label = "The export cannot write this as it stands"
+    bl_options = {"INTERNAL"}
+
+    choice: bpy.props.EnumProperty(
+        name="Choice", options={"SKIP_SAVE"},
+        items=lambda self, context: _question_items or [("NONE", "Nothing", "")])
+    remember: bpy.props.BoolProperty(
+        name="Remember", options={"SKIP_SAVE"},
+        description="Save this answer in the .blend for every case of this kind. The "
+                    "export dialog's Questions section forgets it")
+    token: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    lines: bpy.props.StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        if blender_dialogs.skip_dialogs:
+            return blender_dialogs.answer(self, context)
+        return context.window_manager.invoke_props_dialog(
+            self, width=560, title=self.bl_label, confirm_text="Export")
+
+    def draw(self, context):
+        col = self.layout.column()
+        words, line = self.lines.split(), ""
+        for w in words:
+            if len(line) + len(w) > 90:
+                col.label(text=line)
+                line = ""
+            line = (line + " " + w).strip()
+        if line:
+            col.label(text=line)
+        col.separator()
+        col.prop(self, "choice", expand=True)
+        col.prop(self, "remember")
+
+    def execute(self, context):
+        pend = _pending.pop(self.token, None)
+        if pend is None or self.choice == "NONE":
+            return {"CANCELLED"}
+        if self.remember:
+            kept = _remembered(context)
+            kept[pend["site"]] = self.choice
+            context.scene[_ANSWERS_KEY] = json.dumps(kept, sort_keys=True)
+        values = dict(pend["values"])
+        given = json.loads(values["answers"])
+        given[pend["key"]] = self.choice
+        values["answers"] = json.dumps(given)
+        group, name = pend["op"].split(".")
+        getattr(getattr(bpy.ops, group), name)("EXEC_DEFAULT", **values)
+        return {"FINISHED"}
+
+
 def _refused():
     """Every module's `Refused`, looked up at the raise: `register` reloads the modules, and
     a tuple built at import would keep the classes the reload replaced."""
@@ -1116,6 +1225,12 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 "Rebuild every model from the scene and write a .vtx beside the export")),
         description="What the export does when no .dx80.vtx of the source is beside it, on a "
                     "content root or in a pack. Set by the message box the dialog opens on one")
+    answers: bpy.props.StringProperty(
+        options={"HIDDEN", "SKIP_SAVE"},
+        description='JSON {"site" or "site/instance": choice} for the message boxes')
+    forget_answers: bpy.props.BoolProperty(
+        name="Forget the remembered answers", options={"SKIP_SAVE"},
+        description="Clear every message box answer saved in the .blend before exporting")
     mismatched_dx7: bpy.props.EnumProperty(
         name="Another model's .dx7_2bone.vtx", default="STOP",
         options={"HIDDEN", "SKIP_SAVE"},
@@ -1563,6 +1678,11 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             for prop in _ASKED:
                 box.label(text=_ASKED_LABELS[prop])
                 box.row().prop(self, prop, expand=True)
+            kept = _remembered(context)
+            if kept:
+                box.label(text="Remembered: " + ", ".join(
+                    "%s = %s" % kv for kv in sorted(kept.items())))
+                box.prop(self, "forget_answers")
 
         lay.label(text="Rebuilt from scratch: every offset recomputed, unreferenced "
                        "spans dropped.", icon="FILE_REFRESH")
@@ -1646,6 +1766,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
                     self.write_vmt, self.write_tth))
 
+            _set_answers(self, context)
             with blender_export.placed(objs, obj) as moved:
                 r = blender_export.export_actions(
                     context, obj, src, self.filepath, actions, scale=arm_scale,
@@ -1675,6 +1796,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                     mismatched_vtx=self.mismatched_vtx.lower(),
                     mismatched_dx7=self.mismatched_dx7.lower(),
                     missing_vtx="rewrite" if self.missing_vtx == "REWRITE" else "keep")
+        except blender_export.Question as exc:
+            return _question(self, context, exc)
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -1685,6 +1808,7 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
             return {"CANCELLED"}
         finally:
             context.scene.frame_set(frame)
+            blender_export.answers = {}
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
         if self.target != NONE:
@@ -2771,6 +2895,12 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
         name="Activity", default="ACT_IDLE",
         description="The activity every sequence claims. An action carrying its own "
                     "vtmb_activity overrides this one")
+    answers: bpy.props.StringProperty(
+        options={"HIDDEN", "SKIP_SAVE"},
+        description='JSON {"site" or "site/instance": choice} for the message boxes')
+    forget_answers: bpy.props.BoolProperty(
+        name="Forget the remembered answers", options={"SKIP_SAVE"},
+        description="Clear every message box answer saved in the .blend before exporting")
     use_range: bpy.props.BoolProperty(
         name="Scene range", default=False,
         description="Sample the scene's Start and End frames rather than each action's "
@@ -3017,6 +3147,7 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                 [n for n in blender_scratch.eye_mesh_materials(d) if n in added],
                 self.write_vmt, self.write_tth))
 
+        _set_answers(self, context)
         try:
             with blender_export.placed(meshes, obj) as moved:
                 hull = blender_scratch.fit_hull(meshes, self.scale) if self.fit_hull else None
@@ -3028,6 +3159,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
                     activity=self.activity, hitboxes=self.fit_hitboxes,
                     root_motion=self.root_motion, no_mesh=self.no_mesh,
                     includes=(blender_scratch.scene_includes(obj) if self.chain else ()))
+        except blender_export.Question as exc:
+            return _question(self, context, exc)
         except _refused() as exc:
             self.report({"ERROR"}, "refused: %s" % exc)
             return {"CANCELLED"}
@@ -3036,6 +3169,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "%s: %s -- traceback on the console"
                         % (type(exc).__name__, exc))
             return {"CANCELLED"}
+        finally:
+            blender_export.answers = {}
         _report_unfitted(self, r.get("unfitted"))
         _report_unkeepable(self, r.get("unkeepable"))
         _report_placed(self, moved, None, set())
@@ -3174,7 +3309,8 @@ class EXPORT_OT_vtmb_mdl_scratch(bpy.types.Operator, ExportHelper):
 
 
 CLASSES = ([VTMB_AddonPreferences, IMPORT_OT_vtmb_mdl, EXPORT_OT_vtmb_mdl,
-            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_mismatched_vtx, VTMB_OT_chained_actions]
+            EXPORT_OT_vtmb_mdl_scratch, VTMB_OT_mismatched_vtx, VTMB_OT_chained_actions,
+            VTMB_OT_export_question]
            + list(blender_templates.CLASSES) + list(blender_panel.CLASSES))
 
 if hasattr(bpy.types, "FileHandler"):

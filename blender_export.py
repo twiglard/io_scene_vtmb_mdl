@@ -94,6 +94,31 @@ class SceneRefused(build_mod.Refused, ValueError):
     with no traceback, and ValueError, so a caller that catches one still does."""
 
 
+class Question(SceneRefused):
+    """A refusal the user can answer: `choices` is [(value, label, description)], and the
+    operator asks, then runs the export again with `answers[key]` set to the value."""
+
+    def __init__(self, site, key, text, choices):
+        SceneRefused.__init__(self, text)
+        self.site, self.key, self.choices = site, key, list(choices)
+
+
+answers = {}
+
+
+def ask(site, instance, text, choices):
+    """The value `answers` holds for this instance of the site, else for the site, else
+    raises `Question` with `text`."""
+    key = site if instance is None else "%s/%s" % (site, instance)
+    got = answers.get(key, answers.get(site))
+    if got is None:
+        raise Question(site, key, text, choices)
+    if got not in [c[0] for c in choices]:
+        raise SceneRefused("%s: the answer %r is none of %s"
+                           % (text, got, ", ".join(c[0] for c in choices)))
+    return got
+
+
 def root_motion_mode(action, chosen, donor=True, default="keep"):
     """Which of the four writes this action's travel takes.
 
@@ -118,8 +143,13 @@ def root_motion_mode(action, chosen, donor=True, default="keep"):
         mode = default if nmv is None else ("keep" if nmv else "none")
     mode = str(mode)
     if mode not in ROOT_MOTION_MODES:
-        raise SceneRefused("action %r carries %s %r, which is none of %s"
-                           % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)))
+        ask("root_motion_mode", action.name,
+            "action %r carries %s %r, which is none of %s"
+            % (action.name, MODE_ATTR, mode, ", ".join(ROOT_MOTION_MODES)),
+            [("unstamped", "Write it as an action with no stamp",
+              "The mode its vtmb_movements count gives, else the export's default")])
+        nmv = action.get("vtmb_movements")
+        mode = default if nmv is None else ("keep" if nmv else "none")
     return "extract" if (mode == "keep" and not donor) else mode
 
 
@@ -401,11 +431,14 @@ def reparented(m, k, db, file_of):
         return None
     if now >= k:
         was = m.bones[b.parent].name if b.parent >= 0 else "nothing"
-        raise SceneRefused(
+        ask("reparented", b.name,
             "bone %r was reparented from %s to %r, which sits at index %d against its own "
             "%d -- the engine builds each bone's world matrix off its parent's while "
             "walking the array in order, so a parent must come first, and nothing here "
-            "renumbers the bone array" % (b.name, was, m.bones[now].name, now, k))
+            "renumbers the bone array" % (b.name, was, m.bones[now].name, now, k),
+            [("keep", "Keep the file's parent",
+              "The bone keeps %s as its parent, and its rest is taken against it" % was)])
+        return None
     return now
 
 
@@ -1065,12 +1098,14 @@ def renamed_bodyparts(m, source):
     out = {}
     for bi, names in sorted(got.items()):
         if len(names) > 1:
-            raise build_mod.Refused(
+            ask("renamed_bodyparts", m.bodyparts[bi].name,
                 "bodypart %r is renamed %s; a bodypart has one name, and the Bodypart "
                 "field sets it on every object of the bodypart at once"
                 % (m.bodyparts[bi].name,
                    " and ".join("%r by %s" % (n, ", ".join(sorted(objs)))
-                                for n, objs in sorted(names.items()))))
+                                for n, objs in sorted(names.items()))),
+                [("keep", "Keep the file's name", "Neither rename is written")])
+            continue
         out[bi] = next(iter(names))
     return out
 
