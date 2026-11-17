@@ -900,8 +900,8 @@ class VTMB_OT_mismatched_vtx(bpy.types.Operator):
                 "Every model is rebuilt from the scene, and a model the scene has no mesh "
                 "of is written with no mesh"),
                ("ANIMATIONS_ONLY", "Export the animations only",
-                "The .vtx is copied as it is, so the game still draws no geometry for "
-                "this model"),
+                "Only the armature's bones and the animations are written. The .vtx is "
+                "copied as it is, so the game still draws no geometry for this model"),
                ("REMAKE", "Remake the .dx7_2bone.vtx (recommended)",
                 "Written from nothing off the triangles of the .dx80.vtx"),
                ("KEEP", "Keep it as it is",
@@ -1010,7 +1010,8 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                 "Rebuild every model from the scene and write each .vtx flavour beside the "
                 "source from nothing"),
                ("ANIMATIONS_ONLY", "Export the animations only",
-                "Copy every .vtx as it is, so the game still draws no geometry")),
+                "Write only the armature's bones and the animations, and copy every .vtx "
+                "as it is, so the game still draws no geometry")),
         description="What the export does when the .dx80.vtx beside the source has another "
                     "checksum than the .mdl's. The game draws no geometry from such a pair. "
                     "Set by the message box the dialog opens on one")
@@ -1553,9 +1554,9 @@ class EXPORT_OT_vtmb_mdl(bpy.types.Operator, ExportHelper):
                            ", ".join(mesh["unmeshed"][:4])))
         foreign = r.get("vtx_foreign")
         if foreign and foreign[0] == "animations_only":
-            self.report({"WARNING"}, "Only the animations were exported: %s is another "
-                                     "model's and was copied as it is, so the game draws no "
-                                     "geometry for this model"
+            self.report({"WARNING"}, "Only the bones and animations were exported: %s is "
+                                     "another model's and was copied as it is, so the game "
+                                     "draws no geometry for this model"
                         % ", ".join(name for name, _got, _want in foreign[1]))
         if mesh["missing"] and mesh["fields"]:
             self.report({"WARNING"}, "%d model%s of %s had no mesh in the scene and kept "

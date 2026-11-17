@@ -6219,8 +6219,9 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     another checksum than the .mdl's: "stop" refuses before anything is written. "rewrite"
     rebuilds every model from the scene and writes every flavour that sat beside the source
     from nothing, a model with no scene mesh written with no mesh; it refuses when no model
-    has one. "animations_only" copies every `.vtx` as it is, so the game still draws no
-    geometry for the model.
+    has one. "animations_only" writes the armature's bones and the animations and nothing
+    else of the scene, and copies every `.vtx` and the `.phy` as they are, so the game still
+    draws no geometry for the model.
 
     `mismatched_dx7` does the same for a `.dx7_2bone.vtx` with another checksum beside a
     `.dx80.vtx` that is the model's own: "stop", "remake" from the `.dx80.vtx` written, or
@@ -6239,6 +6240,10 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     if dx7 and mismatched_dx7 == "stop":
         raise SceneRefused(mismatched_dx7_text(dx7, source))
     rewrite = bool(foreign) and mismatched_vtx == "rewrite"
+    anim_only = bool(foreign) and mismatched_vtx == "animations_only"
+    if anim_only:
+        mesh_fields, write_flexes, write_cloth = (), False, False
+        model_name, hull, cdtexture = "", None, None
     if rewrite and not meshed_models(m, source):
         raise SceneRefused(unmeshed_text(source))
     if dx7 and mismatched_dx7 == "remake" and not os.path.exists(vtx_path(source)):
@@ -6274,7 +6279,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # Before `bone_map` raises on an unresolvable one, and before the appends make each copy
     # a bone of the file in its own right.
     dup_bones = duplicate_bones(m, arm_obj)
-    new_objs = new_model_objects(m, source, arm_obj)
+    new_objs = [] if anim_only else new_model_objects(m, source, arm_obj)
     eye_models = resolve_eyeball_models(m, arm_obj, new_objs)
     appending = set(o.name for o in new_objs)
     dup_models = [x for x in dup_models if x[0] not in appending]
@@ -6303,11 +6308,11 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     renamed = [(m.bones[k].name, name) for k, name in sorted(renamed.items())]
 
     # Both names are `char name[128]` inline, so writing either moves nothing.
-    remodelled = renamed_models(m, source)
+    remodelled = {} if anim_only else renamed_models(m, source)
     for (bi, mi), name in sorted(remodelled.items()):
         build_mod.set_model_name(d, bi, mi, name)
     # A bodypart's name is a string-table offset, and `mdl_build.emit` lays the table out.
-    rebodied = renamed_bodyparts(m, source)
+    rebodied = {} if anim_only else renamed_bodyparts(m, source)
     for bi, name in sorted(rebodied.items()):
         d.bodyparts[bi].name = name
     if model_name and model_name != d.name:
@@ -6325,7 +6330,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         d.refit_boxes = True
     # Compared as the f32 bytes, so an unedited stamp writes nothing. A typed hull moves no
     # vertex and leaves the sequence boxes alone; Fit hull, when ticked, wins over it.
-    typed = header_vectors(arm_obj, scale)
+    typed = {} if anim_only else header_vectors(arm_obj, scale)
     header = {}
     for off, v in sorted(typed.items()):
         if hull is not None and off != mdl_mod.HDR_EYEPOSITION:
@@ -6459,62 +6464,71 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # The table before the renames, so a slot showing a record a cell added reads through
     # the row that names it, and before new_materials, whose records append a column to
     # every row this replaces.
-    if len(skin_table(arm_obj)[0]) > 1:
-        sync_skin_table(arm_obj, armature_meshes(context.scene, arm_obj), bpy.data.materials)
-    if skin_edited(arm_obj):
-        d.skin, added = resolve_skin_table(d, arm_obj)
-        scene["skin_families"] = len(d.skin)
-        scene["added_materials"] += added
-    if skin_edited(arm_obj):
-        named, scene["slots_moved"], scene["slots_gone"] = read_materials(
-            m, source, skin_family(m, arm_obj), rows=d.skin)
+    if anim_only:
+        face = {"eye_gone": (), "materials": []}
+        eye_names = []
+        scene.update({"spring_end_renamed": [], "cloth_volumes": 0, "cloth_volumes_unread": 0,
+                      "cloth_two_bone": [], "face": 0, "eyes_added": [], "mouth_added": False,
+                      "mouth_removed": False, "eye_meshes": 0, "eye_radius_keys": [],
+                      "eye_lid_targets": [], "eye_empties": [], "eye_records": [],
+                      "eyes_removed": [], "flex": (0, 0, 0)})
     else:
-        named, scene["slots_moved"], scene["slots_gone"] = read_materials(
-            m, source, skin_family(m, arm_obj))
-    named.update(skin_renames(d, arm_obj, set(named)))
-    for ref, name in sorted(named.items()):
-        if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
-            d.textures[ref].name = name
-            scene["materials"] += 1
-    # After the rename loop, so a slot renamed onto an existing texture is a rename and
-    # not an addition. `cdtexture` has already been applied to d.cdtextures above, so None
-    # here leaves the list the scene asked for alone.
-    have = {t.name for t in d.textures}
-    for name in new_materials(m, source):
-        if name in have:
-            continue
-        build_mod.add_material(d, name, None)
-        have.add(name)
-        scene["added_materials"].append(name)
-    sp = apply_springbones(d, m, arm_obj)
-    scene["springs"] = sp["changed"]
-    for key in ("ends", "switched", "unclaimed", "added", "removed", "stamps",
-                "gone", "over_mask", "end_renamed"):
-        scene["spring_" + key] = sp[key]
-    scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
-    vol = apply_cloth_volumes(d, m, arm_obj, scale)
-    scene["cloth_volumes"], scene["cloth_volumes_unread"] = vol["changed"], vol["unread"]
-    scene["cloth_two_bone"] = vol.get("two_bone") or []
-    # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
-    scene["hitboxsets"] = len(d.hitboxsets)
-    face = apply_face(d, m, arm_obj, scale, source, eye_models)
-    scene["face"] = face["changed"]
-    scene["eyes_added"] = face["eyes_added"]
-    scene["mouth_added"] = face["mouth_added"]
-    scene["mouth_removed"] = face["mouth_removed"]
-    scene["eye_meshes"] = face["eye_meshes"]
-    scene["eye_radius_keys"] = face["radius_keys"]
-    scene["eye_lid_targets"] = face["lid_targets"]
-    scene["eye_empties"] = face["eye_empties"]
-    scene["eye_records"] = face["eye_records"]
-    scene["eyes_removed"] = face["eyes_removed"]
-    # After the mesh pass above rather than beside it: an eyeball is the one thing that
-    # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
-    eye_names = list(face["materials"])
-    for name in face["materials"]:
-        if name not in scene["added_materials"]:
+        if len(skin_table(arm_obj)[0]) > 1:
+            sync_skin_table(arm_obj, armature_meshes(context.scene, arm_obj), bpy.data.materials)
+        if skin_edited(arm_obj):
+            d.skin, added = resolve_skin_table(d, arm_obj)
+            scene["skin_families"] = len(d.skin)
+            scene["added_materials"] += added
+        if skin_edited(arm_obj):
+            named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+                m, source, skin_family(m, arm_obj), rows=d.skin)
+        else:
+            named, scene["slots_moved"], scene["slots_gone"] = read_materials(
+                m, source, skin_family(m, arm_obj))
+        named.update(skin_renames(d, arm_obj, set(named)))
+        for ref, name in sorted(named.items()):
+            if 0 <= ref < len(d.textures) and d.textures[ref].name != name:
+                d.textures[ref].name = name
+                scene["materials"] += 1
+        # After the rename loop, so a slot renamed onto an existing texture is a rename and
+        # not an addition. `cdtexture` has already been applied to d.cdtextures above, so None
+        # here leaves the list the scene asked for alone.
+        have = {t.name for t in d.textures}
+        for name in new_materials(m, source):
+            if name in have:
+                continue
+            build_mod.add_material(d, name, None)
+            have.add(name)
             scene["added_materials"].append(name)
-    scene["flex"] = apply_flex(d, m, arm_obj)
+        sp = apply_springbones(d, m, arm_obj)
+        scene["springs"] = sp["changed"]
+        for key in ("ends", "switched", "unclaimed", "added", "removed", "stamps",
+                    "gone", "over_mask", "end_renamed"):
+            scene["spring_" + key] = sp[key]
+        scene["accessories"] = apply_accessories(d, m, arm_obj, scale)
+        vol = apply_cloth_volumes(d, m, arm_obj, scale)
+        scene["cloth_volumes"], scene["cloth_volumes_unread"] = vol["changed"], vol["unread"]
+        scene["cloth_two_bone"] = vol.get("two_bone") or []
+        # Deleting every box empty writes numhitboxsets 0, which nothing else would say.
+        scene["hitboxsets"] = len(d.hitboxsets)
+        face = apply_face(d, m, arm_obj, scale, source, eye_models)
+        scene["face"] = face["changed"]
+        scene["eyes_added"] = face["eyes_added"]
+        scene["mouth_added"] = face["mouth_added"]
+        scene["mouth_removed"] = face["mouth_removed"]
+        scene["eye_meshes"] = face["eye_meshes"]
+        scene["eye_radius_keys"] = face["radius_keys"]
+        scene["eye_lid_targets"] = face["lid_targets"]
+        scene["eye_empties"] = face["eye_empties"]
+        scene["eye_records"] = face["eye_records"]
+        scene["eyes_removed"] = face["eyes_removed"]
+        # After the mesh pass above rather than beside it: an eyeball is the one thing that
+        # names a material the meshes do not, and the `.vmt` and `.tth` writers read this list.
+        eye_names = list(face["materials"])
+        for name in face["materials"]:
+            if name not in scene["added_materials"]:
+                scene["added_materials"].append(name)
+        scene["flex"] = apply_flex(d, m, arm_obj)
     # Before the append, not after: apply_sequences refuses outright when the armature's
     # stash and the file disagree on how many sequences there are.
     anim_names = [r.name for r in d.anims]
@@ -6580,7 +6594,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     # added, deleted or re-wound moves no .mdl byte and no checkbox names one -- and a
     # mesh the scene changed is rebuilt from the scene rather than from the file, which
     # is what leaves the written model independent of the donor's own geometry.
-    blanks = blanks_here(arm_obj, source)
+    blanks = () if anim_only else blanks_here(arm_obj, source)
     # Under "rewrite" a model the scene has no mesh of leaves the file as a deleted one
     # does: its triangles were in another model's .vtx, so nothing of it can be drawn.
     blank = [] if blanks or rewrite else None
@@ -6588,6 +6602,8 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
         mesh["crowded"], mesh["blind_normals"], mesh["uv_spare"], donor_faces, \
         mesh["unskinned"], mesh["stray_groups"] = read_meshes(
             m, source, mesh_fields, boxes, blank, rebuild_all=rewrite)
+    if anim_only:
+        cells, rebuild = {}, {}
     if (mesh_fields and not cells and not rebuild and not mesh["missing"] and not blank
             and any(drawn_model(mo, donor_faces, bi, mi)
                     for bi, mi, _bp, mo in mesh_mod.models_of(m))):
@@ -6739,11 +6755,14 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     for (bi, mi), ks in sorted(drops.items()):
         build_mod.drop_meshes(d, bi, mi, ks)
     # Before `before_write`, which writes `.vmt` files: a dent refuses with nothing on disk.
-    hulls = scene_hulls(arm_obj, m, source, content, scale)
-    # A donor with no `.phy`: the hull objects are the whole of it (the user, 2026-10-29).
-    built = (hulls_phy(arm_obj, d, scale, os.path.splitext(os.path.basename(dest))[0])
-             if hulls is None else None)
-    collision = scene_collision_text(arm_obj, source, content) if built is None else None
+    if anim_only:
+        hulls = built = collision = None
+    else:
+        hulls = scene_hulls(arm_obj, m, source, content, scale)
+        # A donor with no `.phy`: the hull objects are the whole of it (the user, 2026-10-29).
+        built = (hulls_phy(arm_obj, d, scale, os.path.splitext(os.path.basename(dest))[0])
+                 if hulls is None else None)
+        collision = scene_collision_text(arm_obj, source, content) if built is None else None
     drawn = drawn_names(d)
     scene["eye_record_materials"] = [n for n in dict.fromkeys(eye_names) if n not in drawn]
     if before_write is not None:
@@ -6751,7 +6770,7 @@ def export_actions(context, arm_obj, source, dest, actions, scale=1.0,
     phy_rewrite = rewrite_phy(source, dest, bone_pairs, content,
                               [g["name"] for g in removed], phy_moves(d, m, donor_pose),
                               hulls, m, bone_rests(d, m) if hulls and hulls["add"] else None,
-                              collision, arm_obj.get("vtmb_phy_totalmass"))
+                              collision, None if anim_only else arm_obj.get("vtmb_phy_totalmass"))
     if phy_rewrite is not None and (phy_rewrite["dropped"] or phy_rewrite["moved"]
                                     or phy_rewrite["added"]):
         build_mod.set_physicsbones(d, phy_mod.solid_names(phy_rewrite["data"]))
